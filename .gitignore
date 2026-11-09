@@ -408,3 +408,35 @@ seekdb_data/
 
 # Local Python bytecode for the iOS build helpers.
 deps/ios-build/__pycache__/
+
+# Local build products, immutable benchmark baselines and raw experiment logs.
+/work/
+
+# Local environments, caches and generated submission bundles.
+.venv/
+venv/
+virtualenv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+/outputs/
+
+# Disposable database/test data; keep fixtures under mysqltest/ controlled.
+/tmp/
+/temp/
+/test_data/
+/test-data/
+/benchmark_data/
+/mvdb_data/
+/data/
+
+# Out-of-tree or accidental in-tree native build artifacts.
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+*.exe
+*.dll
+*.obj
+*.pdb

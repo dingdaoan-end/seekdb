@@ -1,0 +1,8 @@
+.git
+work
+outputs
+.agents
+.github
+.devcontainer
+**/__pycache__
+*.zip

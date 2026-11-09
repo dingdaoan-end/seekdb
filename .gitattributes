@@ -10,3 +10,8 @@
 *.i filter=codeformat
 *.ic filter=codeformat
 *.js filter=codeformat
+
+# Preserve the reviewed evidence bytes across Windows and Linux checkouts.
+/conversation.json text eol=lf
+/agent/conversation.json text eol=lf
+/tools/*.sh text eol=lf

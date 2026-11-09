@@ -1,0 +1,80 @@
+#include "../src/engine.hpp"
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
+#include <cassert>
+#include <filesystem>
+#include <iostream>
+#include <set>
+#include <unistd.h>
+using namespace mvdb;
+static std::vector<int64_t> ids(Engine& e,const std::string& q){std::vector<int64_t> out;e.execute(q).each([&](const auto& r){out.push_back(std::get<int64_t>(r[0]));});return out;}
+static std::string query(const std::string& vector,const std::string& filter="") {return "SELECT id,L2_distance(v,'"+vector+"') AS d FROM t "+filter+" ORDER BY d LIMIT 10;";}
+int main(){
+ const std::filesystem::path root="/tmp/mvdb_index_phase3_"+std::to_string(::getpid());std::filesystem::remove_all(root);
+ uint32_t recommendation=0;
+ {
+  Engine e(root,1<<20);e.execute("CREATE TABLE t (id BIGINT PRIMARY KEY,category VARCHAR(16),v VECTOR(2));");
+  e.execute("BEGIN;");
+  for(int start=0;start<4200;start+=100){std::string sql="INSERT INTO t VALUES ";for(int i=start;i<std::min(start+100,4200);++i){if(i!=start)sql+=",";auto x=(i%64)*1000+(i/64)*.001;sql+="("+std::to_string(i)+",'"+(i%2?"red":"blue")+"','["+std::to_string(x)+","+std::to_string(x)+"]')";}e.execute(sql+";");}e.execute("COMMIT;");
+  auto undo=e.undo_spill_bytes();e.execute("CREATE VECTOR INDEX vi ON t(v);");assert(e.undo_spill_bytes()-undo<8192);
+  recommendation=e.recommended_nprobe("t");assert(recommendation>=1&&recommendation<=32);assert(e.active_rows("t")==4200);
+  assert(e.mutation_count("t")==0&&e.rows_at_calibration("t")==4200&&e.drift_threshold("t")==840);
+  e.execute("SET search_mode=ann;");auto q=query("[17000.0215,17000.0195]");auto automatic=ids(e,q);assert(e.effective_nprobe()==(e.last_route()=="ivf"?recommendation:0));
+  e.execute("SET nprobe=64;");auto all=ids(e,q);assert(e.last_route()=="ivf"&&e.effective_nprobe()==64);
+  e.execute("SET search_mode=exact;");assert(ids(e,q)==all);
+  e.execute("SET search_mode=ann;");e.execute("BEGIN;");e.execute("UPDATE t SET v='[999999,999999]' WHERE id=17;");e.execute("DELETE FROM t WHERE id=81;");e.execute("INSERT INTO t VALUES (99999,'red','[17000,17000]');");assert(!e.calibration_stale("t"));assert(e.mutation_count("t")==3&&e.active_rows("t")==4200);e.execute("SET nprobe=0;");auto changed=ids(e,q);assert(e.last_route()=="ivf"&&e.effective_nprobe()==recommendation);e.execute("SET search_mode=exact;");assert(ids(e,q)==changed);e.execute("SET search_mode=ann;");e.execute("ROLLBACK;");assert(!e.calibration_stale("t"));assert(ids(e,q)==all);
+  assert(e.mutation_count("t")==0);
+  e.execute("SET nprobe=0;");e.execute("DELETE FROM t WHERE id=4199;");ids(e,q);assert(e.last_route()=="ivf"&&e.effective_nprobe()==recommendation&&e.active_rows("t")==4199);
+  assert(e.mutation_count("t")==1&&!e.calibration_stale("t"));
+  // A failed multi-row statement must undo its earlier row and counter writes.
+  bool duplicate=false;try{e.execute("UPDATE t SET id=100000;");}catch(const std::exception&){duplicate=true;}assert(duplicate);assert(e.mutation_count("t")==1);
+  e.execute("DELETE FROM t WHERE id=999999;");assert(e.mutation_count("t")==1);
+  e.close();
+ }
+ {
+  Engine e(root,1<<20);assert(e.recommended_nprobe("t")==recommendation);assert(e.active_rows("t")==4199);
+  assert(e.mutation_count("t")==1&&e.rows_at_calibration("t")==4200&&e.drift_threshold("t")==840);
+  e.execute("SET search_mode=ann;");ids(e,query("[17000,17000]"));assert(e.last_route()=="ivf");
+  // Exactly the threshold remains calibrated; the next affected row falls back.
+  e.execute("UPDATE t SET category='changed' WHERE id<839;");assert(e.mutation_count("t")==840&&!e.calibration_stale("t"));
+  ids(e,query("[17000,17000]"));assert(e.last_route()=="ivf"&&e.effective_nprobe()==recommendation);
+  e.execute("BEGIN;");e.execute("UPDATE t SET category='rolled' WHERE id=1000;");assert(e.calibration_stale("t"));ids(e,query("[17000,17000]"));assert(e.last_route()=="exact_fallback");e.execute("ROLLBACK;");
+  assert(e.mutation_count("t")==840&&!e.calibration_stale("t"));ids(e,query("[17000,17000]"));assert(e.last_route()=="ivf");
+  e.execute("UPDATE t SET category='committed' WHERE id=1000;");assert(e.mutation_count("t")==841&&e.calibration_stale("t"));
+  ids(e,query("[17000,17000]"));assert(e.last_route()=="exact_fallback"&&e.effective_nprobe()==0);e.close();
+ }
+ {
+  Engine e(root,1<<20);assert(e.mutation_count("t")==841&&e.rows_at_calibration("t")==4200&&e.calibration_stale("t"));
+  e.execute("SET search_mode=ann;");ids(e,query("[17000,17000]"));assert(e.last_route()=="exact_fallback");
+ }
+ // Build inside an explicit transaction, then rollback its fresh namespace.
+ {
+  Engine e(root/"rollback",1<<20);e.execute("CREATE TABLE t (id BIGINT PRIMARY KEY,category VARCHAR(16),v VECTOR(2));");e.execute("INSERT INTO t VALUES (1,'red','[0,0]'),(2,'blue','[1,1]');");
+  e.execute("BEGIN;");e.execute("INSERT INTO t VALUES (3,'red','[2,2]');");e.execute("CREATE VECTOR INDEX vi ON t(v);");assert(e.recommended_nprobe("t")>0);
+  assert(e.drift_threshold("t")==64&&e.rows_at_calibration("t")==3&&e.mutation_count("t")==0);
+  bool duplicate=false;try{e.execute("UPDATE t SET id=10;");}catch(const std::exception&){duplicate=true;}assert(duplicate);assert(ids(e,"SELECT id FROM t ORDER BY id LIMIT 10;")==std::vector<int64_t>({1,2,3}));assert(!e.calibration_stale("t")&&e.mutation_count("t")==0);
+  e.execute("ROLLBACK;");assert(e.recommended_nprobe("t")==0&&e.active_rows("t")==2);
+  e.execute("CREATE VECTOR INDEX vi ON t(v);");e.execute("SET search_mode=ann;");ids(e,query("[0,0]"));assert(e.last_route()=="exact_fallback");e.execute("SET nprobe=1;");ids(e,query("[0,0]"));assert(e.last_route()=="ivf");
+ }
+ // A degenerate training set puts >4092 slots in bucket zero. Its slots
+ // cross the compact page-zero header boundary and a following page.
+ {
+  Engine e(root/"wide_bucket",1<<20);e.execute("CREATE TABLE t (id BIGINT PRIMARY KEY,category VARCHAR(16),v VECTOR(2));");e.execute("BEGIN;");
+  for(int start=0;start<4200;start+=100){std::string sql="INSERT INTO t VALUES ";for(int i=start;i<std::min(start+100,4200);++i){if(i!=start)sql+=",";sql+="("+std::to_string(i)+",'same','[0,0]')";}e.execute(sql+";");}e.execute("COMMIT;");
+  auto undo=e.undo_spill_bytes();e.execute("CREATE VECTOR INDEX vi ON t(v);");assert(e.undo_spill_bytes()==undo);
+  e.execute("SET search_mode=ann;");e.execute("SET nprobe=64;");
+  const auto boundary=query("[0,0]","WHERE id>=4090"),tail=query("[0,0]","WHERE id>=4190");
+  auto before=ids(e,boundary),last=ids(e,tail);assert(before.front()==4090&&before.back()==4099);assert(last.front()==4190&&last.back()==4199);
+  e.execute("BEGIN;");e.execute("DELETE FROM t WHERE id=4091;");e.execute("DELETE FROM t WHERE id=4199;");e.execute("UPDATE t SET v='[1,1]' WHERE id=4092;");
+  auto changed=ids(e,boundary),changed_tail=ids(e,tail);e.execute("SET search_mode=exact;");assert(ids(e,boundary)==changed&&ids(e,tail)==changed_tail);e.execute("ROLLBACK;");e.execute("SET search_mode=ann;");assert(ids(e,boundary)==before&&ids(e,tail)==last);
+  e.close();
+ }
+ // Workspace exhaustion happens after namespace allocation. A failed build
+ // must remove that namespace and retain earlier writes in the transaction.
+ {
+  Engine e(root/"failure",65536);e.execute("CREATE TABLE t (id BIGINT PRIMARY KEY,v VECTOR(1024));");std::string vector="[";for(int i=0;i<1024;++i){if(i)vector+=",";vector+="0";}vector+="]";
+  e.execute("BEGIN;");for(int i=0;i<5;++i)e.execute("INSERT INTO t VALUES ("+std::to_string(i)+",'"+vector+"');");bool failed=false;try{e.execute("CREATE VECTOR INDEX vi ON t(v);");}catch(const std::exception&){failed=true;}assert(failed);assert(e.recommended_nprobe("t")==0);assert(ids(e,"SELECT id FROM t ORDER BY id LIMIT 10;").size()==5);e.execute("COMMIT;");
+ }
+ std::cout<<"index calibration/region regression passed\n";
+}
