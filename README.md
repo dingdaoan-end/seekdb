@@ -14,7 +14,7 @@ work/build/mvdb_local --data-dir /tmp/minivectordb
 
 依赖 Linux、C++20 编译器、CMake >=3.20、zlib；回归驱动使用 Python3 标准库。
 独立性能基准额外使用 NumPy。运行时检测 AVX2/FMA，保留 float64 回退。
-数据文件使用16KiB对齐直接 I/O，数据目录所在文件系统需要支持 O_DIRECT。
+数据文件优先使用16KiB对齐直接I/O；不支持时自动回退有界缓存I/O。
 
 CLI 默认数据根目录 `/data`。未显式指定预算时读取 cgroup v2 的
 `memory.max` 与 `memory.high`，取可解析有限额的较小值，预算为其55%，
@@ -24,8 +24,23 @@ CLI 默认数据根目录 `/data`。未显式指定预算时读取 cgroup v2 的
 `DATA_DIR [MEMORY_BUDGET]` 位置参数。进程以前台方式读取 stdin、写入 stdout，
 每条响应显式 flush，日志与诊断只写 stderr。
 
-目前交互层是开发用的 SQL行输入/JSON行输出适配器，与 Engine 解耦。
-公开题包没有完整正式驱动，因此不声称这些封包、错误码或就绪标识是正式协议。
+交互层遵循官方 [STDIO_PROTOCOL.md](STDIO_PROTOCOL.md)：启动及恢复完成后立即输出
+`{"type":"ready"}`，逐行接收带原样id的JSON请求；execute返回查询列/行或受影响行数，
+SQL错误返回error.code对象，shutdown回滚未提交事务并正常关闭。普通裸SQL行仍兼容，
+旧客户端也需要先消费启动ready。向量投影为JSON数组，BIGINT和id不经double转换。
+未显式提供数据目录时，优先使用VECTORDB_DATA_DIR，再默认/data。
+
+官方交互式验证：
+
+```sh
+python3 protocol_check/run.py --command '["/absolute/path/to/mvdb_local"]' --output work/protocol-native
+python3 protocol_check/run.py --image minivectordb:round6 --output work/protocol-docker
+```
+
+公开题包为官方f4d4e2665版本的20个用例、95条SQL，包含重启、模式切换及错误断言。
+测试驱动逐条使用JSONL；驱动指令不消耗SQL断言。正式容器只读根文件系统下，
+所有临时/排序文件均写数据目录并及时unlink。O_DIRECT被文件系统以EINVAL拒绝时，
+自动切换缓冲I/O并保持有界fadvise排空。
 
 ## Docker（Ubuntu24.04）
 

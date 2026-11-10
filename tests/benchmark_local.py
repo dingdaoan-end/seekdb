@@ -86,6 +86,7 @@ class Client:
         self.messages = []
         self.thread = threading.Thread(target=self.drain, daemon=True)
         self.thread.start()
+        assert json.loads(self.p.stdout.readline()) == {"type":"ready"}
 
     def drain(self):
         try:

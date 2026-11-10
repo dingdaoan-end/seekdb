@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -99,6 +100,8 @@ public:
   ~Storage();
   // Explicit close propagates checkpoint errors; repeated calls are harmless.
   void close();
+  // Anonymous, unbuffered spill file on the same writable volume as the DB.
+  std::shared_ptr<FILE> temporary();
   uint64_t undo_spill_bytes=0, wal_bytes_written=0, shadow_bytes_written=0;
   // Includes recovery and checkpoint epoch initialization; use deltas for commits.
   uint64_t wal_syncs=0;

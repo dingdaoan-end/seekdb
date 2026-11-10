@@ -15,3 +15,6 @@
 /conversation.json text eol=lf
 /agent/conversation.json text eol=lf
 /tools/*.sh text eol=lf
+
+# Preserve the official checker verbatim, including its upstream final blank line.
+/protocol_check/_assertions.py whitespace=-blank-at-eof

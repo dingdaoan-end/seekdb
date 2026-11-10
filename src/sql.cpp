@@ -70,11 +70,16 @@ struct Parser {
     else if(accept("create")) {
       if(accept("vector")){s.kind=Statement::CreateIndex;need("index");s.index=name();need("on");s.table=name();need("(");s.value=name();need(")");}
       else{s.kind=Statement::Create;need("table");s.table=name();need("(");do{
-        Column c;c.name=name();if(accept("bigint"))c.type=Type::Bigint;
+        Column c;c.name=name();if(accept("bigint")||accept("int"))c.type=Type::Bigint;
         else {if(accept("varchar"))c.type=Type::Varchar;else if(accept("vector"))c.type=Type::Vector;else error("unsupported column type");
           need("(");auto width=take();if(width.quoted)error("type width must be numeric");auto n=integer(width.text);if(n<=0||n>1048576)error("invalid type width");c.width=static_cast<uint32_t>(n);need(")");}
         if(accept("primary")){need("key");c.primary=true;}s.columns.push_back(c);
-      }while(accept(","));need(")");}
+      }while(accept(","));need(")");
+        // A single integer column is an unambiguous implicit primary key.
+        size_t keys=0,integers=0,integer_column=0;
+        for(size_t i=0;i<s.columns.size();++i){keys+=s.columns[i].primary;if(s.columns[i].type==Type::Bigint){++integers;integer_column=i;}}
+        if(keys==0&&integers==1)s.columns[integer_column].primary=true;
+      }
     } else if(accept("insert")){s.kind=Statement::Insert;need("into");s.table=name();
       if(accept("(")){do{s.insert_columns.push_back(name());}while(accept(","));need(")");}
       need("values");do{need("(");std::vector<Literal> row;do{row.push_back(literal());}while(accept(","));need(")");s.rows.push_back(std::move(row));}while(accept(","));

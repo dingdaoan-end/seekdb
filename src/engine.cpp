@@ -22,34 +22,34 @@ uint64_t scalar_hash(const Value& value){
   else throw std::runtime_error("invalid sketch scalar");
   return h;
 }
-std::shared_ptr<FILE> temporary(){auto f=std::tmpfile();require(f!=nullptr,"temporary file failed");::setvbuf(f,nullptr,_IONBF,0);return {f,[](FILE* p){std::fclose(p);}};}
 void spill_write(FILE* f,const std::vector<Value>& row){auto before=::ftello(f);auto s=pack_values(row);uint32_t n=static_cast<uint32_t>(s.size());require(std::fwrite(&n,4,1,f)==1&&std::fwrite(s.data(),1,s.size(),f)==s.size(),"result spill failed");total_spill_bytes+=4+s.size();auto after=::ftello(f);if(before/65536!=after/65536){require(::fdatasync(::fileno(f))==0,"spill sync failed");::posix_fadvise(::fileno(f),0,after/PAGE*PAGE,POSIX_FADV_DONTNEED);}}
 bool spill_read(FILE* f,std::vector<Value>& row){uint32_t n=0;auto count=std::fread(&n,1,4,f);if(!count){require(!std::ferror(f),"result read failed");return false;}require(count==4&&n<=16*1024*1024,"corrupt spill record");std::string s(n,'\0');require(std::fread(s.data(),1,n,f)==n,"truncated spill record");row=unpack_values(s);return true;}
 void discard_cache(FILE* f){auto pos=::ftello(f);if(pos>0)::posix_fadvise(::fileno(f),0,pos/PAGE*PAGE,POSIX_FADV_DONTNEED);}
 class Sorter {
+  Storage& storage;
   Reservation memory;
   size_t used=0,capacity;
   std::vector<std::vector<Value>> chunk;
   std::vector<std::shared_ptr<FILE>> levels;
   std::function<bool(const std::vector<Value>&,const std::vector<Value>&)> less;
   std::shared_ptr<FILE> merge(std::shared_ptr<FILE> a,std::shared_ptr<FILE> b){
-    std::rewind(a.get());std::rewind(b.get());auto out=temporary();std::vector<Value> x,y;
+    std::rewind(a.get());std::rewind(b.get());auto out=storage.temporary();std::vector<Value> x,y;
     bool ax=spill_read(a.get(),x),by=spill_read(b.get(),y);
     while(ax||by){if(ax&&(!by||!less(y,x))){spill_write(out.get(),x);ax=spill_read(a.get(),x);discard_cache(a.get());}
       else{spill_write(out.get(),y);by=spill_read(b.get(),y);discard_cache(b.get());}}
     ::fdatasync(::fileno(out.get()));discard_cache(out.get());return out;
   }
-  void run(){if(chunk.empty())return;std::sort(chunk.begin(),chunk.end(),less);auto f=temporary();for(auto& r:chunk)spill_write(f.get(),r);chunk.clear();used=0;
+  void run(){if(chunk.empty())return;std::sort(chunk.begin(),chunk.end(),less);auto f=storage.temporary();for(auto& r:chunk)spill_write(f.get(),r);chunk.clear();used=0;
     ::fdatasync(::fileno(f.get()));discard_cache(f.get());size_t i=0;
     while(i<levels.size()&&levels[i]){f=merge(levels[i],f);levels[i].reset();++i;}
     if(i==levels.size())levels.emplace_back();
     levels[i]=f;
   }
 public:
-  Sorter(MemoryBudget& b,decltype(less) fn):memory(b,(b.limit-b.used)/2),capacity(memory.n/2),less(std::move(fn)){}
+  Sorter(Storage& s,decltype(less) fn):storage(s),memory(s.budget,(s.budget.limit-s.budget.used)/2),capacity(memory.n/2),less(std::move(fn)){}
   void add(std::vector<Value> values){size_t n=pack_values(values).size()*3+values.size()*sizeof(Value)+128;
     require(n<=capacity,"query row exceeds workspace budget");if(used+n>capacity)run();used+=n;chunk.push_back(std::move(values));}
-  std::shared_ptr<FILE> finish(){run();std::shared_ptr<FILE> out;for(auto& f:levels)if(f)out=out?merge(out,f):f;if(!out)out=temporary();std::rewind(out.get());return out;}
+  std::shared_ptr<FILE> finish(){run();std::shared_ptr<FILE> out;for(auto& f:levels)if(f)out=out?merge(out,f):f;if(!out)out=storage.temporary();std::rewind(out.get());return out;}
 };
 }
 void Result::each(const std::function<void(const std::vector<Value>&)>& callback) const {if(memory_rows){for(auto& r:*memory_rows)callback(r);return;}if(!rows)return;std::rewind(rows.get());std::vector<Value> r;while(spill_read(rows.get(),r)){callback(r);discard_cache(rows.get());}}
@@ -241,7 +241,7 @@ Result Engine::execute_inner(const Statement& s){
   std::vector<std::vector<Value>> heap;
   std::unique_ptr<Sorter> sorter;
   if(use_heap){heap_reservation=std::make_shared<Reservation>(storage.budget,retained*s.limit);heap.reserve(s.limit);}
-  else sorter=std::make_unique<Sorter>(storage.budget,less);
+  else sorter=std::make_unique<Sorter>(storage,less);
   std::vector<uint32_t> buckets;size_t distance_expr=0;bool found=false;for(size_t i=0;i<expressions.size();++i)if(expressions[i].distance&&selected[i]==h.ivector){distance_expr=i;found=true;break;}
   bool use_ivf=ann&&h.nlist&&found&&!order.empty()&&order[0].first==distance_expr&&!order[0].second&&s.limit!=UINT64_MAX;
   last_probes=0;route="exact";
@@ -301,7 +301,7 @@ Result Engine::execute_inner(const Statement& s){
     }
   }
   if(use_heap){std::sort(heap.begin(),heap.end(),less);for(auto& r:heap)r.resize(projected);result.memory_rows=std::make_shared<std::vector<std::vector<Value>>>(std::move(heap));result.memory_reservation=std::move(heap_reservation);return result;}
-  auto sorted=sorter->finish();result.rows=temporary();std::vector<Value> values;uint64_t returned=0;
+  auto sorted=sorter->finish();result.rows=storage.temporary();std::vector<Value> values;uint64_t returned=0;
   while(returned<s.limit&&spill_read(sorted.get(),values)){values.resize(projected);spill_write(result.rows.get(),values);++returned;discard_cache(sorted.get());}
   ::fdatasync(::fileno(result.rows.get()));discard_cache(result.rows.get());return result;
 }

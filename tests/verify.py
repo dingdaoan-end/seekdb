@@ -1,4 +1,4 @@
-"""Real-process assertions; local framing is NOT the competition protocol."""
+"""Official JSONL process assertions and public directives."""
 import argparse
 import json
 import math
@@ -34,9 +34,16 @@ class Client:
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, text=True,
                                   env={**os.environ, **env})
+        self.mode="exact"
+        self.sequence=0
+        if "MVDB_RECOVERY_PAUSE_AFTER" not in env:
+            assert json.loads(self.p.stdout.readline()) == {"type":"ready"}
 
     def sql(self, sql, ok=True):
-        self.p.stdin.write(sql + '\n')
+        self.sequence += 1
+        if sql.upper().startswith('SET SEARCH_MODE'):
+            self.mode = 'ann' if 'ann' in sql.lower() else 'exact'
+        self.p.stdin.write(json.dumps({'id':self.sequence,'op':'execute','sql':sql,'search_mode':self.mode}) + '\n')
         self.p.stdin.flush()
         ready, _, _ = select.select([self.p.stdout], [], [], 20)
         if not ready:
@@ -45,6 +52,7 @@ class Client:
         if not line:
             raise AssertionError('process exited: ' + self.p.stderr.read())
         result = json.loads(line)
+        assert type(result.get('id')) is int and result['id']==self.sequence
         assert 'diagnostics' not in result, 'debug metrics must stay on stderr'
         while True:
             diagnostic = self.p.stderr.readline()
@@ -76,6 +84,8 @@ class Client:
 
 
 def equal_cell(a, b):
+    if isinstance(b,list):
+        return isinstance(a,list) and len(a)==len(b) and all(equal_cell(x,y) for x,y in zip(a,b))
     if type(b) is int:
         return type(a) is int and a == b
     if type(b) is float:
@@ -88,6 +98,9 @@ def equal_row(a, b):
 
 
 def check(result, expected):
+    if 'error' in expected:
+        assert result['ok'] is False and isinstance(result['error']['code'],str) and result['error']['code']
+        return
     assert result['ok'] is True
     for field in ('affected_rows', 'columns'):
         if field in expected:
@@ -108,26 +121,28 @@ def check(result, expected):
 
 
 class Public(unittest.TestCase):
-    def test_32_statements(self):
-        total = 0
-        manifest = json.loads((Path(args.repo) / 'mysqltest/manifest.json').read_text())
+    def test_public_statements(self):
+        total=0
+        manifest=json.loads((Path(args.repo)/'mysqltest/manifest.json').read_text())
         for case in manifest['cases']:
-            name = case['id']
-            directory = Path(args.repo) / 'mysqltest/cases'
-            sql = [s for s in (directory / (name + '.test')).read_text().splitlines() if s.strip()]
-            expected = json.loads((directory / (name + '.result')).read_text())
-            self.assertEqual(len(sql), case['statements'])
-            self.assertEqual(len(sql), len(expected))
-            client = Client(clean(name))
+            root=clean(case['id']);client=Client(root);index=0;mode='exact'
+            expected=json.loads((Path(args.repo)/'mysqltest'/case['result']).read_text())
             try:
-                for number, (statement, assertion) in enumerate(zip(sql, expected), 1):
-                    check(client.sql(statement), assertion)
-                    total += 1
-            finally:
-                client.close()
-            print(f'PUBLIC {name}: {len(sql)}/{len(sql)} PASS', flush=True)
-        self.assertEqual(total, 32)
-        print('PUBLIC TOTAL: 32/32 PASS', flush=True)
+                for line in (Path(args.repo)/'mysqltest'/case['test']).read_text().splitlines():
+                    sql=line.strip()
+                    if not sql or sql.startswith('#'):continue
+                    if sql=='--restart':
+                        client.close();client=Client(root);continue
+                    if sql.startswith('--mode '):mode=sql.split()[1];continue
+                    assert not sql.startswith('--'),sql
+                    client.mode=mode
+                    check(client.sql(sql,ok='error' not in expected[index]),expected[index])
+                    index+=1;total+=1
+                self.assertEqual(index,case['statements']);self.assertEqual(index,len(expected))
+            finally:client.close()
+            print(f"PUBLIC {case['id']}: {index}/{index} PASS",flush=True)
+        self.assertEqual(total,sum(c['statements'] for c in manifest['cases']))
+        print(f'PUBLIC TOTAL: {total}/{total} PASS ({len(manifest["cases"])} cases)',flush=True)
 
 
 SCHEMA = 'CREATE TABLE t (id BIGINT PRIMARY KEY, s VARCHAR(3), v VECTOR(2));'
@@ -145,7 +160,7 @@ class Extra(unittest.TestCase):
         run=subprocess.run([str(Path(args.binary).resolve()),'--data-dir',str(root/'db'),'--memory-budget','65536'],
                            input='SELECT id FROM t;\n',text=True,capture_output=True,cwd=root,timeout=20)
         self.assertEqual(run.returncode,0,run.stderr)
-        self.assertEqual(json.loads(run.stdout.splitlines()[0])['rows'],[[9]])
+        self.assertEqual(json.loads(run.stdout.splitlines()[1])['rows'],[[9]])
         self.assertEqual(subprocess.run([str(Path(args.binary).resolve()),'--help'],cwd=root,capture_output=True,timeout=10).returncode,0)
         self.assertNotEqual(subprocess.run([str(Path(args.binary).resolve()),'--unsupported'],cwd=root,capture_output=True,timeout=10).returncode,0)
 

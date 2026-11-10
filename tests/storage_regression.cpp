@@ -10,11 +10,46 @@
 #include <signal.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/syscall.h>
+#include <fcntl.h>
+#include <cstdarg>
+#include <cerrno>
 using namespace mvdb;
+// Deterministically emulate filesystems rejecting O_DIRECT at open or first
+// I/O. The kernel handles all operations outside each narrowly scoped test.
+namespace {int reject_direct=0;unsigned direct_rejections=0;}
+extern "C" int open(const char* path,int flags,...){
+ mode_t mode=0;if(flags&O_CREAT){va_list args;va_start(args,flags);mode=va_arg(args,int);va_end(args);}
+ if(reject_direct==1&&(flags&O_DIRECT)){++direct_rejections;errno=EINVAL;return -1;}
+ return static_cast<int>(::syscall(SYS_openat,AT_FDCWD,path,flags,mode));
+}
+extern "C" ssize_t pread(int fd,void* data,size_t n,off_t offset){
+ if(reject_direct==2&&(::fcntl(fd,F_GETFL)&O_DIRECT)){++direct_rejections;errno=EINVAL;return -1;}
+ return ::syscall(SYS_pread64,fd,data,n,offset);
+}
+extern "C" ssize_t pwrite(int fd,const void* data,size_t n,off_t offset){
+ if(reject_direct==3&&(::fcntl(fd,F_GETFL)&O_DIRECT)){++direct_rejections;errno=EINVAL;return -1;}
+ return ::syscall(SYS_pwrite64,fd,data,n,offset);
+}
 const std::filesystem::path base="/tmp/mvdb_storage_phase3";
 template<class F> void child(F action,bool killed=false){auto c=fork();assert(c>=0);if(!c){action();_exit(0);}int status;assert(waitpid(c,&status,0)==c);assert(killed?WIFSIGNALED(status)&&WTERMSIG(status)==SIGKILL:WIFEXITED(status)&&WEXITSTATUS(status)==0);}
 void kill_now(){::kill(getpid(),SIGKILL);}
 int main(){std::filesystem::remove_all(base);
+ for(int mode=1;mode<=3;mode++){
+  auto fallback=base/("direct_fallback"+std::to_string(mode));reject_direct=mode;direct_rejections=0;
+  {Storage s(fallback,65536);s.begin();Page p{};p[0]=std::byte(41);for(int i=0;i<12;i++)s.write("v",i,p);s.commit();
+   s.begin();p[0]=std::byte(99);for(int i=0;i<12;i++)s.write("v",i,p);s.rollback();
+   for(int i=0;i<12;i++)assert(s.read("v",i)[0]==std::byte(41));
+   auto spill=s.temporary();assert(std::fwrite("spill",1,5,spill.get())==5);std::rewind(spill.get());char bytes[5];assert(std::fread(bytes,1,5,spill.get())==5&&std::memcmp(bytes,"spill",5)==0);
+   auto target=std::filesystem::read_symlink("/proc/self/fd/"+std::to_string(::fileno(spill.get()))).string();assert(target.rfind(fallback.string()+"/spill.",0)==0&&target.ends_with(" (deleted)"));
+   s.close();}
+  assert(direct_rejections>0);
+  {Storage s(fallback,65536);for(int i=0;i<12;i++)assert(s.read("v",i)[0]==std::byte(41));}
+  child([&]{Storage s(fallback,65536);s.begin();Page p{};p[0]=std::byte(42);for(int i=0;i<12;i++)s.write("v",i,p);s.commit();
+   s.begin();p[0]=std::byte(99);for(int i=0;i<12;i++)s.write("v",i,p);kill_now();},true);
+  {Storage s(fallback,65536);for(int i=0;i<12;i++)assert(s.read("v",i)[0]==std::byte(42));}
+  reject_direct=0;
+ }
  auto d=base/"compact";
  {Storage s(d,32<<20);s.begin();std::mt19937 random(7);Page p{},meta{};
   for(int i=0;i<100;i++){for(int j=0;j<128;j++){float v=float(random()%100000)/100000;std::memcpy(p.data()+j*4,&v,4);}s.write("t.v1",i,p);meta[0]=std::byte(i);s.write("t.meta",0,meta);}

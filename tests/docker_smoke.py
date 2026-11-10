@@ -22,7 +22,7 @@ def command(*extra):
 def execute(sql,*extra):
     run=subprocess.run(command(*extra),input=sql,text=True,capture_output=True,timeout=120)
     assert run.returncode==0,(run.returncode,run.stderr)
-    rows=[json.loads(line) for line in run.stdout.splitlines()]
+    rows=[json.loads(line) for line in run.stdout.splitlines()[1:]]
     assert all(row['ok'] is True for row in rows),rows
     return rows,run.stderr
 
@@ -43,6 +43,7 @@ try:
     # docker run syntax is docker run --name NAME --rm ...
     child=subprocess.Popen(crash_command,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
     try:
+        assert json.loads(child.stdout.readline()) == {"type":"ready"}
         for sql in ('BEGIN;','UPDATE t SET s = \'乙\', v = \'[9,9]\' WHERE id=1;'):
             child.stdin.write(sql+'\n');child.stdin.flush()
             answer=json.loads(child.stdout.readline())

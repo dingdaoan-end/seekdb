@@ -12,6 +12,21 @@
 namespace mvdb {
 namespace {
 void require(bool yes,const char* message) { if(!yes) throw std::runtime_error(message); }
+bool buffered(int fd){auto flags=::fcntl(fd,F_GETFL);require(flags>=0,"file flags failed");return !(flags&O_DIRECT);}
+bool disable_direct(int fd){
+  auto flags=::fcntl(fd,F_GETFL);
+  if(flags<0||!(flags&O_DIRECT))return false;
+  require(::fcntl(fd,F_SETFL,flags&~O_DIRECT)==0,"buffered I/O fallback failed");
+  ::posix_fadvise(fd,0,0,POSIX_FADV_RANDOM);return true;
+}
+ssize_t page_read(int fd,void* data,size_t n,off_t offset){
+  ssize_t got;
+  for(;;){got=::pread(fd,data,n,offset);if(got<0&&errno==EINTR)continue;
+    if(got<0&&errno==EINVAL&&disable_direct(fd))continue;
+    break;}
+  if(got>0&&buffered(fd))::posix_fadvise(fd,offset,got,POSIX_FADV_DONTNEED);
+  return got;
+}
 void write_all(int fd,const void* data,size_t n) {
   auto p=static_cast<const char*>(data);
   while(n) { auto done=::write(fd,p,n); if(done<0&&errno==EINTR) continue;
@@ -28,6 +43,16 @@ bool read_all(int fd,void* data,size_t n,uint64_t offset) {
 void sync_drop(int fd) {
   require(::fdatasync(fd)==0,"fdatasync failed");
   ::posix_fadvise(fd,0,0,POSIX_FADV_DONTNEED);
+}
+void page_write(int fd,const void* data,off_t offset){
+  ssize_t n;
+  for(;;){n=::pwrite(fd,data,PAGE,offset);if(n<0&&errno==EINTR)continue;
+    if(n<0&&errno==EINVAL&&disable_direct(fd))continue;
+    break;}
+  require(n==static_cast<ssize_t>(PAGE),"page write failed");
+  // Direct I/O bypasses page cache. On a filesystem requiring buffered I/O,
+  // drain each fixed-size page before allowing another eviction to grow it.
+  if(buffered(fd)){require(::fdatasync(fd)==0,"buffered page sync failed");::posix_fadvise(fd,offset,PAGE,POSIX_FADV_DONTNEED);}
 }
 template<class T> void append(std::string& out,T v) {out.append(reinterpret_cast<const char*>(&v),sizeof(v));}
 template<class T> T take(const std::string& s,size_t& pos) {
@@ -57,11 +82,14 @@ void sync_directory(const std::filesystem::path& p){int fd=::open(p.c_str(),O_RD
 std::filesystem::path wal_path(const std::filesystem::path& root,uint64_t generation){return root/(generation?"wal."+std::to_string(generation):"wal");}
 int page_fd(const std::filesystem::path& path) {
   int fd=::open(path.c_str(),O_RDWR|O_CREAT|O_CLOEXEC|O_DIRECT,0600);
-  require(fd>=0,"O_DIRECT unavailable for data file");return fd;
+  if(fd<0&&(errno==EINVAL||errno==EOPNOTSUPP)){
+    fd=::open(path.c_str(),O_RDWR|O_CREAT|O_CLOEXEC,0600);
+    if(fd>=0)::posix_fadvise(fd,0,0,POSIX_FADV_RANDOM);
+  }
+  require(fd>=0,"open data file failed");return fd;
 }
 void raw_page(const std::filesystem::path& path,uint64_t id,const void* p) {
-  int fd=page_fd(path);auto n=::pwrite(fd,p,PAGE,static_cast<off_t>(id*PAGE));
-  int saved=errno;::close(fd);errno=saved;require(n==static_cast<ssize_t>(PAGE),"direct page write failed");
+  int fd=page_fd(path);try{page_write(fd,p,static_cast<off_t>(id*PAGE));}catch(...){::close(fd);throw;}::close(fd);
 }
 struct LogRecord {char type;std::string payload;uint64_t end;};
 std::optional<LogRecord> read_record(int fd,uint64_t pos) {
@@ -104,7 +132,7 @@ int BufferPool::descriptor(const std::string& file){auto it=descriptors.find(fil
 void BufferPool::flush(size_t i) {
   auto& f=frames[i];if(f.valid&&f.dirty) {
     if(f.uncommitted&&before_flush)before_flush(f.file,f.page);
-    auto n=::pwrite(descriptor(f.file),arena+i*PAGE,PAGE,static_cast<off_t>(f.page*PAGE));require(n==static_cast<ssize_t>(PAGE),"direct page write failed");data_page_write_bytes+=PAGE;f.dirty=false;
+    page_write(descriptor(f.file),arena+i*PAGE,static_cast<off_t>(f.page*PAGE));data_page_write_bytes+=PAGE;f.dirty=false;
   }
 }
 size_t BufferPool::pin(const std::string& file,uint64_t page) {
@@ -128,7 +156,7 @@ size_t BufferPool::pin(const std::string& file,uint64_t page) {
     if(alternative<frames.size())victim=alternative;
   }
   flush(victim);if(frames[victim].valid)lookup.erase(frames[victim].file+":"+std::to_string(frames[victim].page));auto p=arena+victim*PAGE;std::memset(p,0,PAGE);
-  auto n=::pread(descriptor(file),p,PAGE,static_cast<off_t>(page*PAGE));
+  auto n=page_read(descriptor(file),p,PAGE,static_cast<off_t>(page*PAGE));
   require(n==0||n==static_cast<ssize_t>(PAGE),"short/corrupt data page");
   ++physical_reads;
   auto marker=file.rfind(".v");
@@ -191,6 +219,15 @@ void Storage::close(){
   checkpoint();
   closed=true;
 }
+std::shared_ptr<FILE> Storage::temporary(){
+  require(!closed,"storage is closed");
+  auto name=(root/"spill.XXXXXX").string();std::vector<char> path(name.begin(),name.end());path.push_back('\0');
+  int fd=::mkostemp(path.data(),O_CLOEXEC);require(fd>=0,"create spill file failed");
+  if(::unlink(path.data())!=0){::close(fd);throw std::runtime_error("unlink spill file failed");}
+  FILE* file=::fdopen(fd,"w+b");if(!file){::close(fd);throw std::runtime_error("open spill stream failed");}
+  ::setvbuf(file,nullptr,_IONBF,0);
+  return {file,[](FILE* p){std::fclose(p);}};
+}
 void Storage::sync_wal(){sync_drop(wal);++wal_syncs;wal_dirty_bytes=0;}
 void Storage::record(char type,const std::string& payload) {
   if(type=='P'&&redo_capacity){
@@ -239,7 +276,7 @@ void Storage::recover(const std::function<void(size_t)>& hook) {
         while(replay<pos){auto entry=read_record(wal,replay);require(entry.has_value(),"invalid committed WAL");each_delta(*entry,[&](const std::string& payload){
           if(!payload.empty()&&payload[0]=='\0'){discard_region(payload.substr(1));if(hook)hook(++applied);return;}
           std::string file;uint64_t page;Page bytes{};apply_delta(payload,file,page,bytes,true);
-          int fd=page_fd(root/"data"/file);auto n=::pread(fd,aligned,PAGE,static_cast<off_t>(page*PAGE));::close(fd);require(n>=0&&n<=ssize_t(PAGE),"data recovery read failed");
+          int fd=page_fd(root/"data"/file);auto n=page_read(fd,aligned,PAGE,static_cast<off_t>(page*PAGE));::close(fd);require(n>=0&&n<=ssize_t(PAGE),"data recovery read failed");
           if(n)std::memcpy(bytes.data(),aligned,static_cast<size_t>(n));
           apply_delta(payload,file,page,bytes);
           std::memcpy(aligned,bytes.data(),PAGE);raw_page(root/"data"/file,page,aligned);if(hook)hook(++applied);});replay=entry->end;
@@ -269,7 +306,7 @@ void Storage::protect(const std::string& file,uint64_t page){
     else require(read_all(index,&length,8,0),"shadow index header missing");
     std::string payload;append(payload,static_cast<uint8_t>(file.size()));payload+=file;append(payload,page);append(payload,length);
     bool exists=page<length/PAGE;append(payload,static_cast<uint8_t>(exists));
-    if(exists){alignas(4096) Page bytes{};bool ok=read_all(fd,bytes.data(),PAGE,page*PAGE);::close(fd);fd=-1;require(ok,"shadow original missing");payload.append(reinterpret_cast<const char*>(bytes.data()),PAGE);}else ::close(fd);
+    if(exists){alignas(4096) Page bytes{};auto got=page_read(fd,bytes.data(),PAGE,static_cast<off_t>(page*PAGE));::close(fd);fd=-1;require(got==static_cast<ssize_t>(PAGE),"shadow original missing");payload.append(reinterpret_cast<const char*>(bytes.data()),PAGE);}else ::close(fd);
     std::string record(1,'S');record+=payload;uint32_t n=record.size(),crc=checksum(record);
     auto end=::lseek(shadow,0,SEEK_END);require(end>=0,"shadow journal seek failed");
     try{write_all(shadow,&n,4);write_all(shadow,&crc,4);write_all(shadow,record.data(),record.size());sync_drop(shadow);shadow_bytes_written+=8+record.size();}catch(...){closed=true;throw;}
