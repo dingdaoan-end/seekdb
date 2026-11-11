@@ -26,6 +26,8 @@ class Engine {
     uint32_t active_count=0,recommended_nprobe=0,calibration_stale=0; // Legacy on-disk field; retained for offsets.
     char index_region[128]{};
     uint64_t mutations_since_calibration=0,rows_at_calibration=0;
+    uint32_t calibration_skipped=0; // Empirical recommendation is not a recall certificate.
+    uint32_t calibration_queries=0;
   };
   static uint64_t drift_limit(const Header& h){return h.rows_at_calibration/5>64?h.rows_at_calibration/5:64;}
   static bool stale(const Header& h){return h.calibration_stale||h.mutations_since_calibration>drift_limit(h);}
@@ -48,7 +50,7 @@ class Engine {
   std::string index_base(const std::string&,const Header&) const;
   uint32_t bucket(const std::string&,const Header&,SlotId);
   void put_bucket(const std::string&,const Header&,SlotId,uint32_t);
-  uint32_t calibrate(const std::string&,const Header&,const std::vector<Column>&);
+  uint32_t calibrate(const std::string&,Header&,const std::vector<Column>&);
   Result execute_inner(const Statement&);
 public:
   Engine(std::filesystem::path root,size_t budget=8*1024*1024,std::function<void(size_t)> progress={})
@@ -60,6 +62,8 @@ public:
   bool calibration_stale(const std::string& t){return stale(header(t));}
   uint64_t mutation_count(const std::string& t){return header(t).mutations_since_calibration;}
   uint64_t rows_at_calibration(const std::string& t){return header(t).rows_at_calibration;}
+  bool calibration_skipped(const std::string& t){return header(t).calibration_skipped!=0;}
+  uint32_t calibration_query_count(const std::string& t){return header(t).calibration_queries;}
   uint64_t drift_threshold(const std::string& t){return drift_limit(header(t));}
   uint32_t effective_nprobe() const{return last_probes;}
   uint32_t last_nlist() const{return last_lists;}

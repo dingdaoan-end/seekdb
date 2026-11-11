@@ -19,6 +19,7 @@ int main(){
   for(int start=0;start<4200;start+=100){std::string sql="INSERT INTO t VALUES ";for(int i=start;i<std::min(start+100,4200);++i){if(i!=start)sql+=",";auto x=(i%64)*1000+(i/64)*.001;sql+="("+std::to_string(i)+",'"+(i%2?"red":"blue")+"','["+std::to_string(x)+","+std::to_string(x)+"]')";}e.execute(sql+";");}e.execute("COMMIT;");
   auto undo=e.undo_spill_bytes();e.execute("CREATE VECTOR INDEX vi ON t(v);");assert(e.undo_spill_bytes()-undo<8192);
   recommendation=e.recommended_nprobe("t");assert(recommendation>=1&&recommendation<=32);assert(e.active_rows("t")==4200);
+  assert(!e.calibration_skipped("t")&&e.calibration_query_count("t")==16);
   assert(e.mutation_count("t")==0&&e.rows_at_calibration("t")==4200&&e.drift_threshold("t")==840);
   e.execute("SET search_mode=ann;");auto q=query("[17000.0215,17000.0195]");auto automatic=ids(e,q);assert(e.effective_nprobe()==(e.last_route()=="ivf"?recommendation:0));
   e.execute("SET nprobe=64;");auto all=ids(e,q);assert(e.last_route()=="ivf"&&e.effective_nprobe()==64);
@@ -69,6 +70,20 @@ int main(){
   e.execute("BEGIN;");e.execute("DELETE FROM t WHERE id=4091;");e.execute("DELETE FROM t WHERE id=4199;");e.execute("UPDATE t SET v='[1,1]' WHERE id=4092;");
   auto changed=ids(e,boundary),changed_tail=ids(e,tail);e.execute("SET search_mode=exact;");assert(ids(e,boundary)==changed&&ids(e,tail)==changed_tail);e.execute("ROLLBACK;");e.execute("SET search_mode=ann;");assert(ids(e,boundary)==before&&ids(e,tail)==last);
   e.close();
+ }
+ // Payloads beyond half the configured budget use a persisted empirical probe
+ // count. Automatic searches remain exact until a measured calibration exists.
+ {
+  auto path=root/"budget_skip";std::string zero="[";for(int j=0;j<32;++j){if(j)zero+=",";zero+="0";}zero+="]";
+  {
+   Engine e(path,1<<20);e.execute("CREATE TABLE t (id BIGINT PRIMARY KEY,category VARCHAR(16),v VECTOR(32));");e.execute("BEGIN;");
+   for(int start=0;start<4200;start+=100){std::string sql="INSERT INTO t VALUES ";for(int i=start;i<std::min(start+100,4200);++i){if(i!=start)sql+=",";sql+="("+std::to_string(i)+",'same','"+zero+"')";}e.execute(sql+";");}e.execute("COMMIT;");
+   auto spills=e.spill_bytes();e.execute("CREATE VECTOR INDEX vi ON t(v);");assert(e.recommended_nprobe("t")==16&&e.calibration_skipped("t")&&e.calibration_query_count("t")==0);
+   e.execute("SET search_mode=ann;");auto result=ids(e,query(zero));assert(e.last_route()=="exact_fallback"&&e.effective_nprobe()==0&&result.size()==10);
+   e.execute("SET nprobe=64;");assert(ids(e,query(zero))==result&&e.last_route()=="ivf");assert(e.spill_bytes()==spills);assert(e.budget_peak()<=(1U<<20));e.close();
+  }
+  Engine e(path,1<<20);assert(e.calibration_skipped("t")&&e.calibration_query_count("t")==0&&e.recommended_nprobe("t")==16);
+  e.execute("SET search_mode=ann;");ids(e,query(zero));assert(e.last_route()=="exact_fallback");
  }
  // Workspace exhaustion happens after namespace allocation. A failed build
  // must remove that namespace and retain earlier writes in the transaction.

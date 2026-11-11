@@ -17,25 +17,101 @@
 using namespace mvdb;
 // Deterministically emulate filesystems rejecting O_DIRECT at open or first
 // I/O. The kernel handles all operations outside each narrowly scoped test.
-namespace {int reject_direct=0;unsigned direct_rejections=0;}
+namespace {
+int reject_direct=0;unsigned direct_rejections=0;
+bool audit_io=false;
+unsigned direct_opens=0,data_syncs=0,full_syncs=0,cache_drops=0,data_file_syncs=0,wal_file_syncs=0;
+unsigned sync_interruptions=0,index_read_interruptions=0,index_write_interruptions=0;
+std::string descriptor_path(int fd){
+ char path[512];auto link="/proc/self/fd/"+std::to_string(fd);auto n=::readlink(link.c_str(),path,sizeof(path));
+ return n>0?std::string(path,static_cast<size_t>(n)):std::string{};
+}
+bool shadow_index(int fd){return descriptor_path(fd).find("/index/")!=std::string::npos;}
+void reset_audit(){direct_opens=data_syncs=full_syncs=cache_drops=data_file_syncs=wal_file_syncs=0;}
+}
 extern "C" int open(const char* path,int flags,...){
+ if(audit_io&&(flags&O_DIRECT))++direct_opens;
  mode_t mode=0;if(flags&O_CREAT){va_list args;va_start(args,flags);mode=va_arg(args,int);va_end(args);}
  if(reject_direct==1&&(flags&O_DIRECT)){++direct_rejections;errno=EINVAL;return -1;}
  return static_cast<int>(::syscall(SYS_openat,AT_FDCWD,path,flags,mode));
 }
 extern "C" ssize_t pread(int fd,void* data,size_t n,off_t offset){
+ if(index_read_interruptions&&shadow_index(fd)){--index_read_interruptions;errno=EINTR;return -1;}
  if(reject_direct==2&&(::fcntl(fd,F_GETFL)&O_DIRECT)){++direct_rejections;errno=EINVAL;return -1;}
  return ::syscall(SYS_pread64,fd,data,n,offset);
 }
 extern "C" ssize_t pwrite(int fd,const void* data,size_t n,off_t offset){
+ if(index_write_interruptions&&shadow_index(fd)){--index_write_interruptions;errno=EINTR;return -1;}
  if(reject_direct==3&&(::fcntl(fd,F_GETFL)&O_DIRECT)){++direct_rejections;errno=EINVAL;return -1;}
  return ::syscall(SYS_pwrite64,fd,data,n,offset);
+}
+extern "C" int fdatasync(int fd){if(audit_io){++data_syncs;if(descriptor_path(fd).find("/wal")!=std::string::npos)++wal_file_syncs;}if(sync_interruptions){--sync_interruptions;errno=EINTR;return -1;}return static_cast<int>(::syscall(SYS_fdatasync,fd));}
+extern "C" int fsync(int fd){if(audit_io){++full_syncs;if(descriptor_path(fd).find("/data/")!=std::string::npos)++data_file_syncs;}if(sync_interruptions){--sync_interruptions;errno=EINTR;return -1;}return static_cast<int>(::syscall(SYS_fsync,fd));}
+extern "C" int posix_fadvise(int fd,off_t offset,off_t length,int advice) noexcept {
+ if(audit_io&&advice==POSIX_FADV_DONTNEED)++cache_drops;
+ auto result=::syscall(SYS_fadvise64,fd,offset,length,advice);return result<0?errno:static_cast<int>(result);
 }
 const std::filesystem::path base="/tmp/mvdb_storage_phase3";
 template<class F> void child(F action,bool killed=false){auto c=fork();assert(c>=0);if(!c){action();_exit(0);}int status;assert(waitpid(c,&status,0)==c);assert(killed?WIFSIGNALED(status)&&WTERMSIG(status)==SIGKILL:WIFEXITED(status)&&WEXITSTATUS(status)==0);}
 void kill_now(){::kill(getpid(),SIGKILL);}
-int main(){std::filesystem::remove_all(base);
+// Returning to implicit direct I/O would make default reads fail this audit.
+void buffered_default(){
+ for(const char* value:{static_cast<const char*>(nullptr),"0","true"}){
+  if(value)::setenv("MVDB_USE_ODIRECT",value,1);else ::unsetenv("MVDB_USE_ODIRECT");
+  auto path=base/("buffered_"+std::string(value?value:"unset"));Storage s(path,65536);
+  reset_audit();audit_io=true;s.read("t.v1",0);audit_io=false;
+  assert(direct_opens==0&&cache_drops==0);
+ }
+ ::unsetenv("MVDB_USE_ODIRECT");
+}
+// A three-frame pool must retain hot table and primary metadata across a
+// streaming payload scan, while still admitting payload and dirty evictions.
+void metadata_scan(){
+ Storage s(base/"metadata_scan",65536);s.read("t.header",0);s.read("t.pk",0);
+ auto reads=s.pool.physical_reads;
+ for(int i=0;i<100;i++)s.read("t.v1",i);
+ assert(s.pool.physical_reads==reads+100);reads=s.pool.physical_reads;
+ s.read("t.header",0);s.read("t.pk",0);assert(s.pool.physical_reads==reads);
+ s.begin();Page p{};p[0]=std::byte(31);
+ for(int i=0;i<40;i++){s.write("table"+std::to_string(i%8)+".pk",i,p);s.write("t.v1",i,p);}
+ assert(s.shadow_bytes_written>0);s.rollback();
+ for(int i=0;i<40;i++)assert(s.read("t.v1",i)[0]==std::byte(0));
+ assert(s.budget.peak<=s.budget.limit);
+}
+// Observe real syscalls: a multi-window transaction steals original pages
+// and spills undo, yet performs only its single COMMIT sync until checkpoint.
+void transaction_sync_boundary(){
+ ::unsetenv("MVDB_USE_ODIRECT");Storage s(base/"sync_boundary",65536);std::mt19937 random(51);Page p{};
+ auto fill=[&]{for(size_t j=0;j<PAGE;j+=4){uint32_t v=random();std::memcpy(p.data()+j,&v,4);}};
+ s.begin();for(int i=0;i<40;i++){fill();s.write("t.v1",i,p);}s.commit();s.checkpoint();
+ auto syncs=s.wal_syncs,spill=s.undo_spill_bytes;reset_audit();audit_io=true;s.begin();
+ for(int i=0;i<40;i++){fill();s.write("t.v1",i,p);}
+ assert(s.undo_spill_bytes-spill>64*1024&&s.shadow_bytes_written>0);
+ assert(data_syncs==0&&full_syncs==0&&cache_drops==0&&direct_opens==0);
+ s.commit();audit_io=false;assert(data_syncs==1&&wal_file_syncs==1&&full_syncs==0&&cache_drops==0);
+ assert(s.wal_syncs-syncs==1);
+ reset_audit();audit_io=true;
+ s.checkpoint([&](size_t stage){if(stage==1)assert(data_file_syncs>0);});audit_io=false;
+ assert(data_file_syncs>0&&full_syncs>0&&cache_drops==0);
+}
+// Graceful shutdown signals may interrupt a checkpoint or shadow operation.
+// Retry these syscall boundaries rather than turning a signal into I/O failure.
+void interrupted_io(){
+ Storage s(base/"interrupted_io",65536);s.begin();Page p{};p[0]=std::byte(21);
+ index_read_interruptions=2;index_write_interruptions=2;
+ for(int i=0;i<12;i++)s.write("v",i,p);
+ assert(index_read_interruptions==0&&index_write_interruptions==0);
+ sync_interruptions=2;s.commit();assert(sync_interruptions==0);
+ sync_interruptions=2;s.checkpoint();assert(sync_interruptions==0);
+ for(int i=0;i<12;i++)assert(s.read("v",i)[0]==std::byte(21));
+}
+int main(int argc,char** argv){
+ ::unsetenv("MVDB_USE_ODIRECT");
+ if(argc==2){std::filesystem::remove_all(base);std::string test=argv[1];
+  if(test=="buffered")buffered_default();else if(test=="metadata")metadata_scan();else if(test=="sync")transaction_sync_boundary();else if(test=="interrupt")interrupted_io();else return 2;return 0;}
+ std::filesystem::remove_all(base);buffered_default();metadata_scan();transaction_sync_boundary();interrupted_io();
  for(int mode=1;mode<=3;mode++){
+  ::setenv("MVDB_USE_ODIRECT","1",1);
   auto fallback=base/("direct_fallback"+std::to_string(mode));reject_direct=mode;direct_rejections=0;
   {Storage s(fallback,65536);s.begin();Page p{};p[0]=std::byte(41);for(int i=0;i<12;i++)s.write("v",i,p);s.commit();
    s.begin();p[0]=std::byte(99);for(int i=0;i<12;i++)s.write("v",i,p);s.rollback();
@@ -50,24 +126,24 @@ int main(){std::filesystem::remove_all(base);
   {Storage s(fallback,65536);for(int i=0;i<12;i++)assert(s.read("v",i)[0]==std::byte(42));}
   reject_direct=0;
  }
+ ::unsetenv("MVDB_USE_ODIRECT");
  auto d=base/"compact";
  {Storage s(d,32<<20);s.begin();std::mt19937 random(7);Page p{},meta{};
   for(int i=0;i<100;i++){for(int j=0;j<128;j++){float v=float(random()%100000)/100000;std::memcpy(p.data()+j*4,&v,4);}s.write("t.v1",i,p);meta[0]=std::byte(i);s.write("t.meta",0,meta);}
   s.commit();for(auto& e:std::filesystem::directory_iterator(d))assert(e.path().filename().string().rfind("committed.",0)!=0);auto n=std::filesystem::file_size(d/"wal");std::cout<<"128D row WAL bytes="<<n/100.0<<" undo spill="<<s.undo_spill_bytes<<"\n";assert(n<=60000);assert(s.shadow_bytes_written==0);assert(s.undo_spill_bytes==0);assert(s.budget.peak<=s.budget.limit);s.close();assert(s.shadow_bytes_written==0);}
- // Consecutive ordinary batches cross absolute 64KiB file offsets, but each
- // remains below the dirty-window limit and has exactly one WAL fdatasync.
+ // Every COMMIT has exactly one WAL fdatasync, regardless of absolute file
+ // offset or the number of 64KiB windows in its transaction.
  d=base/"single_sync";
  {Storage s(d,32<<20);std::mt19937 random(17);
   for(int batch=0;batch<4;batch++){auto syncs=s.wal_syncs,bytes=s.wal_bytes_written;s.begin();Page p{},meta{};
    for(int i=0;i<100;i++){for(int j=0;j<128;j++){float v=float(random()%100000)/100000;std::memcpy(p.data()+j*4,&v,4);}s.write("t.v1",batch*100+i,p);meta[0]=std::byte(i);for(int j=8;j<104;j++)meta[j]=std::byte(random()&255);s.write("t.meta",0,meta);}
    s.commit();auto written=s.wal_bytes_written-bytes;std::cout<<"100-row WAL bytes="<<written<<" syncs="<<s.wal_syncs-syncs<<"\n";assert(written>54*1024&&written<64*1024);assert(s.wal_syncs-syncs==1);
   }
-  // Large transactions still drain bounded WAL windows rather than retaining
-  // their whole dirty log in the kernel until COMMIT.
+  // Large transactions also sync only at COMMIT; kernel cache is reclaimable
+  // and charged to the external memory controller, not this userspace pool.
   auto syncs=s.wal_syncs,bytes=s.wal_bytes_written;s.begin();Page p{};
   for(int i=0;i<1600;i++){for(int j=0;j<128;j++){auto v=random();std::memcpy(p.data()+j*4,&v,4);}s.write("large",i,p);}
-  s.commit();auto written=s.wal_bytes_written-bytes;assert(written>512*1024);assert(s.wal_syncs-syncs>1);
-  assert(s.wal_syncs-syncs<=written/(64*1024)+1);
+  s.commit();auto written=s.wal_bytes_written-bytes;assert(written>512*1024);assert(s.wal_syncs-syncs==1);
  }
  d=base/"compact";
  {Storage s(d,65536);s.begin();auto mark=s.savepoint();Page p{};for(int i=0;i<300;i++){p[0]=std::byte(i%255);s.write("tiny",i,p);}assert(s.undo_spill_bytes>0);s.rollback_to(mark);for(int i=0;i<300;i++)assert(s.read("tiny",i)[0]==std::byte(0));s.commit();assert(s.budget.peak<=s.budget.limit);}

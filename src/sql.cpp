@@ -19,6 +19,14 @@ std::vector<Token> lex(const std::string& sql) {
   std::vector<Token> tokens;
   for(size_t p=0;p<sql.size();) {
     unsigned char c=sql[p];if(std::isspace(c)) {++p;continue;}
+    // Comments are whitespace only outside quoted literals. Every path either
+    // advances p or fails, including comments at EOF and repeated semicolons.
+    if(c=='-'&&p+1<sql.size()&&sql[p+1]=='-'){
+      p+=2;while(p<sql.size()&&sql[p]!='\n'&&sql[p]!='\r')++p;continue;
+    }
+    if(c=='/'&&p+1<sql.size()&&sql[p+1]=='*'){
+      auto end=sql.find("*/",p+2);if(end==std::string::npos)error("unterminated SQL comment");p=end+2;continue;
+    }
     if(c=='\'') {
       ++p;std::string s;bool closed=false;
       while(p<sql.size()) {char ch=sql[p++];if(ch=='\'') {
@@ -95,7 +103,9 @@ struct Parser {
       if(accept("order")){need("by");do{auto col=name();bool desc=accept("desc");if(!desc)accept("asc");s.order.emplace_back(col,desc);}while(accept(","));}
       if(accept("limit")){auto count=take();if(count.quoted)error("LIMIT must be numeric");auto n=integer(count.text);if(n<0)error("negative LIMIT");s.limit=static_cast<uint64_t>(n);}
     }else error("unsupported SQL statement");
-    accept(";");if(pos!=tokens.size())error("trailing SQL tokens");return s;
+    while(accept(";")){} // Permit empty trailing statements, never a second SQL statement.
+    if(pos!=tokens.size())error("trailing SQL tokens (multiple statements are unsupported)");
+    return s;
   }
 };
 template<class T>void append(std::string& s,T n){s.append(reinterpret_cast<const char*>(&n),sizeof(n));}

@@ -14,7 +14,7 @@ work/build/mvdb_local --data-dir /tmp/minivectordb
 
 依赖 Linux、C++20 编译器、CMake >=3.20、zlib；回归驱动使用 Python3 标准库。
 独立性能基准额外使用 NumPy。运行时检测 AVX2/FMA，保留 float64 回退。
-数据文件优先使用16KiB对齐直接I/O；不支持时自动回退有界缓存I/O。
+数据页为16KiB，默认使用buffered pread/pwrite；仅MVDB_USE_ODIRECT=1时启用直接I/O，并保留不支持时的回退。
 
 CLI 默认数据根目录 `/data`。未显式指定预算时读取 cgroup v2 的
 `memory.max` 与 `memory.high`，取可解析有限额的较小值，预算为其55%，
@@ -34,13 +34,16 @@ SQL错误返回error.code对象，shutdown回滚未提交事务并正常关闭�
 
 ```sh
 python3 protocol_check/run.py --command '["/absolute/path/to/mvdb_local"]' --output work/protocol-native
-python3 protocol_check/run.py --image minivectordb:round6 --output work/protocol-docker
+python3 protocol_check/run.py --image minivectordb:round7 --output work/protocol-docker
 ```
 
 公开题包为官方f4d4e2665版本的20个用例、95条SQL，包含重启、模式切换及错误断言。
 测试驱动逐条使用JSONL；驱动指令不消耗SQL断言。正式容器只读根文件系统下，
-所有临时/排序文件均写数据目录并及时unlink。O_DIRECT被文件系统以EINVAL拒绝时，
-自动切换缓冲I/O并保持有界fadvise排空。
+所有临时/排序文件均写数据目录并及时unlink。默认buffered I/O允许内核复用干净页，
+BufferPool为.pk/.header保留有上限的优先份额，顺序扫描使用其余帧。直接I/O
+仅由MVDB_USE_ODIRECT=1显式启用；若文件系统拒绝，则自动回退。
+SIGTERM/SIGINT处理器只设置sig_atomic_t标志；空闲输入可立即中断，在安全边界
+执行关闭回滚。正在执行的SQL和响应先完成；stdout消费者始终不读取时仍可能形成背压。
 
 ## Docker（Ubuntu24.04）
 
@@ -94,13 +97,17 @@ python3 tests/docker_smoke.py --image minivectordb:final
 
 CREATE VECTOR INDEX 在新分配的索引区内构建，N>=4096使用64桶，小表最多8桶。
 构建完成后，C++引擎确定性抽样无过滤查询和高频字符串等值过滤查询，直接比较
-Exact Top-10与各nprobe召回，选择两组均达到平均Recall@10>=0.985的最小值，
+16条样本（无过滤/高频等值过滤各8条），在一次向量扫描中维护各样本Top-10，
+再比较各nprobe召回，选择两组均达到平均Recall@10>=0.985的最小值，
 将 recommended_nprobe 写入索引元数据。查询不依赖外部Python校准。
+若有效向量payload超过引擎预算一半或校准工作区不足，跳过抽样校准，持久化
+经验推荐max(4,nlist/4)（不超过nlist）和calibration_skipped。该推荐没有召回证明，
+自动ANN保守使用Exact；手动NPROBE仍可选择IVF。
 
 ann且未手动覆盖NPROBE时使用持久化推荐值。建索引时记录
 `rows_at_calibration`，每条成功DML按受影响行数增加持久化的
 `mutations_since_calibration`；计数不超过`max(64, rows_at_calibration/5)`
-时保留推荐值并同步维护倒排桶、有效位图和槽位映射。仅在严格超过阈值、
+时保留推荐值并同步维护倒排桶、有效位图和槽位映射。预算跳过校准、严格超过阈值、
 推荐探测超过一半桶或活跃行数小于4096时，自动回退连续SIMD扫描。
 计数与数据一起受语句/事务Undo管理；阈值外当前保守回退，不在查询中隐式重建。
 显式 `SET NPROBE = n` 保留手工控制，`SET NPROBE = 0` 恢复自动模式。
@@ -119,11 +126,11 @@ Savepoint，不撤销外层事务已经成功的语句。新索引区只记录�
 
 Redo WAL记录带CRC32的变化范围并按有界批次压缩，COMMIT前同步WAL。
 No-Steal是有界偏好：优先保留未提交脏页，但不允许冷页无限占住小缓存。
-不得不逐出未提交脏页时，先同步该页原始前镜像或文件旧长度，再覆盖data页。
+不得不逐出未提交脏页时，先完成该页原始前镜像或文件旧长度的write，再覆盖data页；不逐页fsync。
 恢复先回放当前epoch的Shadow，再重放完整提交WAL；中途再次强杀可重复恢复。
 完整长度与IEEE CRC32校验的COMMIT帧是提交权威；常规100行批次仅执行
-一次WAL fdatasync，不再写入独立提交水位文件。大事务按事务内未同步字节窗口
-有界排空，可能额外同步。崩溃模型为SIGKILL，不包含断电或外部篡改。
+一次WAL fdatasync，不再写入独立提交水位文件。Undo、Shadow逐出和临时排序
+不执行64KiB窗口同步；Spill按数MiB块及运行结束时作轻量缓存提示。崩溃模型为SIGKILL，不包含断电或外部篡改。
 完整WAL可重建新追加页的短尾；CRC仍检查帧完整性，不承诺恢复人为破坏的已确认日志。
 
 正常Checkpoint只原地刷脏页、同步数据文件和目录，再原子发布新的空WAL/Shadow
@@ -131,7 +138,8 @@ epoch，最后退役旧epoch。不复制全表快照。提交页刷写与Shadow�
 崩溃回归验证；旧epoch Shadow不会在新Checkpoint发布后被错误应用。
 
 第二阶段格式的数据目录需要导出重建；遇到旧格式会明确拒绝，不静默清空。
-MemoryBudget不是整个进程RSS或cgroup memory.peak；基准分别记录这些指标。
+MemoryBudget不是整个进程RSS或cgroup memory.peak。干净Page Cache可被回收，
+但这不意味着任意内存限额下都不可能OOM；内核缓存和进程内存必须一起计入容器限额。
 
 ## 自动模式基准
 
@@ -150,3 +158,15 @@ python3 tests/benchmark_local.py --phase after --automatic-ann --default-budget 
 安装NumPy的Python被CMake选中时，CTest包含dynamic_dml：10k建索引后各50次
 插入/更新/删除，校验150次可见性及1200次ANN的IVF/5路径和独立真值召回。
 最终交互证据在`agent/conversation.json`和根目录`conversation.json`，两份字节一致。
+
+## 小预算防超时复验
+
+```sh
+python3 tests/low_memory.py --binary work/build/mvdb_local --phase after --output work/low-memory.json --enforce-latency
+```
+
+固定种子10k×128D，在4MiB/8MiB引擎预算下各执行100批写入、建索引、
+Exact/ANN各1000查询、全表事务修改/回滚、强杀恢复并校验已提交数据。
+每条SQL响应必须低于0.5秒，输出保存全部请求计时；该指标是本机实测，
+不能当成任意硬件或任意SQL规模的时限保证。
+NumPy可用时CTest包含此完整回归及16MiB预算下的增量IVF维护验证。

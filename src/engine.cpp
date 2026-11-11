@@ -22,8 +22,12 @@ uint64_t scalar_hash(const Value& value){
   else throw std::runtime_error("invalid sketch scalar");
   return h;
 }
-void spill_write(FILE* f,const std::vector<Value>& row){auto before=::ftello(f);auto s=pack_values(row);uint32_t n=static_cast<uint32_t>(s.size());require(std::fwrite(&n,4,1,f)==1&&std::fwrite(s.data(),1,s.size(),f)==s.size(),"result spill failed");total_spill_bytes+=4+s.size();auto after=::ftello(f);if(before/65536!=after/65536){require(::fdatasync(::fileno(f))==0,"spill sync failed");::posix_fadvise(::fileno(f),0,after/PAGE*PAGE,POSIX_FADV_DONTNEED);}}
-bool spill_read(FILE* f,std::vector<Value>& row){uint32_t n=0;auto count=std::fread(&n,1,4,f);if(!count){require(!std::ferror(f),"result read failed");return false;}require(count==4&&n<=16*1024*1024,"corrupt spill record");std::string s(n,'\0');require(std::fread(s.data(),1,n,f)==n,"truncated spill record");row=unpack_values(s);return true;}
+constexpr off_t SPILL_CACHE_CHUNK=4*1024*1024;
+void spill_progress(FILE* f,off_t before){auto after=::ftello(f);if(before/SPILL_CACHE_CHUNK!=after/SPILL_CACHE_CHUNK)::posix_fadvise(::fileno(f),0,after/PAGE*PAGE,POSIX_FADV_DONTNEED);}
+// Sort/result files are disposable after process death. They need no durability
+// syncs; advise the kernel only after several MiB of sequential work.
+void spill_write(FILE* f,const std::vector<Value>& row){auto before=::ftello(f);auto s=pack_values(row);uint32_t n=static_cast<uint32_t>(s.size());require(std::fwrite(&n,4,1,f)==1&&std::fwrite(s.data(),1,s.size(),f)==s.size(),"result spill failed");total_spill_bytes+=4+s.size();spill_progress(f,before);}
+bool spill_read(FILE* f,std::vector<Value>& row){auto before=::ftello(f);uint32_t n=0;auto count=std::fread(&n,1,4,f);if(!count){require(!std::ferror(f),"result read failed");return false;}require(count==4&&n<=16*1024*1024,"corrupt spill record");std::string s(n,'\0');require(std::fread(s.data(),1,n,f)==n,"truncated spill record");row=unpack_values(s);spill_progress(f,before);return true;}
 void discard_cache(FILE* f){auto pos=::ftello(f);if(pos>0)::posix_fadvise(::fileno(f),0,pos/PAGE*PAGE,POSIX_FADV_DONTNEED);}
 class Sorter {
   Storage& storage;
@@ -35,12 +39,12 @@ class Sorter {
   std::shared_ptr<FILE> merge(std::shared_ptr<FILE> a,std::shared_ptr<FILE> b){
     std::rewind(a.get());std::rewind(b.get());auto out=storage.temporary();std::vector<Value> x,y;
     bool ax=spill_read(a.get(),x),by=spill_read(b.get(),y);
-    while(ax||by){if(ax&&(!by||!less(y,x))){spill_write(out.get(),x);ax=spill_read(a.get(),x);discard_cache(a.get());}
-      else{spill_write(out.get(),y);by=spill_read(b.get(),y);discard_cache(b.get());}}
-    ::fdatasync(::fileno(out.get()));discard_cache(out.get());return out;
+    while(ax||by){if(ax&&(!by||!less(y,x))){spill_write(out.get(),x);ax=spill_read(a.get(),x);}
+      else{spill_write(out.get(),y);by=spill_read(b.get(),y);}}
+    discard_cache(a.get());discard_cache(b.get());discard_cache(out.get());return out;
   }
   void run(){if(chunk.empty())return;std::sort(chunk.begin(),chunk.end(),less);auto f=storage.temporary();for(auto& r:chunk)spill_write(f.get(),r);chunk.clear();used=0;
-    ::fdatasync(::fileno(f.get()));discard_cache(f.get());size_t i=0;
+    discard_cache(f.get());size_t i=0;
     while(i<levels.size()&&levels[i]){f=merge(levels[i],f);levels[i].reset();++i;}
     if(i==levels.size())levels.emplace_back();
     levels[i]=f;
@@ -52,7 +56,7 @@ public:
   std::shared_ptr<FILE> finish(){run();std::shared_ptr<FILE> out;for(auto& f:levels)if(f)out=out?merge(out,f):f;if(!out)out=storage.temporary();std::rewind(out.get());return out;}
 };
 }
-void Result::each(const std::function<void(const std::vector<Value>&)>& callback) const {if(memory_rows){for(auto& r:*memory_rows)callback(r);return;}if(!rows)return;std::rewind(rows.get());std::vector<Value> r;while(spill_read(rows.get(),r)){callback(r);discard_cache(rows.get());}}
+void Result::each(const std::function<void(const std::vector<Value>&)>& callback) const {if(memory_rows){for(auto& r:*memory_rows)callback(r);return;}if(!rows)return;std::rewind(rows.get());std::vector<Value> r;while(spill_read(rows.get(),r))callback(r);discard_cache(rows.get());}
 uint64_t Engine::spill_bytes() const{return total_spill_bytes;}
 Engine::Header Engine::header(const std::string& t){auto h=storage.load<Header>(t+".header",0);require(h.magic==0x4d564442,"table does not exist: "+t);return h;}
 std::vector<Column> Engine::schema(const Header& h){require(h.schema_size<sizeof(h.schema),"corrupt schema");return parse(std::string(h.schema,h.schema_size)).columns;}
@@ -83,16 +87,25 @@ void Engine::put_bucket(const std::string& t,const Header& h,SlotId slot,uint32_
 uint32_t Engine::assign(const std::string& t,const Header& h,const std::vector<float>& v){uint32_t best=0;double distance=std::numeric_limits<double>::infinity();bool safe=!has_extreme(v.data(),v.size());for(uint32_t b=0;b<h.nlist;++b){auto p=center_view(index_base(t,h),b,v.size());auto d=l2_fast(v.data(),p,v.size(),safe&&!has_extreme(p,v.size()));if(d<distance){distance=d;best=b;}}return best;}
 void Engine::write_row(const std::string& t,SlotId slot,std::vector<Value> values,const std::vector<Column>& cols,bool active){
   auto h=header(t);auto old=meta(t,slot);PrimaryIndex pk(storage,t+".pk");int64_t key=std::get<int64_t>(values[primary(cols)]);
-  if(active){auto found=pk.find(key);require(!found||*found==slot,"duplicate primary key");}
-  if(old.active){pk.erase(old.key);if(h.nlist)posting(index_base(t,h),bucket(t,h,slot),slot,false);}
+  const bool same_key=old.active&&active&&old.key==key;
+  if(active&&!same_key){auto found=pk.find(key);require(!found||*found==slot,"duplicate primary key");}
+  if(old.active&&!same_key)pk.erase(old.key);
+  if(old.active&&!active&&h.nlist)posting(index_base(t,h),bucket(t,h,slot),slot,false);
   Meta m=old;m.active=active;m.key=key;m.reserved=0;
   if(active){
-    if(h.nlist){m.bucket=assign(t,h,std::get<std::vector<float>>(values[h.ivector]));put_bucket(t,h,slot,m.bucket);posting(index_base(t,h),m.bucket,slot,true);}
-    for(size_t i=0;i<cols.size();++i)if(cols[i].type==Type::Vector){auto& v=std::get<std::vector<float>>(values[i]);m.reserved=has_extreme(v.data(),v.size())?1:0;auto count=PAGE/stride(cols[i]);auto p=slot/count;auto bytes=storage.read(t+".v"+std::to_string(i),p);std::memcpy(bytes.data()+(slot%count)*stride(cols[i]),v.data(),v.size()*4);storage.write(t+".v"+std::to_string(i),p,bytes);values[i]=std::vector<float>{};}
-    for(size_t i=0;i<cols.size();++i)if(cols[i].type!=Type::Vector&&!cols[i].primary){
-      auto f=t+".s"+std::to_string(i);auto p=slot/(PAGE/8);auto bytes=storage.read(f,p);auto hash=scalar_hash(values[i]);std::memcpy(bytes.data()+(slot%(PAGE/8))*8,&hash,8);storage.write(f,p,bytes);
+    if(h.nlist){auto& v=std::get<std::vector<float>>(values[h.ivector]);bool unchanged=old.active&&std::memcmp(vector_view(t,slot,h.ivector,cols[h.ivector]),v.data(),v.size()*sizeof(float))==0;
+      if(!unchanged){auto prior=old.active?bucket(t,h,slot):h.nlist;m.bucket=assign(t,h,v);if(prior!=m.bucket){if(old.active)posting(index_base(t,h),prior,slot,false);put_bucket(t,h,slot,m.bucket);posting(index_base(t,h),m.bucket,slot,true);}}
     }
-    auto bytes=pack_values(values);require(bytes.size()<storage.budget.limit/4,"row exceeds workspace budget");m.offset=h.blob_end;m.length=static_cast<uint32_t>(bytes.size());write_blob(t,h.blob_end,bytes);h.blob_end+=bytes.size();pk.insert(key,slot);
+    for(size_t i=0;i<cols.size();++i)if(cols[i].type==Type::Vector){auto& v=std::get<std::vector<float>>(values[i]);m.reserved|=has_extreme(v.data(),v.size())?1:0;
+      bool unchanged=old.active&&std::memcmp(vector_view(t,slot,i,cols[i]),v.data(),v.size()*sizeof(float))==0;
+      if(!unchanged){auto count=PAGE/stride(cols[i]);auto p=slot/count;auto bytes=storage.read(t+".v"+std::to_string(i),p);std::memcpy(bytes.data()+(slot%count)*stride(cols[i]),v.data(),v.size()*4);storage.write(t+".v"+std::to_string(i),p,bytes);}values[i]=std::vector<float>{};}
+    for(size_t i=0;i<cols.size();++i)if(cols[i].type!=Type::Vector&&!cols[i].primary){
+      auto f=t+".s"+std::to_string(i);auto p=slot/(PAGE/8);auto hash=scalar_hash(values[i]);uint64_t prior=0;if(old.active)std::memcpy(&prior,storage.pool.view(f,p)+(slot%(PAGE/8))*8,8);
+      if(!old.active||prior!=hash){auto bytes=storage.read(f,p);std::memcpy(bytes.data()+(slot%(PAGE/8))*8,&hash,8);storage.write(f,p,bytes);}
+    }
+    auto bytes=pack_values(values);require(bytes.size()<storage.budget.limit/4,"row exceeds workspace budget");
+    if(!old.active||read_blob(t,old.offset,old.length)!=bytes){m.offset=old.active&&bytes.size()<=old.length?old.offset:h.blob_end;m.length=static_cast<uint32_t>(bytes.size());write_blob(t,m.offset,bytes);if(m.offset==h.blob_end)h.blob_end+=bytes.size();}
+    if(!same_key)pk.insert(key,slot);
   }
   if(slot>=h.slots){require(slot<UINT32_MAX,"SlotId exhausted");h.slots=slot+1;}
   if(active&&!old.active)++h.active_count;
@@ -100,7 +113,9 @@ void Engine::write_row(const std::string& t,SlotId slot,std::vector<Value> value
   // Header writes use the same statement/transaction undo path as row pages.
   // Count each affected row once, including scalar updates and repeated writes.
   if(h.nlist&&(active||old.active)&&h.mutations_since_calibration<UINT64_MAX)++h.mutations_since_calibration;
-  put_meta(t,slot,m);bitmap(t,slot,active);storage.store(t+".header",0,h);
+  if(std::memcmp(&m,&old,sizeof(m))!=0)put_meta(t,slot,m);
+  if(bool(old.active)!=active)bitmap(t,slot,active);
+  storage.store(t+".header",0,h);
 }
 void Engine::create_index(const Statement& s,const std::vector<Column>& cols){
   auto h=header(s.table);require(!h.nlist,"vector index already exists");auto col=column(cols,s.value);require(cols[col].type==Type::Vector,"index requires VECTOR column");
@@ -132,20 +147,36 @@ void Engine::create_index(const Statement& s,const std::vector<Column>& cols){
     }
   }
   for(uint32_t b=0;b<h.nlist;++b){auto count=PAGE/stride(cols[col]);auto page=storage.read(region+".centers",b/count);std::memcpy(page.data()+(b%count)*stride(cols[col]),centers[b].data(),dim*4);storage.write_new(region+".centers",b/count,page);}
-  for(SlotId slot=0;slot<h.slots;++slot){auto m=meta(s.table,slot);if(!m.active)continue;auto p=vector_view(s.table,slot,col,cols[col]);std::vector<float> v(p,p+dim);auto b=assign(s.table,h,v);put_bucket(s.table,h,slot,b);posting(region,b,slot,true);}
+  std::vector<bool> safe;for(auto& center:centers)safe.push_back(!has_extreme(center.data(),dim));
+  for(SlotId slot=0;slot<h.slots;++slot){auto m=meta(s.table,slot);if(!m.active)continue;auto p=vector_view(s.table,slot,col,cols[col]);uint32_t b=0;double nearest=INFINITY;
+    for(uint32_t candidate=0;candidate<h.nlist;++candidate){auto distance=l2_fast(p,centers[candidate].data(),dim,m.reserved==0&&safe[candidate]);if(distance<nearest){nearest=distance;b=candidate;}}
+    put_bucket(s.table,h,slot,b);posting(region,b,slot,true);}
   }
-  h.recommended_nprobe=calibrate(s.table,h,cols);h.calibration_stale=0;
+  h.calibration_skipped=uint64_t(count)*dim*sizeof(float)>storage.budget.limit/2;
+  h.calibration_queries=h.calibration_skipped?0:16;
+  h.recommended_nprobe=h.calibration_skipped?std::min(h.nlist,std::max<uint32_t>(4,h.nlist/4)):calibrate(s.table,h,cols);h.calibration_stale=0;
   h.mutations_since_calibration=0;h.rows_at_calibration=count;
   last_lists=h.nlist;last_recommended=h.recommended_nprobe;
   // Publish only after all fresh-region pages and calibration are complete.
   storage.store(s.table+".header",0,h);
   storage.seal_region(region);
 }
-uint32_t Engine::calibrate(const std::string& t,const Header& h,const std::vector<Column>& cols){
-  // A bounded scalar dictionary and one query vector are retained; table vectors
-  // remain in the buffer pool. Two independent groups each use 32 queries.
+uint32_t Engine::calibrate(const std::string& t,Header& h,const std::vector<Column>& cols){
+  // Keep 16 query vectors and bounded Top10 heaps. Exact ground truth is built
+  // for all queries in one sequential pass over vector pages, never a matrix.
   const auto dim=cols[h.ivector].width;
-  Reservation workspace(storage.budget,dim*sizeof(float)+8192+h.nlist*32);
+  struct Neighbor {double distance;int64_t key;uint32_t bucket;};
+  struct Query {
+    std::vector<float> vector;
+    std::array<uint32_t,64> ranks{};
+    std::array<Neighbor,10> top{};
+    uint32_t count=0,ordinal=0;
+    SlotId sample=UINT32_MAX;
+    int category=-1;
+  };
+  auto workspace_bytes=16*(dim*sizeof(float)+sizeof(Query))+8192+h.nlist*32;
+  if(workspace_bytes>storage.budget.limit-storage.budget.used){h.calibration_skipped=1;h.calibration_queries=0;return std::min(h.nlist,std::max<uint32_t>(4,h.nlist/4));}
+  Reservation workspace(storage.budget,workspace_bytes);
   struct Category {std::string value;uint32_t votes=0,count=0;};
   std::vector<Category> categories;size_t filter_col=cols.size();
   for(size_t c=0;c<cols.size();++c)if(cols[c].type==Type::Varchar&&cols[c].width<=64){filter_col=c;break;}
@@ -165,35 +196,40 @@ uint32_t Engine::calibrate(const std::string& t,const Header& h,const std::vecto
     std::sort(categories.begin(),categories.end(),[](const auto& a,const auto& b){return a.count!=b.count?a.count>b.count:a.value<b.value;});
     if(categories.size()>4)categories.resize(4);
   }
-  std::array<std::array<uint64_t,65>,2> hits{};std::array<uint64_t,2> totals{};
-  struct Neighbor {double distance;int64_t key;SlotId slot;};
-  auto less=[](const Neighbor& a,const Neighbor& b){return a.distance!=b.distance?a.distance<b.distance:a.key<b.key;};
-  for(unsigned group=0;group<(categories.empty()?1U:2U);++group)for(uint32_t qi=0;qi<32;++qi){
-    const Category* filter=group?&categories[qi%categories.size()]:nullptr;
-    uint32_t ordinal=static_cast<uint32_t>((uint64_t(qi+1)*2654435761ULL+1013904223ULL)%(filter?filter->count:h.active_count));
-    SlotId sample=0;bool located=false;
-    for(SlotId slot=0;slot<h.slots;++slot){auto m=meta(t,slot);if(!m.active)continue;
-      if(filter){auto values=row(t,slot,m,cols,false);if(std::get<std::string>(values[filter_col])!=filter->value)continue;}
-      if(ordinal--==0){sample=slot;located=true;break;}
-    }
-    require(located,"calibration sample missing");auto p=vector_view(t,sample,h.ivector,cols[h.ivector]);std::vector<float> query(p,p+dim);
-    // Small deterministic perturbations avoid scoring only exact self matches.
-    // A second in-table sample supplies a scale in each coordinate.
-    SlotId other=(sample+h.slots/2+1)%h.slots;
-    for(uint32_t n=0;n<h.slots&&!meta(t,other).active;++n)other=(other+1)%h.slots;
-    p=vector_view(t,other,h.ivector,cols[h.ivector]);
-    for(size_t j=0;j<dim;++j)query[j]=static_cast<float>(double(query[j])*.99+double(p[j])*.01);
-    std::vector<std::pair<double,uint32_t>> centers;for(uint32_t b=0;b<h.nlist;++b){p=center_view(index_base(t,h),b,dim);centers.emplace_back(l2(query.data(),p,dim),b);}std::sort(centers.begin(),centers.end());
-    std::array<uint32_t,64> ranks{};for(uint32_t b=0;b<h.nlist;++b)ranks[centers[b].second]=b+1;
-    std::vector<Neighbor> top;top.reserve(11);
-    for(SlotId slot=0;slot<h.slots;++slot){auto m=meta(t,slot);if(!m.active)continue;
-      if(filter){auto values=row(t,slot,m,cols,false);if(std::get<std::string>(values[filter_col])!=filter->value)continue;}
-      p=vector_view(t,slot,h.ivector,cols[h.ivector]);Neighbor candidate{l2_exact(query.data(),p,dim),m.key,slot};
-      if(top.size()==10&&!less(candidate,top.back()))continue;
-      top.insert(std::lower_bound(top.begin(),top.end(),candidate,less),candidate);if(top.size()>10)top.pop_back();
-    }
-    totals[group]+=top.size();for(auto& n:top){auto rank=ranks[bucket(t,h,n.slot)];for(uint32_t probe=rank;probe<=h.nlist;++probe)++hits[group][probe];}
+  std::array<Query,16> queries;
+  for(uint32_t qi=0;qi<queries.size();++qi){auto& q=queries[qi];if(qi>=8&&!categories.empty())q.category=static_cast<int>((qi-8)%categories.size());
+    auto count=q.category>=0?categories[q.category].count:h.active_count;
+    q.ordinal=static_cast<uint32_t>((uint64_t(qi+1)*2654435761ULL+1013904223ULL)%count);
   }
+  // Select all samples together. No query causes another table-vector scan.
+  for(SlotId slot=0;slot<h.slots;++slot){auto m=meta(t,slot);if(!m.active)continue;int category=-1;
+    if(!categories.empty()){auto values=row(t,slot,m,cols,false);for(size_t c=0;c<categories.size();++c)if(std::get<std::string>(values[filter_col])==categories[c].value){category=static_cast<int>(c);break;}}
+    for(auto& q:queries)if(q.sample==UINT32_MAX&&(q.category<0||q.category==category)&&q.ordinal--==0)q.sample=slot;
+  }
+  for(auto& q:queries){require(q.sample!=UINT32_MAX,"calibration sample missing");auto p=vector_view(t,q.sample,h.ivector,cols[h.ivector]);q.vector.assign(p,p+dim);
+    // Perturb the sample toward another live vector to avoid self-match bias.
+    SlotId other=(q.sample+h.slots/2+1)%h.slots;
+    for(uint32_t n=0;n<h.slots&&!meta(t,other).active;++n)other=(other+1)%h.slots;
+    p=vector_view(t,other,h.ivector,cols[h.ivector]);for(size_t j=0;j<dim;++j)q.vector[j]=static_cast<float>(double(q.vector[j])*.99+double(p[j])*.01);
+    std::vector<std::pair<double,uint32_t>> centers;for(uint32_t b=0;b<h.nlist;++b){p=center_view(index_base(t,h),b,dim);centers.emplace_back(l2(q.vector.data(),p,dim),b);}std::sort(centers.begin(),centers.end());
+    for(uint32_t b=0;b<h.nlist;++b)q.ranks[centers[b].second]=b+1;
+  }
+  auto less=[](const Neighbor& a,const Neighbor& b){return a.distance!=b.distance?a.distance<b.distance:a.key<b.key;};
+  BufferPool::PageGuard lease;uint64_t leased_page=UINT64_MAX;const auto per_page=PAGE/stride(cols[h.ivector]);
+  for(SlotId slot=0;slot<h.slots;++slot){auto m=meta(t,slot);if(!m.active)continue;int category=-1;
+    if(!categories.empty()){auto values=row(t,slot,m,cols,false);for(size_t c=0;c<categories.size();++c)if(std::get<std::string>(values[filter_col])==categories[c].value){category=static_cast<int>(c);break;}}
+    auto b=bucket(t,h,slot);auto page=slot/per_page;if(leased_page!=page){lease.reset();lease=storage.pool.lease(t+".v"+std::to_string(h.ivector),page);leased_page=page;}
+    auto p=reinterpret_cast<const float*>(lease.data+(slot%per_page)*stride(cols[h.ivector]));
+    for(auto& q:queries){if(q.category>=0&&q.category!=category)continue;Neighbor candidate{l2_exact(q.vector.data(),p,dim),m.key,b};
+      if(q.count==10&&!less(candidate,q.top[q.count-1]))continue;
+      auto pos=static_cast<size_t>(std::lower_bound(q.top.begin(),q.top.begin()+q.count,candidate,less)-q.top.begin());
+      if(q.count<10)++q.count;
+      for(size_t n=q.count-1;n>pos;--n)q.top[n]=q.top[n-1];
+      q.top[pos]=candidate;
+    }
+  }
+  std::array<std::array<uint64_t,65>,2> hits{};std::array<uint64_t,2> totals{};
+  for(auto& q:queries){auto group=q.category>=0?1:0;totals[group]+=q.count;for(uint32_t n=0;n<q.count;++n)for(uint32_t probe=q.ranks[q.top[n].bucket];probe<=h.nlist;++probe)++hits[group][probe];}
   for(uint32_t probe=1;probe<=h.nlist;++probe){bool good=true;for(unsigned group=0;group<2;++group)if(totals[group]&&double(hits[group][probe])/totals[group]<.985)good=false;if(good)return probe;}
   return h.nlist;
 }
@@ -245,7 +281,7 @@ Result Engine::execute_inner(const Statement& s){
   std::vector<uint32_t> buckets;size_t distance_expr=0;bool found=false;for(size_t i=0;i<expressions.size();++i)if(expressions[i].distance&&selected[i]==h.ivector){distance_expr=i;found=true;break;}
   bool use_ivf=ann&&h.nlist&&found&&!order.empty()&&order[0].first==distance_expr&&!order[0].second&&s.limit!=UINT64_MAX;
   last_probes=0;route="exact";
-  if(use_ivf&&!nprobe&&(h.active_count<4096||stale(h)||!h.recommended_nprobe||h.recommended_nprobe>h.nlist/2)){use_ivf=false;route="exact_fallback";}
+  if(use_ivf&&!nprobe&&(h.active_count<4096||stale(h)||h.calibration_skipped||!h.recommended_nprobe||h.recommended_nprobe>h.nlist/2)){use_ivf=false;route="exact_fallback";}
   if(use_ivf){route="ivf";last_probes=std::min(nprobe?nprobe:h.recommended_nprobe,h.nlist);std::vector<std::pair<double,uint32_t>> distances;for(uint32_t b=0;b<h.nlist;++b){auto p=center_view(index_base(s.table,h),b,queries[distance_expr].size());distances.emplace_back(l2(queries[distance_expr].data(),p,queries[distance_expr].size()),b);}std::sort(distances.begin(),distances.end());for(size_t i=0;i<std::min<size_t>(last_probes,distances.size());++i)buckets.push_back(distances[i].second);}
   std::optional<SlotId> exact_slot;bool pk_filter=false;
   for(size_t j=0;j<s.conditions.size();++j)if(predicates[j].first==keycol&&s.conditions[j].op=="="){pk_filter=true;exact_slot=PrimaryIndex(storage,s.table+".pk").find(std::get<int64_t>(predicates[j].second));}
@@ -302,7 +338,7 @@ Result Engine::execute_inner(const Statement& s){
   }
   if(use_heap){std::sort(heap.begin(),heap.end(),less);for(auto& r:heap)r.resize(projected);result.memory_rows=std::make_shared<std::vector<std::vector<Value>>>(std::move(heap));result.memory_reservation=std::move(heap_reservation);return result;}
   auto sorted=sorter->finish();result.rows=storage.temporary();std::vector<Value> values;uint64_t returned=0;
-  while(returned<s.limit&&spill_read(sorted.get(),values)){values.resize(projected);spill_write(result.rows.get(),values);++returned;discard_cache(sorted.get());}
-  ::fdatasync(::fileno(result.rows.get()));discard_cache(result.rows.get());return result;
+  while(returned<s.limit&&spill_read(sorted.get(),values)){values.resize(projected);spill_write(result.rows.get(),values);++returned;}
+  discard_cache(sorted.get());discard_cache(result.rows.get());return result;
 }
 }

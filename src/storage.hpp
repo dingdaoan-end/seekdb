@@ -26,9 +26,10 @@ struct MemoryBudget {
   void release(size_t bytes) { used -= bytes; }
 };
 
-// A fixed allocation: directory and LRU metadata grow only with frame count.
+// A fixed userspace allocation: frame and replacement metadata grow only with
+// frame count. Buffered I/O also uses reclaimable, externally charged kernel cache.
 class BufferPool {
-  struct Frame { std::string file; uint64_t page=0, age=0; bool valid=false, dirty=false, uncommitted=false; uint32_t pins=0; };
+  struct Frame { std::string file; uint64_t page=0, age=0; bool valid=false, dirty=false, uncommitted=false, metadata=false; uint32_t pins=0; };
   std::filesystem::path directory;
   MemoryBudget& budget;
   std::vector<Frame> frames;
@@ -72,7 +73,6 @@ public:
 class Storage {
   std::filesystem::path root;
   int wal=-1, undo=-1, shadow=-1;
-  size_t wal_dirty_bytes=0;
   void sync_wal();
   std::filesystem::path shadow_directory, shadow_index;
   std::vector<std::string> regions;
@@ -83,7 +83,6 @@ class Storage {
   uint64_t undo_top=0, generation=0, transaction_start=0;
   uint32_t transaction_crc=0;
   bool active=false, closed=false;
-  size_t undo_dirty_bytes=0;
   std::vector<char> undo_memory;
   size_t undo_capacity=0, redo_capacity=0;
   std::string redo_buffer;

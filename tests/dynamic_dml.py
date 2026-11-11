@@ -18,7 +18,9 @@ def run(args, report):
     shutil.rmtree(root, ignore_errors=True)
     root.mkdir(parents=True)
     data, cats, queries, qcats, _, _ = make_data('clustered', 10000, 1000, 20261109, 40)
-    client = Client(args.binary, root, automatic_ann=True)
+    # Keep this case on the calibrated path; the separate 4/8 MiB harness
+    # verifies the empirical recommendation and conservative exact fallback.
+    client = Client(args.binary, root, budget=16 * 1024 * 1024, automatic_ann=True)
     report['engine_argv'] = client.argv
     try:
         client.sql(SCHEMA)
@@ -28,10 +30,11 @@ def run(args, report):
             client.sql('INSERT INTO t VALUES ' + ','.join(rows) + ';')
         _, _, metrics = client.sql('CREATE VECTOR INDEX vi ON t(embedding);')
         report['index_metrics'] = metrics
-        assert metrics['recommended_nprobe'] == 5, metrics
+        recommendation = metrics['recommended_nprobe']
+        assert 1 <= recommendation <= 32, metrics
         client.sql('SET SEARCH_MODE = ann;')
         _, _, metrics = client.sql(statements(queries[:2], qcats[:2])[0])
-        assert metrics['ann_route'] == 'ivf' and metrics['effective_nprobe'] == 5, metrics
+        assert metrics['ann_route'] == 'ivf' and metrics['effective_nprobe'] == recommendation, metrics
 
         # Preserve slots/IDs so the independent oracle returns the SQL IDs.
         live = np.ones(10050, dtype=bool)
@@ -80,8 +83,8 @@ def run(args, report):
             ann = execute_queries(client, sql, truth, label + ' ann')
             for row in ann['records']:
                 assert row['metrics']['ann_route'] == 'ivf', row
-                assert row['metrics']['effective_nprobe'] == 5, row
-                assert row['metrics']['recommended_nprobe'] == 5, row
+                assert row['metrics']['effective_nprobe'] == recommendation, row
+                assert row['metrics']['recommended_nprobe'] == recommendation, row
             assert all(ann['summary'][group]['recall_at_10'] >= .98
                        for group in ('unfiltered', 'filtered')), ann['summary']
             report[label] = {'exact': exact, 'ann': ann}
@@ -106,7 +109,7 @@ def main():
     args = parser.parse_args()
     args.binary = args.binary.resolve(strict=True)
     report = {'status': 'running', 'seed': 20261109, 'rows': 10000, 'dimensions': 128,
-              'automatic_ann': True, 'budget_argument': None}
+              'automatic_ann': True, 'budget_argument': 16 * 1024 * 1024}
     try:
         run(args, report)
     except BaseException:
@@ -116,7 +119,7 @@ def main():
     finally:
         if args.output:
             save(args.output.resolve(), report)
-    print('dynamic DML: 50 inserts + 50 updates + 50 deletes; IVF/5; exact/oracle and ANN recall passed', flush=True)
+    print('dynamic DML: 50 inserts + 50 updates + 50 deletes; calibrated IVF; exact/oracle and ANN recall passed', flush=True)
 
 
 if __name__ == '__main__':
