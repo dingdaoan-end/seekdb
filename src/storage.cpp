@@ -49,7 +49,7 @@ void page_write(int fd,const void* data,off_t offset){
     break;}
   require(n==static_cast<ssize_t>(PAGE),"page write failed");
 }
-template<class T> void append(std::string& out,T v) {out.append(reinterpret_cast<const char*>(&v),sizeof(v));}
+template<class T> void append_value(std::string& out,T v) {out.append(reinterpret_cast<const char*>(&v),sizeof(v));}
 template<class T> T take(const std::string& s,size_t& pos) {
   require(pos+sizeof(T)<=s.size(),"corrupt log record"); T v;
   std::memcpy(&v,s.data()+pos,sizeof(v));pos+=sizeof(v);return v;
@@ -60,10 +60,10 @@ uint32_t checksum(const std::string& s) {
 // Changed runs include short equal gaps to avoid headers for individual float bytes.
 std::string delta(const std::string& file,uint64_t page,const Page& old,const Page& next) {
   require(!file.empty()&&file.size()<128&&file.find('/')==std::string::npos&&file.find("..") == std::string::npos,"unsafe page file");
-  std::string out;append(out,static_cast<uint8_t>(file.size()));out+=file;append(out,page);
+  std::string out;append_value(out,static_cast<uint8_t>(file.size()));out+=file;append_value(out,page);
   size_t i=0;while(i<PAGE){while(i<PAGE&&old[i]==next[i])++i;if(i==PAGE)break;
     size_t start=i++,end=i;while(i<PAGE){if(old[i]!=next[i])end=i+1;if(i>=end+8)break;++i;}
-    append(out,static_cast<uint16_t>(start));append(out,static_cast<uint16_t>(end-start));
+    append_value(out,static_cast<uint16_t>(start));append_value(out,static_cast<uint16_t>(end-start));
     out.append(reinterpret_cast<const char*>(next.data()+start),end-start);i=end;
   }return out;
 }
@@ -111,7 +111,8 @@ std::optional<LogRecord> read_record(int fd,uint64_t pos) {
 void MemoryBudget::acquire(size_t n) {require(n<=limit-used,"memory budget exceeded");used+=n;peak=std::max(peak,used);}
 BufferPool::BufferPool(std::filesystem::path path,MemoryBudget& b):directory(std::move(path)),budget(b) {
   std::filesystem::create_directories(directory);
-  size_t count=std::max<size_t>(3,b.limit/(2*(PAGE+sizeof(Frame)+384)));
+  size_t allocation=b.limit>8*1024*1024 ? b.limit-b.limit/4 : b.limit/2;
+  size_t count=std::max<size_t>(3,allocation/(PAGE+sizeof(Frame)+384));
   require(count>=2,"buffer budget needs at least two frames");
   reservation=count*(PAGE+sizeof(Frame)+384);budget.acquire(reservation);
   require(::posix_memalign(reinterpret_cast<void**>(&arena),4096,count*PAGE)==0,"aligned allocation failed");
@@ -165,7 +166,8 @@ size_t BufferPool::pin(const std::string& file,uint64_t page) {
   ++physical_reads;
   auto marker=file.rfind(".v");
   if(marker!=std::string::npos&&marker+2<file.size()&&file[marker+2]>='0'&&file[marker+2]<='9')++vector_reads;
-  frames[victim]={file,page,++clock,true,false,false,metadata};lookup.emplace(std::move(key),victim);return victim;
+  auto version=frames[victim].version+1;
+  frames[victim]={file,page,++clock,version,true,false,false,metadata};lookup.emplace(std::move(key),victim);return victim;
 }
 Page BufferPool::get(const std::string& f,uint64_t p) {Page r;std::memcpy(r.data(),view(f,p),PAGE);return r;}
 const std::byte* BufferPool::view(const std::string& f,uint64_t p) {return arena+pin(f,p)*PAGE;}
@@ -173,13 +175,34 @@ BufferPool::PageGuard BufferPool::lease(const std::string& f,uint64_t p){auto i=
 void BufferPool::put(const std::string& f,uint64_t p,const Page& bytes) {
   auto i=pin(f,p);std::memcpy(arena+i*PAGE,bytes.data(),PAGE);frames[i].dirty=true;frames[i].uncommitted=transaction_active;
 }
+BufferPool::ResidentHandle BufferPool::handle(const std::string& f,uint64_t p){auto i=pin(f,p);return {i,frames[i].version};}
+const std::byte* BufferPool::resident(ResidentHandle h) const {
+  if(h.frame>=frames.size()||!frames[h.frame].valid||frames[h.frame].version!=h.version)return nullptr;
+  return arena+h.frame*PAGE;
+}
+void BufferPool::flush_page(const std::string& f,uint64_t p){flush(pin(f,p));}
+void BufferPool::append_extent(const std::string& f,uint64_t p,const Page& bytes,size_t offset,size_t length){
+  auto i=pin(f,p);require(!frames[i].dirty,"append requires flushed page");
+  int fd=descriptor(f);
+  // An extent can be unaligned; explicit O_DIRECT remains supported by switching
+  // this descriptor to buffered writes before publishing the appended payload.
+  disable_direct(fd);
+  // Establish a complete zero-filled page first. SIGKILL between extent write
+  // and a later extension would otherwise leave an unreadable short page.
+  auto size=::lseek(fd,0,SEEK_END);require(size>=0,"append size failed");
+  if(static_cast<uint64_t>(size)<(p+1)*PAGE)require(::ftruncate(fd,static_cast<off_t>((p+1)*PAGE))==0,"append page extension failed");
+  size_t remaining=length;const std::byte* source=bytes.data()+offset;uint64_t position=p*PAGE+offset;
+  while(remaining){auto done=retry_eintr([&]{return ::pwrite(fd,source,remaining,static_cast<off_t>(position));});require(done>0,"append write failed");source+=done;remaining-=done;position+=done;}
+  data_page_write_bytes+=length;std::memcpy(arena+i*PAGE,bytes.data(),PAGE);
+  frames[i].dirty=frames[i].uncommitted=false;
+}
 void BufferPool::committed(){transaction_active=false;for(auto& f:frames)f.uncommitted=false;}
 void BufferPool::invalidate_prefix(const std::string& prefix){
-  for(auto& f:frames)if(f.valid&&(f.file==prefix||f.file.rfind(prefix+".",0)==0)){require(!f.pins,"discard pinned region");lookup.erase(f.file+":"+std::to_string(f.page));f.valid=f.dirty=false;}
+  for(auto& f:frames)if(f.valid&&(f.file==prefix||f.file.rfind(prefix+".",0)==0)){require(!f.pins,"discard pinned region");lookup.erase(f.file+":"+std::to_string(f.page));f.valid=f.dirty=false;++f.version;}
   for(auto it=descriptors.begin();it!=descriptors.end();)if(it->first==prefix||it->first.rfind(prefix+".",0)==0){::close(it->second);it=descriptors.erase(it);}else ++it;
 }
 void BufferPool::sync_all(){
-  for(auto& e:std::filesystem::directory_iterator(directory)){int fd=page_fd(e.path());try{require(retry_eintr([&]{return ::fsync(fd);})==0,"data file sync failed");}catch(...){::close(fd);throw;}::close(fd);}sync_directory(directory);
+  for(auto& e:std::filesystem::directory_iterator(directory)){int fd=page_fd(e.path());try{require(retry_eintr([&]{return ::fsync(fd);})==0,"data file sync failed");::posix_fadvise(fd,0,0,POSIX_FADV_DONTNEED);}catch(...){::close(fd);throw;}::close(fd);}sync_directory(directory);
 }
 void BufferPool::flush_all() {for(size_t i=0;i<frames.size();++i) flush(i);}
 
@@ -197,8 +220,11 @@ Storage::Storage(std::filesystem::path path,size_t bytes,std::function<void(size
   else{std::ifstream format(root/"FORMAT");std::string magic;require(bool(format>>magic)&&magic=="MV3","invalid storage format");}
   wal=::open(wal_path(root,generation).c_str(),O_RDWR|O_CREAT|O_CLOEXEC,0600);require(wal>=0,"open WAL failed");
   shadow_directory=root/("shadow."+std::to_string(generation));
-  shadow_index=shadow_directory/"index";
-  std::filesystem::create_directories(shadow_directory);
+  shadow_index=shadow_directory/"index";written_directory=shadow_directory/"written";
+  std::filesystem::create_directories(written_directory);
+  written_count=budget.limit<=8*1024*1024?4:16;
+  written_reservation=written_count*sizeof(WrittenEntry);budget.acquire(written_reservation);
+  written_cache=std::make_unique<WrittenEntry[]>(written_count);
   shadow=::open((shadow_directory/"journal").c_str(),O_RDWR|O_CREAT|O_CLOEXEC,0600);require(shadow>=0,"open shadow journal failed");
   sync_directory(shadow_directory);sync_directory(root);
   restore_shadow();recover(hook);
@@ -215,7 +241,7 @@ Storage::~Storage() {
   if(undo>=0)::close(undo);
   if(wal>=0)::close(wal);
   if(shadow>=0)::close(shadow);
-  budget.release(undo_capacity+redo_capacity);
+  budget.release(undo_capacity+redo_capacity+written_reservation);
 }
 void Storage::close(){
   if(closed)return;
@@ -230,12 +256,12 @@ std::shared_ptr<FILE> Storage::temporary(){
   if(::unlink(path.data())!=0){::close(fd);throw std::runtime_error("unlink spill file failed");}
   FILE* file=::fdopen(fd,"w+b");if(!file){::close(fd);throw std::runtime_error("open spill stream failed");}
   ::setvbuf(file,nullptr,_IONBF,0);
-  return {file,[](FILE* p){std::fclose(p);}};
+  return {file,[](FILE* p){::posix_fadvise(::fileno(p),0,0,POSIX_FADV_DONTNEED);std::fclose(p);}};
 }
-void Storage::sync_wal(){sync_file(wal);++wal_syncs;}
+void Storage::sync_wal(){sync_file(wal);++wal_syncs;::posix_fadvise(wal,0,0,POSIX_FADV_DONTNEED);}
 void Storage::record(char type,const std::string& payload) {
   if(type=='P'&&redo_capacity){
-    std::string entry;append(entry,static_cast<uint32_t>(payload.size()));entry+=payload;
+    std::string entry;append_value(entry,static_cast<uint32_t>(payload.size()));entry+=payload;
     if(redo_buffer.size()+entry.size()>redo_capacity)flush_redo();
     if(entry.size()<=redo_capacity){redo_buffer+=entry;std::string bytes(1,'P');bytes+=payload;transaction_crc=::crc32(transaction_crc,reinterpret_cast<const Bytef*>(bytes.data()),bytes.size());return;}
   }
@@ -256,7 +282,7 @@ void Storage::flush_redo(){
   if(rc!=Z_OK){budget.release(compression_workspace);throw std::runtime_error("WAL compression initialization failed");}
   std::array<char,32768> output{};z.next_in=reinterpret_cast<Bytef*>(redo_buffer.data());z.avail_in=redo_buffer.size();z.next_out=reinterpret_cast<Bytef*>(output.data());z.avail_out=output.size();
   rc=deflate(&z,Z_FINISH);auto length=z.total_out;deflateEnd(&z);budget.release(compression_workspace);require(rc==Z_STREAM_END,"WAL compression failed");
-  if(length+4<redo_buffer.size()){std::string payload;append(payload,static_cast<uint32_t>(redo_buffer.size()));payload.append(output.data(),length);record('Z',payload);}
+  if(length+4<redo_buffer.size()){std::string payload;append_value(payload,static_cast<uint32_t>(redo_buffer.size()));payload.append(output.data(),length);record('Z',payload);}
   else record('X',redo_buffer);
   redo_buffer.clear();
 }
@@ -276,6 +302,7 @@ void Storage::recover(const std::function<void(size_t)>& hook) {
         while(replay<pos){auto entry=read_record(wal,replay);require(entry.has_value(),"invalid committed WAL");each_delta(*entry,[&](const std::string& payload){
           if(!payload.empty()&&payload[0]=='\0'){discard_region(payload.substr(1));if(hook)hook(++applied);return;}
           std::string file;uint64_t page;Page bytes{};apply_delta(payload,file,page,bytes,true);
+          mark_written(file);
           int fd=page_fd(root/"data"/file);auto n=page_read(fd,aligned,PAGE,static_cast<off_t>(page*PAGE));::close(fd);require(n>=0&&n<=ssize_t(PAGE),"data recovery read failed");
           if(n)std::memcpy(bytes.data(),aligned,static_cast<size_t>(n));
           apply_delta(payload,file,page,bytes);
@@ -297,6 +324,7 @@ void Storage::recover(const std::function<void(size_t)>& hook) {
 // replaying absolute changed runs in commit order is idempotent on their images.
 void Storage::protect(const std::string& file,uint64_t page){
   if(!active)return;
+  mark_written(file);
   require(!file.empty()&&file.size()<128&&file.find('/')==std::string::npos&&file.find("..") == std::string::npos,"unsafe shadow file");
   int index=::open((shadow_index/file).c_str(),O_RDWR|O_CREAT|O_CLOEXEC,0600);require(index>=0,"open shadow index failed");
   try{
@@ -306,8 +334,8 @@ void Storage::protect(const std::string& file,uint64_t page){
     auto size=::lseek(index,0,SEEK_END);
     if(size<8){auto end=::lseek(fd,0,SEEK_END);require(end>=0,"data size failed");length=end;require(retry_eintr([&]{return ::pwrite(index,&length,8,0);})==8,"shadow index header failed");}
     else require(read_all(index,&length,8,0),"shadow index header missing");
-    std::string payload;append(payload,static_cast<uint8_t>(file.size()));payload+=file;append(payload,page);append(payload,length);
-    bool exists=page<length/PAGE;append(payload,static_cast<uint8_t>(exists));
+    std::string payload;append_value(payload,static_cast<uint8_t>(file.size()));payload+=file;append_value(payload,page);append_value(payload,length);
+    bool exists=page<length/PAGE;append_value(payload,static_cast<uint8_t>(exists));
     if(exists){alignas(4096) Page bytes{};auto got=page_read(fd,bytes.data(),PAGE,static_cast<off_t>(page*PAGE));::close(fd);fd=-1;require(got==static_cast<ssize_t>(PAGE),"shadow original missing");payload.append(reinterpret_cast<const char*>(bytes.data()),PAGE);}else ::close(fd);
     std::string record(1,'S');record+=payload;uint32_t n=record.size(),crc=checksum(record);
     auto end=::lseek(shadow,0,SEEK_END);require(end>=0,"shadow journal seek failed");
@@ -358,16 +386,54 @@ void Storage::undo_read(char* p,size_t n,uint64_t offset){
   if(n)require(read_all(undo,p,n,offset-undo_capacity),"undo record missing");
 }
 void Storage::begin(){require(!closed,"storage is closed");require(!active,"transaction already active");require(::ftruncate(undo,0)==0,"undo reset failed");undo_top=0;redo_buffer.clear();transaction_crc=0;transaction_start=::lseek(wal,0,SEEK_END);record('B',"MV2");active=true;pool.transaction_active=true;}
-void Storage::commit(){require(!closed&&active,"no active transaction");try{flush_redo();std::string payload;append(payload,transaction_crc);record('C',payload);sync_wal();
+void Storage::commit(){require(!closed&&active,"no active transaction");try{flush_redo();std::string payload;append_value(payload,transaction_crc);record('C',payload);sync_wal();
   active=false;pool.committed();regions.clear();undo_top=0;
   if(::lseek(wal,0,SEEK_END)>=64*1024*1024)checkpoint();
   }catch(...){closed=true;throw;}
 }
-void Storage::write_redo(const std::string& f,uint64_t p,const Page& bytes){auto old=pool.get(f,p);if(old==bytes)return;record('P',delta(f,p,old,bytes));pool.put(f,p,bytes);}
+void Storage::cache_written(const std::string& f,bool status){
+  for(size_t i=0;i<written_count;++i)if(f==written_cache[i].file.data()){written_cache[i].status=status;return;}
+  auto i=written_cursor++%written_count;std::memcpy(written_cache[i].file.data(),f.c_str(),f.size()+1);written_cache[i].status=status;
+}
+bool Storage::normal_written(const std::string& f){
+  for(size_t i=0;i<written_count;++i)if(f==written_cache[i].file.data())return written_cache[i].status;
+  // Both positive and negative results are safe until the next epoch. Every
+  // normal redo/shadow path changes this exact cache entry before writing.
+  bool found=std::filesystem::exists(written_directory/f)||std::filesystem::exists(shadow_index/f);
+  cache_written(f,found);return found;
+}
+void Storage::mark_written(const std::string& f){
+  require(!f.empty()&&f.size()<128&&f.find('/')==std::string::npos&&f.find("..") == std::string::npos,"unsafe written file");
+  if(normal_written(f))return;
+  // A bounded exact cache accelerates a persistent epoch guard. Retain the
+  // marker across recovery: older committed redo may overwrite a reused tail.
+  int fd=::open((written_directory/f).c_str(),O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC,0600);
+  if(fd>=0)::close(fd);else require(errno==EEXIST,"create written marker failed");
+  cache_written(f,true);
+}
+void Storage::write_redo(const std::string& f,uint64_t p,const Page& bytes){auto old=pool.get(f,p);if(old==bytes)return;mark_written(f);record('P',delta(f,p,old,bytes));pool.put(f,p,bytes);}
 void Storage::write(const std::string& f,uint64_t p,const Page& bytes){require(!closed&&active,"write outside transaction");auto before=pool.get(f,p);if(before==bytes)return;
   if(fresh_region(f)){write_new(f,p,bytes);return;}
   auto data=delta(f,p,bytes,before);uint32_t n=data.size();undo_write(data.data(),n,undo_top);undo_write(reinterpret_cast<const char*>(&n),4,undo_top+n);undo_top+=n+4;
-  record('P',delta(f,p,before,bytes));pool.put(f,p,bytes);
+  mark_written(f);record('P',delta(f,p,before,bytes));pool.put(f,p,bytes);
+}
+void Storage::append(const std::string& f,uint64_t p,const Page& bytes,size_t offset,size_t length){
+  require(!closed&&active,"append outside transaction");
+  require(length&&offset<=PAGE&&length<=PAGE-offset,"invalid append extent");
+  require(!f.empty()&&f.size()<128&&f.find('/')==std::string::npos&&f.find("..") == std::string::npos,"unsafe append file");
+  auto before=pool.get(f,p);
+  require(std::memcmp(before.data(),bytes.data(),offset)==0&&std::memcmp(before.data()+offset+length,bytes.data()+offset+length,PAGE-offset-length)==0,"append modified visible prefix");
+  if(before==bytes)return;
+  // A known guarded file keeps ordinary buffered WAL writes; no forced flush
+  // is needed because this path will never omit redo.
+  if(normal_written(f)){write(f,p,bytes);return;}
+  // Flush first: an uncommitted dirty page must acquire shadow protection, and
+  // a committed dirty prefix must reach disk before the direct extent write.
+  pool.flush_page(f,p);
+  // Every shadow record carries a FILE length and restore truncates to it.
+  // A page-only test would lose WAL-free appends beyond another page's length.
+  if(normal_written(f)){write(f,p,bytes);return;}
+  pool.append_extent(f,p,bytes,offset,length);
 }
 void Storage::rollback_to(uint64_t target){require(active&&target<=undo_top,"invalid savepoint");while(undo_top>target){uint32_t n=0;undo_read(reinterpret_cast<char*>(&n),4,undo_top-4);require(n<=2*PAGE+256&&n+4<=undo_top-target,"invalid undo length");std::string data(n,'\0');undo_read(data.data(),n,undo_top-n-4);
   if(!data.empty()&&data[0]=='\0'){auto prefix=data.substr(1);record('P',data);discard_region(prefix);regions.erase(std::remove(regions.begin(),regions.end(),prefix),regions.end());undo_top-=n+4;continue;}
@@ -386,7 +452,7 @@ void Storage::checkpoint(const std::function<void(size_t)>& stage){
   auto pending=root/"CURRENT.tmp";int fd=::open(pending.c_str(),O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC,0600);require(fd>=0,"create checkpoint manifest failed");auto value="MV3 "+std::to_string(next)+"\n";write_all(fd,value.data(),value.size());sync_file(fd);::close(fd);sync_directory(root);if(stage)stage(2);
   std::filesystem::rename(pending,root/"CURRENT");sync_directory(root);
   auto oldwal=wal_path(root,generation),oldshadow=shadow_directory;
-  ::close(wal);::close(shadow);wal=fresh;shadow=nextfd;fresh=nextfd=-1;generation=next;shadow_directory=nextshadow;shadow_index=nextshadow/"index";std::filesystem::create_directory(shadow_index);
+  ::close(wal);::close(shadow);wal=fresh;shadow=nextfd;fresh=nextfd=-1;generation=next;shadow_directory=nextshadow;shadow_index=nextshadow/"index";written_directory=nextshadow/"written";for(size_t i=0;i<written_count;++i)written_cache[i]={};written_cursor=0;std::filesystem::create_directory(shadow_index);std::filesystem::create_directory(written_directory);
   if(stage)stage(3);
   auto link=root/"wal.linktmp";std::filesystem::remove(link);std::filesystem::create_symlink(nextwal.filename(),link);std::filesystem::rename(link,root/"wal");sync_directory(root);if(stage)stage(4);
   if(oldwal!=root/"wal")std::filesystem::remove(oldwal);

@@ -19,6 +19,7 @@ using namespace mvdb;
 // I/O. The kernel handles all operations outside each narrowly scoped test.
 namespace {
 int reject_direct=0;unsigned direct_rejections=0;
+int kill_append_write_stage=0;
 bool audit_io=false;
 unsigned direct_opens=0,data_syncs=0,full_syncs=0,cache_drops=0,data_file_syncs=0,wal_file_syncs=0;
 unsigned sync_interruptions=0,index_read_interruptions=0,index_write_interruptions=0;
@@ -41,6 +42,10 @@ extern "C" ssize_t pread(int fd,void* data,size_t n,off_t offset){
  return ::syscall(SYS_pread64,fd,data,n,offset);
 }
 extern "C" ssize_t pwrite(int fd,const void* data,size_t n,off_t offset){
+ if(kill_append_write_stage&&descriptor_path(fd).ends_with("/data/t.v1")){
+  if(kill_append_write_stage==1)::kill(::getpid(),SIGKILL);
+  auto result=::syscall(SYS_pwrite64,fd,data,n,offset);::kill(::getpid(),SIGKILL);return result;
+ }
  if(index_write_interruptions&&shadow_index(fd)){--index_write_interruptions;errno=EINTR;return -1;}
  if(reject_direct==3&&(::fcntl(fd,F_GETFL)&O_DIRECT)){++direct_rejections;errno=EINVAL;return -1;}
  return ::syscall(SYS_pwrite64,fd,data,n,offset);
@@ -88,11 +93,11 @@ void transaction_sync_boundary(){
  for(int i=0;i<40;i++){fill();s.write("t.v1",i,p);}
  assert(s.undo_spill_bytes-spill>64*1024&&s.shadow_bytes_written>0);
  assert(data_syncs==0&&full_syncs==0&&cache_drops==0&&direct_opens==0);
- s.commit();audit_io=false;assert(data_syncs==1&&wal_file_syncs==1&&full_syncs==0&&cache_drops==0);
+ s.commit();audit_io=false;assert(data_syncs==1&&wal_file_syncs==1&&full_syncs==0&&cache_drops==1);
  assert(s.wal_syncs-syncs==1);
  reset_audit();audit_io=true;
  s.checkpoint([&](size_t stage){if(stage==1)assert(data_file_syncs>0);});audit_io=false;
- assert(data_file_syncs>0&&full_syncs>0&&cache_drops==0);
+ assert(data_file_syncs>0&&full_syncs>0&&cache_drops>0);
 }
 // Graceful shutdown signals may interrupt a checkpoint or shadow operation.
 // Retry these syscall boundaries rather than turning a signal into I/O failure.
@@ -105,11 +110,75 @@ void interrupted_io(){
  sync_interruptions=2;s.checkpoint();assert(sync_interruptions==0);
  for(int i=0;i<12;i++)assert(s.read("v",i)[0]==std::byte(21));
 }
+// Invisible extents publish only through normally logged metadata. Both the
+// no-C and C boundaries, later shadow capture, and file-wide fallback matter.
+void invisible_append(){
+ auto check=[](const std::filesystem::path& d,unsigned count,unsigned tail){Storage s(d,65536);assert(s.read("t.header",0)[0]==std::byte(count));auto p=s.read("t.v1",0);assert(p[16]==std::byte(tail));};
+ for(int stage=1;stage<=2;stage++){
+  auto d=base/("append_mid_write"+std::to_string(stage));
+  child([&]{Storage s(d,65536);s.begin();Page p{};p[16]=std::byte(42);kill_append_write_stage=stage;s.append("t.v1",0,p,16,4);},true);
+  check(d,0,stage==1?0:42);
+ }
+ for(bool committed:{false,true}){
+  auto d=base/(committed?"append_C":"append_no_C");
+  child([&]{Storage s(d,65536);s.begin();Page p{},h{};p[16]=std::byte(42);auto undo=s.savepoint();auto wal=s.wal_bytes_written;
+   s.append("t.v1",0,p,16,4);assert(s.savepoint()==undo&&s.wal_bytes_written==wal);h[0]=std::byte(1);s.write("t.header",0,h);if(committed)s.commit();kill_now();},true);
+  check(d,committed?1:0,42);
+ }
+ auto d=base/"append_future_shadow";
+ child([&]{Storage s(d,65536);s.begin();Page p{},h{};p[16]=std::byte(42);s.append("t.v1",0,p,16,4);h[0]=std::byte(1);s.write("t.header",0,h);s.commit();
+  s.begin();p[16]=std::byte(99);s.write("t.v1",0,p);s.pool.flush_all();assert(s.shadow_bytes_written>0);kill_now();},true);
+ for(int i=0;i<2;i++)child([&]{Storage s(d,65536,[](size_t n){if(n==1)kill_now();});},true);
+ check(d,1,42);
+ for(bool same_page:{false,true}){
+  d=base/(same_page?"append_same_shadow":"append_file_shadow");
+  {Storage s(d,65536);s.begin();Page p{};p[0]=std::byte(1);s.write("t.v1",0,p);s.commit();}
+  child([&]{Storage s(d,65536);s.begin();auto p=s.read("t.v1",0);p[0]=std::byte(2);s.write("t.v1",0,p);s.pool.flush_all();s.commit();
+   s.begin();auto page=same_page?0:1;p=s.read("t.v1",page);p[16]=std::byte(42);auto undo=s.savepoint();s.append("t.v1",page,p,16,4);assert(s.savepoint()>undo);s.commit();kill_now();},true);
+  {Storage s(d,65536);assert(s.read("t.v1",0)[0]==std::byte(2));assert(s.read("t.v1",same_page?0:1)[16]==std::byte(42));}
+ }
+ for(size_t stage=1;stage<=4;stage++){
+  d=base/("append_checkpoint"+std::to_string(stage));
+  child([&]{Storage s(d,65536);s.begin();Page p{},h{};p[16]=std::byte(42);s.append("t.v1",0,p,16,4);h[0]=std::byte(1);s.write("t.header",0,h);s.commit();s.checkpoint([&](size_t n){if(n==stage)kill_now();});},true);
+  check(d,1,42);
+ }
+ d=base/"append_dirty_prefix";
+ child([&]{Storage s(d,65536);s.begin();Page p{};p[0]=std::byte(7);s.write("t.v1",0,p);s.commit();s.begin();p[16]=std::byte(42);s.append("t.v1",0,p,16,4);s.commit();kill_now();},true);
+ {Storage s(d,65536);auto p=s.read("t.v1",0);assert(p[0]==std::byte(7)&&p[16]==std::byte(42));}
+ // Earlier physical redo includes inverse writes from savepoint rollback.
+ // Such redo would erase a later WAL-free reuse even without any shadow page.
+ for(bool same_transaction:{false,true}){
+  d=base/(same_transaction?"append_prior_redo_tx":"append_prior_redo_commit");
+  child([&]{Storage s(d,32<<20);s.begin();Page p{};auto mark=s.savepoint();p[16]=std::byte(17);s.write("t.v1",0,p);s.rollback_to(mark);
+   if(!same_transaction){s.commit();s.begin();}p=s.read("t.v1",0);p[16]=std::byte(42);mark=s.savepoint();s.append("t.v1",0,p,16,4);assert(s.savepoint()>mark);if(!same_transaction)assert(s.shadow_bytes_written==0);s.commit();kill_now();},true);
+  {Storage s(d,65536);assert(s.read("t.v1",0)[16]==std::byte(42));}
+ }
+ // Compatibility: recover old WAL without guard markers, then guard later
+ // appends against those earlier absolute redo runs on every subsequent restart.
+ d=base/"append_rebuild_guard";
+ child([&]{Storage s(d,32<<20);s.begin();Page p{};p[16]=std::byte(17);s.write("t.v1",0,p);s.commit();kill_now();},true);
+ std::filesystem::remove_all(d/"shadow.0"/"written");
+ child([&]{Storage s(d,32<<20);s.begin();auto p=s.read("t.v1",0);p[16]=std::byte(42);auto mark=s.savepoint();s.append("t.v1",0,p,16,4);assert(s.savepoint()>mark);s.commit();kill_now();},true);
+ {Storage s(d,65536);assert(s.read("t.v1",0)[16]==std::byte(42));}
+ // Reusing rolled-back garbage must remain safe under a later normal update.
+ d=base/"append_savepoint";
+ child([&]{Storage s(d,65536);s.begin();Page p{},h{};auto mark=s.savepoint();p[16]=std::byte(41);s.append("t.v1",0,p,16,4);h[0]=std::byte(1);s.write("t.header",0,h);s.rollback_to(mark);p[16]=std::byte(42);s.append("t.v1",0,p,16,4);s.write("t.header",0,h);s.commit();s.begin();p[16]=std::byte(99);s.write("t.v1",0,p);s.pool.flush_all();kill_now();},true);
+ check(d,1,42);
+}
+void resident_handles(){
+ Storage s(base/"resident_handles",65536);auto h=s.pool.handle("v",0);assert(s.pool.resident(h));
+ for(unsigned i=1;i<10;i++)s.read("v",i);
+ assert(!s.pool.resident(h));
+ auto current=s.pool.handle("v",0);assert(s.pool.resident(current));s.pool.invalidate_prefix("v");assert(!s.pool.resident(current));
+ Storage large(base/"larger_pool",12<<20);auto reads=large.pool.physical_reads;
+ for(int repeat=0;repeat<2;repeat++)for(int i=0;i<480;i++)large.read("v",i);
+ assert(large.pool.physical_reads==reads+480&&large.budget.peak<=large.budget.limit);
+}
 int main(int argc,char** argv){
  ::unsetenv("MVDB_USE_ODIRECT");
  if(argc==2){std::filesystem::remove_all(base);std::string test=argv[1];
-  if(test=="buffered")buffered_default();else if(test=="metadata")metadata_scan();else if(test=="sync")transaction_sync_boundary();else if(test=="interrupt")interrupted_io();else return 2;return 0;}
- std::filesystem::remove_all(base);buffered_default();metadata_scan();transaction_sync_boundary();interrupted_io();
+  if(test=="buffered")buffered_default();else if(test=="metadata")metadata_scan();else if(test=="sync")transaction_sync_boundary();else if(test=="interrupt")interrupted_io();else if(test=="append")invisible_append();else if(test=="resident")resident_handles();else return 2;return 0;}
+ std::filesystem::remove_all(base);buffered_default();metadata_scan();transaction_sync_boundary();interrupted_io();invisible_append();resident_handles();
  for(int mode=1;mode<=3;mode++){
   ::setenv("MVDB_USE_ODIRECT","1",1);
   auto fallback=base/("direct_fallback"+std::to_string(mode));reject_direct=mode;direct_rejections=0;

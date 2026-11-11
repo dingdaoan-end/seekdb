@@ -1,8 +1,28 @@
 # Local benchmark method
 
-This harness measures the **local raw-SQL-line / JSON-line adapter**, not the
-competition handshake. The workload below is the supplied workload; no unseen
-section 3.3 or external benchmark specification has been independently verified.
+The current harness uses the official JSONL startup/request/response protocol.
+Round 8 adds `tests/benchmark_cgroup.py`: independent write/query containers,
+three repeats, fixed seeds, external cgroup v2 sampling, and post-measurement
+restart/content verification. The student supplied sections 3.3.1–3.3.3; local
+reference constants come from the three-run median of `fe90005`, with its exact
+query project as the query reference. Public platform constants remain unknown.
+
+For each project, `R_T=(T_base+0.001)/(T+0.001)` and
+`R_B=(B_base+1048576)/(B+1048576)`, likewise for byte-valued M.
+With `f(R)=R/(1+R)`, `E_project=0.6*f(R_T)+0.2*f(R_B)+0.2*f(R_M)` and
+`E=(E_write+2*E_query)/3`. Report the median of three E values, rounded to six
+decimals. This is a local relative comparison, with reference E=0.5; it cannot
+predict the platform's ranking or convert its reported 1930.412174 value.
+
+The Docker Desktop data device also charges image startup reads. Full target
+io.stat counters are retained, including startup and shutdown writeback; the
+collector is outside the target cgroup. A fixed holder shell remains after DB
+shutdown to retain counters. Fresh volumes and the same warmup are used, without
+global cache dropping. These limits are identical before/after and are disclosed
+in [the Round 8 report](round8-performance.md), alongside native process RSS
+measurements, which must not be substituted for container memory.peak.
+
+The sections below retain the Phase 3 historical reproduction procedure.
 
 ## Reproduction
 

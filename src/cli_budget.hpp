@@ -19,9 +19,9 @@ inline CliBudget default_cli_budget(const std::filesystem::path& root="/sys/fs/c
   auto limit=cgroup_limit(root/"memory.max"),high=cgroup_limit(root/"memory.high");
   if(high&&(!limit||*high<*limit))limit=high;
   constexpr uint64_t MiB=1024*1024;
-  if(!limit)return {20*MiB,"fallback"};
+  if(!limit)return {12*MiB,"fallback"};
   // Compute floor(55% * limit) without overflow at uint64_t maximum.
   const auto fraction=(*limit/100)*55+(*limit%100)*55/100;
-  return {std::clamp(fraction,4*MiB,24*MiB),"cgroup"};
+  return {std::clamp(fraction,4*MiB,12*MiB),"cgroup"};
 }
 }

@@ -18,7 +18,7 @@ work/build/mvdb_local --data-dir /tmp/minivectordb
 
 CLI 默认数据根目录 `/data`。未显式指定预算时读取 cgroup v2 的
 `memory.max` 与 `memory.high`，取可解析有限额的较小值，预算为其55%，
-下限4MiB、上限24MiB；均为`max`或不可读时默认20MiB（20971520字节）。
+下限4MiB、上限12MiB；均为`max`或不可读时默认12MiB（12582912字节）。
 这是引擎分配预算，尚需为程序、内核和Page Cache留出余量。支持
 `--data-dir PATH`、`--memory-budget BYTES`、`--help`，以及原有的
 `DATA_DIR [MEMORY_BUDGET]` 位置参数。进程以前台方式读取 stdin、写入 stdout，
@@ -34,7 +34,7 @@ SQL错误返回error.code对象，shutdown回滚未提交事务并正常关闭�
 
 ```sh
 python3 protocol_check/run.py --command '["/absolute/path/to/mvdb_local"]' --output work/protocol-native
-python3 protocol_check/run.py --image minivectordb:round7 --output work/protocol-docker
+python3 protocol_check/run.py --image minivectordb:round8 --output work/protocol-docker
 ```
 
 公开题包为官方f4d4e2665版本的20个用例、95条SQL，包含重启、模式切换及错误断言。
@@ -92,6 +92,32 @@ python3 tests/docker_smoke.py --image minivectordb:final
 所有页共享受 MemoryBudget 管控的有界BufferPool。128维向量占512字节，
 16KiB payload页容纳32条；向量与行元数据分离，IVF桶仅存4字节SlotId。
 小K查询使用内存Top-K堆，以排序键和主键升序决胜；大结果才回退外部排序。
+
+预算大于8MiB时约四分之三分配给BufferPool，其余保留给Undo、解析和查询工作区；
+4/8MiB及更小预算仍保留一半工作区。最多25,000槽位的向量TopK查询可按预算
+建立单表热读缓存：主键、有效/极端值标记、质心和4B SlotId桶。普通字符串列
+最多128个字典值、16KiB字符串内容，以uint16槽位编码精确过滤；高基数列回退
+通用执行器。缓存不复制向量payload，所有DML、事务控制和异常均使缓存失效。
+驻留向量页使用带帧版本的句柄验证后直接读取；缺页仍由BufferPool统一换入。
+SIMD平方距离仅筛除确定落选者，潜在赢家用float64复算，最终开方并按主键决胜。
+
+新槽位向量与blob逻辑尾部可以在COMMIT前直接写入数据文件，WAL只发布其
+可见元数据，减少双写。仅在整个文件本epoch从未被普通Redo或Shadow触及时
+启用；否则保留完整WAL，防止恢复前镜像、文件截断或旧Redo覆盖新提交尾部。
+这些保护标记跨重启保留，Checkpoint后重置。追加先扩展完整页，再写不可见
+字节，避免强杀产生短页。该优化依据赛题SIGKILL模型，不宣称支持断电恢复。
+WAL同步后、数据Checkpoint同步后及临时文件关闭时提示内核释放可回收页缓存。
+
+Round 8容器基准使用独立数据卷和cgroup，外部采样器读取io.stat与memory.peak：
+
+```sh
+python3 tests/benchmark_local.py --phase after --automatic-ann --default-budget --binary work/build/mvdb_local --output work/native-after.json
+python3 tests/benchmark_cgroup.py --image minivectordb:round8 --phase after --output work/cgroup-after.json --rounds 3
+```
+
+本地Docker Desktop统计包含同设备启动读，且容器内固定保留一个关闭后采样用的
+shell；前后口径一致，但不能替代正式平台的专用数据设备成绩。历史实测与本轮
+对比见[Round 8报告](docs/round8-performance.md)。
 
 ## 索引与内建校准
 

@@ -37,6 +37,8 @@ double l2(const float*,const float*,size_t);
 bool has_extreme(const float*,size_t);
 double l2_fast(const float*,const float*,size_t,bool safe);
 double l2_exact(const float*,const float*,size_t);
+double l2_squared_fast(const float*,const float*,size_t,bool safe);
+double l2_squared_exact(const float*,const float*,size_t);
 bool avx2_available();
 bool fma_available();
 }

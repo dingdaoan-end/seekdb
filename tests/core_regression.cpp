@@ -45,5 +45,49 @@ int main(){
    size_t rows=0;projected.each([&](const auto& row){assert(mvdb::json(row[0])=="[1,2,3]");++rows;});assert(rows==1);
    assert(engine.active_rows("implicit_key")==1&&engine.mutation_count("implicit_key")==0);
   }
+  // A warmed read cache must not survive writes, transaction boundaries, or
+  // a failed statement. Both exact dictionaries and PK tie ordering matter.
+  {mvdb::Engine e(root/"read_cache",1<<20);
+   e.execute("CREATE TABLE t (id BIGINT PRIMARY KEY,category VARCHAR(16),v VECTOR(2));");
+   e.execute("INSERT INTO t VALUES (7,'\xe4\xb8\xad\xe6\x96\x87','[0,0]'),(2,'\xe4\xb8\xad\xe6\x96\x87','[0,0]'),(9,'other','[2,0]');");
+   const std::string q="SELECT id,L2_DISTANCE(v,'[0,0]') AS d FROM t WHERE category='\xe4\xb8\xad\xe6\x96\x87' ORDER BY d LIMIT 2;";
+   auto ids=[&](){std::vector<int64_t> out;e.execute(q).each([&](const auto& r){out.push_back(std::get<int64_t>(r[0]));});return out;};
+   assert((ids()==std::vector<int64_t>{2,7}));assert(e.read_cache_slots()==3);
+   e.execute("BEGIN;");assert(e.read_cache_slots()==0);
+   e.execute("UPDATE t SET category='other' WHERE id=2;");assert((ids()==std::vector<int64_t>{7}));
+   e.execute("ROLLBACK;");assert(e.read_cache_slots()==0);assert((ids()==std::vector<int64_t>{2,7}));
+   bool failed=false;try{e.execute("INSERT INTO t VALUES (10,'\xe4\xb8\xad\xe6\x96\x87','[0,0]'),(2,'\xe4\xb8\xad\xe6\x96\x87','[0,0]');");}catch(const std::exception&){failed=true;}
+   assert(failed&&e.read_cache_slots()==0);assert((ids()==std::vector<int64_t>{2,7}));
+   e.execute("BEGIN;");e.execute("DELETE FROM t WHERE id=2;");assert((ids()==std::vector<int64_t>{7}));e.execute("COMMIT;");assert(e.read_cache_slots()==0);assert((ids()==std::vector<int64_t>{7}));
+   assert(e.budget_peak()<=(1U<<20));
+  }
+  {mvdb::Engine e(root/"cache_fallback",1<<20);
+   e.execute("CREATE TABLE t (id BIGINT PRIMARY KEY,category VARCHAR(40),v VECTOR(2));");
+   e.execute("BEGIN;");for(int i=0;i<140;++i)e.execute("INSERT INTO t VALUES ("+std::to_string(i)+",'unique"+std::to_string(i)+"','["+std::to_string(i)+",0]');");e.execute("COMMIT;");
+   auto r=e.execute("SELECT id,L2_DISTANCE(v,'[0,0]') AS d FROM t WHERE category='unique139' ORDER BY d LIMIT 1;");
+   size_t count=0;r.each([&](const auto& values){assert(std::get<int64_t>(values[0])==139);++count;});assert(count==1&&e.read_cache_slots()==0);
+   e.execute("CREATE TABLE extremes (id BIGINT PRIMARY KEY,v VECTOR(2));");
+   e.execute("INSERT INTO extremes VALUES (9007199254740993,'[3e38,3e38]'),(9007199254740992,'[3e38,3e38]'),(3,'[1e-30,0]'),(2,'[0,0]');");
+   auto ranked=[&](bool generic){std::vector<std::pair<int64_t,double>> out;e.execute(std::string("SELECT id,L2_DISTANCE(v,'[0,0]') AS d")+(generic?",id AS again":"")+" FROM extremes ORDER BY d LIMIT 4;").each([&](const auto& values){out.emplace_back(std::get<int64_t>(values[0]),std::get<double>(values[1]));});return out;};
+   auto fast=ranked(false);assert(fast==ranked(true));assert(fast[2].first==9007199254740992LL&&fast[3].first==9007199254740993LL);
+   e.execute("CREATE TABLE rounded (id BIGINT PRIMARY KEY,v VECTOR(2));");
+   e.execute("INSERT INTO rounded VALUES (1,'[1,1.5e-8]'),(2,'[1,0]');");
+   std::vector<int64_t> tied;e.execute("SELECT id,L2_DISTANCE(v,'[0,0]') AS d FROM rounded ORDER BY d LIMIT 2;").each([&](const auto& r){assert(std::get<double>(r[1])==1.0);tied.push_back(std::get<int64_t>(r[0]));});assert((tied==std::vector<int64_t>{1,2}));
+   size_t none=0;e.execute("SELECT id,L2_DISTANCE(v,'[0,0]') AS d FROM extremes WHERE id=2 AND id=3 ORDER BY d LIMIT 4;").each([&](const auto&){++none;});assert(none==0);
+   assert(e.budget_peak()<=(1U<<20));
+  }
+  // The measured workload specifies an explicit ascending PK tiebreaker.
+  // Both the projected alias and the underlying column must use the cache.
+  {mvdb::Engine e(root/"cache_order_shape",12<<20);
+   e.execute("CREATE TABLE t (id BIGINT PRIMARY KEY,category VARCHAR(16),content VARCHAR(128),v VECTOR(128));");
+   std::string zero="[";for(int i=0;i<128;++i){if(i)zero+=",";zero+="0";}zero+="]";
+   e.execute("BEGIN;");for(int i=139;i>=0;--i)e.execute("INSERT INTO t VALUES ("+std::to_string(i)+",'same','unique"+std::to_string(i)+"','"+zero+"');");e.execute("COMMIT;");
+   for(const auto& suffix:{"id","pk"}){
+    std::vector<int64_t> ids;e.execute("SELECT id AS pk,L2_DISTANCE(v,'"+zero+"') AS d FROM t WHERE category='same' ORDER BY d,"+suffix+" LIMIT 10;").each([&](const auto& r){ids.push_back(std::get<int64_t>(r[0]));});
+    assert(ids.size()==10&&ids.front()==0&&ids.back()==9);assert(e.read_cache_slots()==140);
+   }
+   std::vector<int64_t> descending;e.execute("SELECT id,L2_DISTANCE(v,'"+zero+"') AS d FROM t ORDER BY d,id DESC LIMIT 10;").each([&](const auto& r){descending.push_back(std::get<int64_t>(r[0]));});
+   assert(descending.front()==139&&descending.back()==130&&e.read_cache_slots()==0);
+  }
   std::cout<<"result lifetime regression passed\n";
 }

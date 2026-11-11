@@ -15,6 +15,7 @@ struct Json {
 class Parser {
   std::string_view source;
   size_t pos=0;
+  bool request_only=false;
   [[noreturn]] void fail() const {throw std::runtime_error("invalid JSON request");}
   void ws(){while(pos<source.size()&&(source[pos]==' '||source[pos]=='\t'||source[pos]=='\r'||source[pos]=='\n'))++pos;}
   bool eat(char c){if(pos<source.size()&&source[pos]==c){++pos;return true;}return false;}
@@ -39,11 +40,11 @@ class Parser {
     }fail();
   }
   bool digit() const {return pos<source.size()&&source[pos]>='0'&&source[pos]<='9';}
-  Json value(unsigned depth){
+  Json value(unsigned depth,bool capture_raw=false){
     if(depth>128)fail();
     ws();if(pos==source.size())fail();size_t start=pos;Json result;result.kind=source[pos];
     if(result.kind=='"')result.text=string();
-    else if(eat('{')){ws();if(!eat('}')){for(;;){ws();auto key=string();ws();if(!eat(':'))fail();auto child=value(depth+1);if(!result.fields.emplace(std::move(key),std::move(child)).second)fail();ws();if(eat('}'))break;if(!eat(','))fail();}}}
+    else if(eat('{')){ws();if(!eat('}')){for(;;){ws();auto key=string();ws();if(!eat(':'))fail();auto child=value(depth+1,depth==0&&key=="id");if(!result.fields.emplace(std::move(key),std::move(child)).second)fail();ws();if(eat('}'))break;if(!eat(','))fail();}}}
     else if(eat('[')){ws();if(!eat(']')){for(;;){value(depth+1);ws();if(eat(']'))break;if(!eat(','))fail();}}}
     else if(result.kind=='t'||result.kind=='f'||result.kind=='n'){std::string_view word=result.kind=='t'?"true":result.kind=='f'?"false":"null";if(source.substr(pos,word.size())!=word)fail();pos+=word.size();}
     else {
@@ -51,11 +52,12 @@ class Parser {
       if(eat('.')){if(!digit())fail();while(digit())++pos;}
       if(eat('e')||eat('E')){if(!eat('+'))eat('-');if(!digit())fail();while(digit())++pos;}
     }
-    result.raw=std::string(source.substr(start,pos-start));return result;
+    if(!request_only||capture_raw)result.raw=std::string(source.substr(start,pos-start));
+    return result;
   }
 public:
-  explicit Parser(std::string_view input):source(input){}
+  explicit Parser(std::string_view input,bool request=false):source(input),request_only(request){}
   Json parse(){auto result=value(0);ws();if(pos!=source.size())fail();return result;}
 };
-inline std::string required_string(const Json& request,const std::string& field){auto it=request.fields.find(field);if(it==request.fields.end()||it->second.kind!='"')throw std::runtime_error("request requires string field: "+field);return it->second.text;}
+template<class Request>inline auto& required_string(Request& request,const std::string& field){auto it=request.fields.find(field);if(it==request.fields.end()||it->second.kind!='"')throw std::runtime_error("request requires string field: "+field);return it->second.text;}
 }

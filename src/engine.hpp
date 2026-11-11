@@ -40,6 +40,27 @@ class Engine {
   static bool stale(const Header& h){return h.calibration_stale||h.mutations_since_calibration>drift_limit(h);}
   struct Meta {int64_t key=0;uint64_t offset=0;uint32_t length=0,active=0,bucket=0,reserved=0;};
   static_assert(sizeof(Meta)==32);
+  // One bounded cache: payload vectors remain exclusively in BufferPool.
+  struct TableReadCache {
+    std::string table;
+    uint32_t slots=0;
+    std::shared_ptr<void> reservation;
+    std::vector<int64_t> keys;
+    std::vector<uint8_t> flags; // active and extreme
+    struct Dictionary {bool supported=false;std::vector<uint16_t> ids;std::vector<std::string> values;};
+    std::vector<Dictionary> dictionaries;
+    std::vector<float> centers;
+    std::vector<SlotId> postings,active_slots;
+    std::vector<uint32_t> offsets;
+    std::vector<BufferPool::ResidentHandle> vector_pages;
+  };
+  std::unique_ptr<TableReadCache> read_cache;
+  TableReadCache* cache(const std::string&,const Header&,const std::vector<Column>&);
+  bool fast_topk(const Statement&,const Header&,const std::vector<Column>&,
+                 const std::vector<Expr>&,const std::vector<size_t>&,
+                 const std::vector<std::vector<float>>&,
+                 const std::vector<std::pair<size_t,bool>>&,
+                 const std::vector<std::pair<size_t,Value>>&,Result&);
   Header header(const std::string&);
   std::vector<Column> schema(const Header&);
   Meta meta(const std::string&,SlotId);
@@ -49,7 +70,7 @@ class Engine {
   const float* center_view(const std::string&,uint32_t,size_t);
   void write_row(const std::string&,SlotId,std::vector<Value>,const std::vector<Column>&,bool);
   std::string read_blob(const std::string&,uint64_t,uint32_t);
-  void write_blob(const std::string&,uint64_t,const std::string&);
+  void write_blob(const std::string&,uint64_t,const std::string&,bool append=false);
   void bitmap(const std::string&,SlotId,bool);
   void posting(const std::string&,uint32_t,SlotId,bool);
   uint32_t assign(const std::string&,const Header&,const std::vector<float>&);
@@ -63,7 +84,8 @@ public:
   Engine(std::filesystem::path root,size_t budget=8*1024*1024,std::function<void(size_t)> progress={})
     :storage(std::move(root),budget,std::move(progress)){}
   Result execute(const std::string& sql);
-  void close(){storage.close();}
+  void close(){read_cache.reset();storage.close();}
+  size_t read_cache_slots() const{return read_cache?read_cache->slots:0;}
   uint32_t recommended_nprobe(const std::string& t){return header(t).recommended_nprobe;}
   uint32_t active_rows(const std::string& t){return header(t).active_count;}
   bool calibration_stale(const std::string& t){return stale(header(t));}

@@ -4,10 +4,9 @@
 #include <cmath>
 #include <cctype>
 #include <cstring>
-#include <iomanip>
+#include <locale.h>
 #include <immintrin.h>
 #include <limits>
-#include <sstream>
 #include <stdexcept>
 
 namespace mvdb {
@@ -160,11 +159,26 @@ Value convert(const Literal& v,const Column& col) {
   if(col.type==Type::Bigint){if(v.quoted)error("BIGINT literal must be numeric");return integer(v.text);}
   if(!v.quoted)error("string/vector literal must be quoted");
   if(col.type==Type::Varchar){if(unicode_length(v.text)>col.width)error("VARCHAR exceeds code point length");return v.text;}
-  std::vector<float> out;size_t p=0;auto ws=[&]{while(p<v.text.size()&&std::isspace(static_cast<unsigned char>(v.text[p])))++p;};
+  std::vector<float> out;out.reserve(std::min<size_t>(col.width,v.text.size()/2+1));
+  size_t p=0;auto ws=[&]{while(p<v.text.size()&&std::isspace(static_cast<unsigned char>(v.text[p])))++p;};
   ws();if(p==v.text.size()||v.text[p++]!='[')error("invalid VECTOR literal");ws();
-  if(p<v.text.size()&&v.text[p]!=']')while(true){const char* first=v.text.c_str()+p;char* end=nullptr;double x=std::strtod(first,&end);
+  if(p<v.text.size()&&v.text[p]!=']')while(true){
+    const char* first=v.text.data()+p;const char* last=v.text.data()+v.text.size();
+    const char* number=first;if(number!=last&&*number=='+')++number;
+    if(number==last||(number!=first&&(*number=='-'||*number=='+')))error("invalid VECTOR component");
+    double x=0;auto parsed=std::from_chars(number,last,x,std::chars_format::general);
+    const char* end=parsed.ptr;
+    const char* magnitude=number;if(magnitude!=last&&*magnitude=='-')++magnitude;
+    const bool hex=last-magnitude>=2&&magnitude[0]=='0'&&(magnitude[1]=='x'||magnitude[1]=='X');
+    if(hex||parsed.ec==std::errc::result_out_of_range){
+      // Preserve strtod's hexadecimal and underflow-to-zero admission, using
+      // an explicit locale only on these uncommon paths. Decimal parsing is
+      // allocation-free and independent of the process locale.
+      static locale_t c_locale=[] {auto locale=newlocale(LC_NUMERIC_MASK,"C",nullptr);if(!locale)error("cannot create numeric locale");return locale;}();
+      char* fallback_end=nullptr;x=strtod_l(first,&fallback_end,c_locale);end=fallback_end;
+    }else if(parsed.ec!=std::errc{})error("invalid VECTOR component");
     if(end==first||!std::isfinite(x)||std::abs(x)>std::numeric_limits<float>::max())error("nonfinite or overflowing VECTOR component");
-    p=static_cast<size_t>(end-v.text.c_str());out.push_back(static_cast<float>(x));ws();
+    p=static_cast<size_t>(end-v.text.data());out.push_back(static_cast<float>(x));ws();
     if(p<v.text.size()&&v.text[p]==','){++p;ws();continue;}break;}
   if(p==v.text.size()||v.text[p++]!=']')error("invalid VECTOR separator");
   ws();
@@ -180,14 +194,23 @@ int compare(const Value& a,const Value& b) {
   error("VECTOR comparison is unsupported");
 }
 std::string quote(const std::string& s) {
-  std::string out="\"";constexpr char hex[]="0123456789abcdef";
+  std::string out;out.reserve(s.size()+2);out+='"';constexpr char hex[]="0123456789abcdef";
   for(unsigned char c:s){if(c=='"'||c=='\\'){out+='\\';out+=static_cast<char>(c);}else if(c<32){out+="\\u00";out+=hex[c>>4];out+=hex[c&15];}else out+=static_cast<char>(c);}return out+'"';
 }
+namespace {
+template<class Number>void append_number(std::string& out,Number value){
+  char buffer[64];auto result=[&]{if constexpr(std::is_integral_v<Number>)return std::to_chars(buffer,buffer+sizeof(buffer),value);else return std::to_chars(buffer,buffer+sizeof(buffer),value,std::chars_format::general,17);}();
+  if(result.ec!=std::errc{})error("cannot serialize number");
+  out.append(buffer,result.ptr);
+}
+}
 std::string json(const Value& v){
-  if(auto n=std::get_if<int64_t>(&v))return std::to_string(*n);
-  if(auto n=std::get_if<double>(&v)){std::ostringstream out;out<<std::setprecision(17)<<*n;return out.str();}
+  std::string out;
+  if(auto n=std::get_if<int64_t>(&v)){append_number(out,*n);return out;}
+  if(auto n=std::get_if<double>(&v)){append_number(out,*n);return out;}
   if(auto s=std::get_if<std::string>(&v))return quote(*s);
-  std::string out="[";bool first=true;for(float x:std::get<std::vector<float>>(v)){if(!first)out+=',';first=false;out+=json(static_cast<double>(x));}return out+"]";
+  const auto& vector=std::get<std::vector<float>>(v);out.reserve(vector.size()*12+2);out+='[';
+  bool first=true;for(float x:vector){if(!first)out+=',';first=false;append_number(out,static_cast<double>(x));}out+=']';return out;
 }
 std::string pack_values(const std::vector<Value>& row) {
   std::string s;append(s,static_cast<uint32_t>(row.size()));for(auto& v:row){append(s,static_cast<uint8_t>(v.index()));
@@ -214,15 +237,17 @@ bool has_extreme(const float* a,size_t n){
   for(size_t i=0;i<n;++i)if(!std::isfinite(a[i])||std::abs(a[i])>1e16f)return true;
   return false;
 }
-double l2_exact(const float* a,const float* b,size_t n){
-  double sum=0;for(size_t i=0;i<n;++i){double d=static_cast<double>(a[i])-b[i];sum+=d*d;}return std::sqrt(sum);
+double l2_squared_exact(const float* a,const float* b,size_t n){
+  double sum=0;for(size_t i=0;i<n;++i){double d=static_cast<double>(a[i])-b[i];sum+=d*d;}return sum;
 }
-double l2_fast(const float* a,const float* b,size_t n,bool safe){
-  if(!safe||n>4096||!avx2_available())return l2_exact(a,b,n);
+double l2_exact(const float* a,const float* b,size_t n){return std::sqrt(l2_squared_exact(a,b,n));}
+double l2_squared_fast(const float* a,const float* b,size_t n,bool safe){
+  if(!safe||n>4096||!avx2_available())return l2_squared_exact(a,b,n);
   double sum=fma_available()?simd_squared_fma(a,b,n):simd_squared(a,b,n);
   // Recompute tiny sums to avoid float square underflow (including FTZ mode).
-  if(!std::isfinite(sum)||sum<=1e-20)return l2_exact(a,b,n);
-  return std::sqrt(sum);
+  if(!std::isfinite(sum)||sum<=1e-20)return l2_squared_exact(a,b,n);
+  return sum;
 }
+double l2_fast(const float* a,const float* b,size_t n,bool safe){return std::sqrt(l2_squared_fast(a,b,n,safe));}
 double l2(const float* a,const float* b,size_t n){return l2_fast(a,b,n,!has_extreme(a,n)&&!has_extreme(b,n));}
 }

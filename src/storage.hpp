@@ -29,7 +29,7 @@ struct MemoryBudget {
 // A fixed userspace allocation: frame and replacement metadata grow only with
 // frame count. Buffered I/O also uses reclaimable, externally charged kernel cache.
 class BufferPool {
-  struct Frame { std::string file; uint64_t page=0, age=0; bool valid=false, dirty=false, uncommitted=false, metadata=false; uint32_t pins=0; };
+  struct Frame { std::string file; uint64_t page=0, age=0, version=0; bool valid=false, dirty=false, uncommitted=false, metadata=false; uint32_t pins=0; };
   std::filesystem::path directory;
   MemoryBudget& budget;
   std::vector<Frame> frames;
@@ -55,6 +55,11 @@ public:
   };
   std::function<void(const std::string&,uint64_t)> before_flush;
   bool transaction_active=false;
+  struct ResidentHandle { size_t frame=0; uint64_t version=0; };
+  ResidentHandle handle(const std::string&,uint64_t);
+  const std::byte* resident(ResidentHandle) const;
+  void append_extent(const std::string&,uint64_t,const Page&,size_t,size_t);
+  void flush_page(const std::string&,uint64_t);
   void committed();
   void invalidate_prefix(const std::string&);
   void sync_all();
@@ -74,7 +79,14 @@ class Storage {
   std::filesystem::path root;
   int wal=-1, undo=-1, shadow=-1;
   void sync_wal();
-  std::filesystem::path shadow_directory, shadow_index;
+  std::filesystem::path shadow_directory, shadow_index, written_directory;
+  struct WrittenEntry { std::array<char,128> file{}; bool status=false; };
+  std::unique_ptr<WrittenEntry[]> written_cache;
+  size_t written_count=0;
+  void cache_written(const std::string&,bool);
+  size_t written_cursor=0, written_reservation=0;
+  bool normal_written(const std::string&);
+  void mark_written(const std::string&);
   std::vector<std::string> regions;
   void protect(const std::string&,uint64_t);
   void restore_shadow();
@@ -113,6 +125,9 @@ public:
   void rollback();
   Page read(const std::string& f,uint64_t p) { return pool.get(f,p); }
   void write(const std::string&,uint64_t,const Page&);
+  // Only logically invisible new slots/tails; rollback leaves unreachable garbage.
+  // Previously logged or shadowed files automatically use normal WAL/undo.
+  void append(const std::string&,uint64_t,const Page&,size_t offset,size_t length);
   std::string begin_region(const std::string& prefix);
   void write_new(const std::string&,uint64_t,const Page&);
   void seal_region(const std::string&);

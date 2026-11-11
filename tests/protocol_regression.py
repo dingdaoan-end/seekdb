@@ -82,6 +82,14 @@ with tempfile.TemporaryDirectory(prefix='mvdb-jsonl-') as root:
         assert send(p, {'id':ident,'sql':sql})['ok']
     result = send(p, {'id':22,'sql':'SELECT id,v FROM t ORDER BY id;','search_mode':'approx'})
     assert result['rows'] == [[1,[1,2,3]]] and result['columns'] == ['id','v'], result
+    assert send(p, {'id': 'numeric-table', 'sql': 'CREATE TABLE numeric_vectors (id INT, v VECTOR(6));'})['ok']
+    assert send(p, {'id': 'numeric-valid', 'sql': "INSERT INTO numeric_vectors VALUES(1,'[ +1.25, -2e1, 3E-2, 1e-9999, -1e-9999, 0x1p+2 ]');"})['ok']
+    numbers = send(p, {'id': 'numeric-read', 'sql': 'SELECT v FROM numeric_vectors;'})['rows'][0][0]
+    assert numbers[:2] == [1.25, -20] and abs(numbers[2] - 0.03) < 1e-8 and numbers[3:] == [0, 0, 4], numbers
+    for component in ['NaN', 'nan', 'Inf', '-Infinity', '1e9999', '-1e9999', '3.5e38', '-3.5e38', '+-1', '1e', '1.2.3', '1 2']:
+        error = send(p, {'id': 'numeric-rejected', 'sql': "INSERT INTO numeric_vectors VALUES(2,'[" + component + ",0,0,0,0,0]');"})
+        assert error['ok'] is False and error['error']['code'], (component, error)
+    assert send(p, {'id': 'numeric-atomic', 'sql': 'SELECT id FROM numeric_vectors;'})['rows'] == [[1]]
     # JSON escapes newlines while the SQL lexer treats comments as whitespace.
     for sql in ['-- leading comment\nSELECT id FROM t; -- trailing comment',
                 '/* leading ; SELECT */ SELECT/*between*/id FROM t; ; /* tail */ ;',
