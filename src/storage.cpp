@@ -182,6 +182,9 @@ const std::byte* BufferPool::resident(ResidentHandle h) const {
 }
 void BufferPool::flush_page(const std::string& f,uint64_t p){flush(pin(f,p));}
 void BufferPool::append_extent(const std::string& f,uint64_t p,const Page& bytes,size_t offset,size_t length){
+  append_extent_bytes(f,p,offset,bytes.data()+offset,length);
+}
+void BufferPool::append_extent_bytes(const std::string& f,uint64_t p,size_t offset,const void* bytes,size_t length){
   auto i=pin(f,p);require(!frames[i].dirty,"append requires flushed page");
   int fd=descriptor(f);
   // An extent can be unaligned; explicit O_DIRECT remains supported by switching
@@ -191,9 +194,9 @@ void BufferPool::append_extent(const std::string& f,uint64_t p,const Page& bytes
   // and a later extension would otherwise leave an unreadable short page.
   auto size=::lseek(fd,0,SEEK_END);require(size>=0,"append size failed");
   if(static_cast<uint64_t>(size)<(p+1)*PAGE)require(::ftruncate(fd,static_cast<off_t>((p+1)*PAGE))==0,"append page extension failed");
-  size_t remaining=length;const std::byte* source=bytes.data()+offset;uint64_t position=p*PAGE+offset;
+  size_t remaining=length;const std::byte* source=static_cast<const std::byte*>(bytes);uint64_t position=p*PAGE+offset;
   while(remaining){auto done=retry_eintr([&]{return ::pwrite(fd,source,remaining,static_cast<off_t>(position));});require(done>0,"append write failed");source+=done;remaining-=done;position+=done;}
-  data_page_write_bytes+=length;std::memcpy(arena+i*PAGE,bytes.data(),PAGE);
+  data_page_write_bytes+=length;std::memcpy(arena+i*PAGE+offset,bytes,length);
   frames[i].dirty=frames[i].uncommitted=false;
 }
 void BufferPool::committed(){transaction_active=false;for(auto& f:frames)f.uncommitted=false;}
@@ -434,6 +437,18 @@ void Storage::append(const std::string& f,uint64_t p,const Page& bytes,size_t of
   // A page-only test would lose WAL-free appends beyond another page's length.
   if(normal_written(f)){write(f,p,bytes);return;}
   pool.append_extent(f,p,bytes,offset,length);
+}
+void Storage::append_bytes(const std::string& f,uint64_t p,size_t offset,const void* data,size_t length){
+  require(!closed&&active,"append outside transaction");
+  require(data&&length&&offset<=PAGE&&length<=PAGE-offset,"invalid append extent");
+  require(!f.empty()&&f.size()<128&&f.find('/')==std::string::npos&&f.find("..") == std::string::npos,"unsafe append file");
+  auto logged=[&]{auto bytes=pool.get(f,p);std::memcpy(bytes.data()+offset,data,length);write(f,p,bytes);};
+  if(normal_written(f)){logged();return;}
+  // A dirty prefix can acquire a file-wide shadow guard when flushed. Check
+  // again after flush, exactly as the full-page append interface does.
+  pool.flush_page(f,p);
+  if(normal_written(f)){logged();return;}
+  pool.append_extent_bytes(f,p,offset,data,length);
 }
 void Storage::rollback_to(uint64_t target){require(active&&target<=undo_top,"invalid savepoint");while(undo_top>target){uint32_t n=0;undo_read(reinterpret_cast<char*>(&n),4,undo_top-4);require(n<=2*PAGE+256&&n+4<=undo_top-target,"invalid undo length");std::string data(n,'\0');undo_read(data.data(),n,undo_top-n-4);
   if(!data.empty()&&data[0]=='\0'){auto prefix=data.substr(1);record('P',data);discard_region(prefix);regions.erase(std::remove(regions.begin(),regions.end(),prefix),regions.end());undo_top-=n+4;continue;}

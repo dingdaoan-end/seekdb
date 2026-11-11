@@ -22,13 +22,14 @@ int reject_direct=0;unsigned direct_rejections=0;
 int kill_append_write_stage=0;
 bool audit_io=false;
 unsigned direct_opens=0,data_syncs=0,full_syncs=0,cache_drops=0,data_file_syncs=0,wal_file_syncs=0;
+unsigned extent_write_calls=0;
 unsigned sync_interruptions=0,index_read_interruptions=0,index_write_interruptions=0;
 std::string descriptor_path(int fd){
  char path[512];auto link="/proc/self/fd/"+std::to_string(fd);auto n=::readlink(link.c_str(),path,sizeof(path));
  return n>0?std::string(path,static_cast<size_t>(n)):std::string{};
 }
 bool shadow_index(int fd){return descriptor_path(fd).find("/index/")!=std::string::npos;}
-void reset_audit(){direct_opens=data_syncs=full_syncs=cache_drops=data_file_syncs=wal_file_syncs=0;}
+void reset_audit(){extent_write_calls=0;direct_opens=data_syncs=full_syncs=cache_drops=data_file_syncs=wal_file_syncs=0;}
 }
 extern "C" int open(const char* path,int flags,...){
  if(audit_io&&(flags&O_DIRECT))++direct_opens;
@@ -42,8 +43,10 @@ extern "C" ssize_t pread(int fd,void* data,size_t n,off_t offset){
  return ::syscall(SYS_pread64,fd,data,n,offset);
 }
 extern "C" ssize_t pwrite(int fd,const void* data,size_t n,off_t offset){
+ if(audit_io&&descriptor_path(fd).ends_with("/data/t.v1"))++extent_write_calls;
  if(kill_append_write_stage&&descriptor_path(fd).ends_with("/data/t.v1")){
   if(kill_append_write_stage==1)::kill(::getpid(),SIGKILL);
+  if(kill_append_write_stage==3)n=std::min<size_t>(n,113);
   auto result=::syscall(SYS_pwrite64,fd,data,n,offset);::kill(::getpid(),SIGKILL);return result;
  }
  if(index_write_interruptions&&shadow_index(fd)){--index_write_interruptions;errno=EINTR;return -1;}
@@ -165,6 +168,43 @@ void invisible_append(){
  child([&]{Storage s(d,65536);s.begin();Page p{},h{};auto mark=s.savepoint();p[16]=std::byte(41);s.append("t.v1",0,p,16,4);h[0]=std::byte(1);s.write("t.header",0,h);s.rollback_to(mark);p[16]=std::byte(42);s.append("t.v1",0,p,16,4);s.write("t.header",0,h);s.commit();s.begin();p[16]=std::byte(99);s.write("t.v1",0,p);s.pool.flush_all();kill_now();},true);
  check(d,1,42);
 }
+// Page batches may stop mid-statement or mid-pwrite. Only normally logged
+// metadata publishes rows, and guarded files retain savepoint byte undo.
+void batched_append(){
+ std::array<std::byte,8192> batch;batch.fill(std::byte(42));
+ for(int stage=1;stage<=3;stage++){
+  auto d=base/("batch_mid_write"+std::to_string(stage));
+  child([&]{Storage s(d,65536);s.begin();kill_append_write_stage=stage;
+   s.append_bytes("t.v1",0,512,batch.data(),batch.size());},true);
+  Storage s(d,65536);assert(s.read("t.header",0)[0]==std::byte(0));
+  auto bytes=s.read("t.v1",0);assert(bytes[0]==std::byte(0));
+  assert(std::filesystem::file_size(d/"data"/"t.v1")==PAGE);
+  if(stage==2)assert(bytes[512+batch.size()-1]==std::byte(42));
+  if(stage==3)assert(bytes[512]==std::byte(42)&&bytes[512+113]==std::byte(0));
+ }
+ for(bool committed:{false,true}){
+  auto d=base/(committed?"batch_commit":"batch_partial_rollback");
+  child([&]{Storage s(d,65536);s.begin();Page h{};auto mark=s.savepoint();
+   auto wal=s.wal_bytes_written;auto bytes=s.pool.data_page_write_bytes;reset_audit();audit_io=true;
+   s.append_bytes("t.v1",0,512,batch.data(),batch.size());
+   s.append_bytes("t.v1",1,0,batch.data(),batch.size());
+   audit_io=false;assert(extent_write_calls==2);assert(s.pool.data_page_write_bytes-bytes==2*batch.size());
+   assert(s.savepoint()==mark&&s.wal_bytes_written==wal);
+   h[0]=std::byte(32);s.write("t.header",0,h);s.rollback_to(mark);
+   assert(s.read("t.header",0)[0]==std::byte(0));
+   std::array<std::byte,512> reused;reused.fill(std::byte(77));
+   s.append_bytes("t.v1",0,512,reused.data(),reused.size());
+   h[0]=std::byte(1);s.write("t.header",0,h);if(committed)s.commit();kill_now();},true);
+  Storage s(d,65536);assert(s.read("t.header",0)[0]==std::byte(committed?1:0));
+  assert(s.read("t.v1",0)[512]==std::byte(77));
+ }
+ auto d=base/"batch_guarded_savepoint";
+ child([&]{Storage s(d,32<<20);s.begin();Page p{};p[0]=std::byte(9);s.write("t.v1",0,p);
+  auto mark=s.savepoint();s.append_bytes("t.v1",1,0,batch.data(),batch.size());
+  assert(s.savepoint()>mark);s.rollback_to(mark);assert(s.read("t.v1",1)[0]==std::byte(0));
+  s.append_bytes("t.v1",1,0,batch.data(),batch.size());s.commit();kill_now();},true);
+ {Storage s(d,65536);assert(s.read("t.v1",0)[0]==std::byte(9));assert(s.read("t.v1",1)[0]==std::byte(42));}
+}
 void resident_handles(){
  Storage s(base/"resident_handles",65536);auto h=s.pool.handle("v",0);assert(s.pool.resident(h));
  for(unsigned i=1;i<10;i++)s.read("v",i);
@@ -177,8 +217,8 @@ void resident_handles(){
 int main(int argc,char** argv){
  ::unsetenv("MVDB_USE_ODIRECT");
  if(argc==2){std::filesystem::remove_all(base);std::string test=argv[1];
-  if(test=="buffered")buffered_default();else if(test=="metadata")metadata_scan();else if(test=="sync")transaction_sync_boundary();else if(test=="interrupt")interrupted_io();else if(test=="append")invisible_append();else if(test=="resident")resident_handles();else return 2;return 0;}
- std::filesystem::remove_all(base);buffered_default();metadata_scan();transaction_sync_boundary();interrupted_io();invisible_append();resident_handles();
+  if(test=="buffered")buffered_default();else if(test=="metadata")metadata_scan();else if(test=="sync")transaction_sync_boundary();else if(test=="interrupt")interrupted_io();else if(test=="append")invisible_append();else if(test=="resident")resident_handles();else if(test=="batch")batched_append();else return 2;return 0;}
+ std::filesystem::remove_all(base);buffered_default();metadata_scan();transaction_sync_boundary();interrupted_io();invisible_append();batched_append();resident_handles();
  for(int mode=1;mode<=3;mode++){
   ::setenv("MVDB_USE_ODIRECT","1",1);
   auto fallback=base/("direct_fallback"+std::to_string(mode));reject_direct=mode;direct_rejections=0;

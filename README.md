@@ -18,7 +18,7 @@ work/build/mvdb_local --data-dir /tmp/minivectordb
 
 CLI 默认数据根目录 `/data`。未显式指定预算时读取 cgroup v2 的
 `memory.max` 与 `memory.high`，取可解析有限额的较小值，预算为其55%，
-下限4MiB、上限12MiB；均为`max`或不可读时默认12MiB（12582912字节）。
+下限4MiB、上限10MiB；均为`max`或不可读时默认10MiB（10485760字节）。
 这是引擎分配预算，尚需为程序、内核和Page Cache留出余量。支持
 `--data-dir PATH`、`--memory-budget BYTES`、`--help`，以及原有的
 `DATA_DIR [MEMORY_BUDGET]` 位置参数。进程以前台方式读取 stdin、写入 stdout，
@@ -118,6 +118,20 @@ python3 tests/benchmark_cgroup.py --image minivectordb:round8 --phase after --ou
 本地Docker Desktop统计包含同设备启动读，且容器内固定保留一个关闭后采样用的
 shell；前后口径一致，但不能替代正式平台的专用数据设备成绩。历史实测与本轮
 对比见[Round 8报告](docs/round8-performance.md)。
+
+Round 9采用借用SQL游标和逐元组INSERT，最多8个有界页缓冲合并追加，最后发布
+表头水位；语句失败仍恢复Undo，水位之外的孤儿槽位不得参与后续修改。
+向量页全部驻留时按探测桶直读，128D使用移位寻址；存在缺页时保留顺序安全路径。
+已有四累加器AVX2/FMA代码单独放在`src/simd.cpp`，数值与极端值回退保持一致。
+10MiB默认上限来自10/12MiB驻留率实验，4/8MiB回归独立验证。
+三代完整窗口实测及局限见[Round 9报告](docs/round9-performance.md)。
+
+```sh
+cmake --build work/build --target benchmark_cpu -j2
+work/build/benchmark_cpu DATA_COPY QUERY_SQL_LINES ann 10485760
+```
+
+`benchmark_cpu`仅用于进程内归因，须使用可丢弃的数据副本，不能代替端到端成绩。
 
 ## 索引与内建校准
 

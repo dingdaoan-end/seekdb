@@ -9,7 +9,7 @@
 #include <unistd.h>
 using namespace mvdb;
 static std::vector<int64_t> ids(Engine& e,const std::string& q){std::vector<int64_t> out;e.execute(q).each([&](const auto& r){out.push_back(std::get<int64_t>(r[0]));});return out;}
-static std::string query(const std::string& vector,const std::string& filter="") {return "SELECT id,L2_distance(v,'"+vector+"') AS d FROM t "+filter+" ORDER BY d LIMIT 10;";}
+static std::string query(const std::string& vector,const std::string& filter="") {return "SELECT id,L2_distance(v,'"+vector+"') AS d FROM t "+filter+" ORDER BY d,id LIMIT 10;";}
 int main(){
  // Keep both strict boundaries: 25,000 active rows still calibrate regardless
  // of payload, and a larger table skips only above half its configured budget.
@@ -29,6 +29,7 @@ int main(){
   assert(e.mutation_count("t")==0&&e.rows_at_calibration("t")==4200&&e.drift_threshold("t")==840);
   e.execute("SET search_mode=ann;");auto q=query("[17000.0215,17000.0195]");auto automatic=ids(e,q);assert(e.effective_nprobe()==(e.last_route()=="ivf"?recommendation:0));
   e.execute("SET nprobe=64;");auto all=ids(e,q);assert(e.last_route()=="ivf"&&e.effective_nprobe()==64);
+  assert(e.read_cache_slots()==4200);assert(ids(e,q)==all);assert(ids(e,q)==all);
   e.execute("SET search_mode=exact;");assert(ids(e,q)==all);
   e.execute("SET search_mode=ann;");e.execute("BEGIN;");e.execute("UPDATE t SET v='[999999,999999]' WHERE id=17;");e.execute("DELETE FROM t WHERE id=81;");e.execute("INSERT INTO t VALUES (99999,'red','[17000,17000]');");assert(!e.calibration_stale("t"));assert(e.mutation_count("t")==3&&e.active_rows("t")==4200);e.execute("SET nprobe=0;");auto changed=ids(e,q);assert(e.last_route()=="ivf"&&e.effective_nprobe()==recommendation);e.execute("SET search_mode=exact;");assert(ids(e,q)==changed);e.execute("SET search_mode=ann;");e.execute("ROLLBACK;");assert(!e.calibration_stale("t"));assert(ids(e,q)==all);
   assert(e.mutation_count("t")==0);
@@ -73,6 +74,8 @@ int main(){
   e.execute("SET search_mode=ann;");e.execute("SET nprobe=64;");
   const auto boundary=query("[0,0]","WHERE id>=4090"),tail=query("[0,0]","WHERE id>=4190");
   auto before=ids(e,boundary),last=ids(e,tail);assert(before.front()==4090&&before.back()==4099);assert(last.front()==4190&&last.back()==4199);
+  // Warm twice so every vector handle validates before the direct bucket scan.
+  auto hot=query("[0,0]","WHERE category='same'");auto hot_ids=ids(e,hot);assert(e.read_cache_slots()==4200);assert(ids(e,hot)==hot_ids);assert(ids(e,hot)==hot_ids);
   e.execute("BEGIN;");e.execute("DELETE FROM t WHERE id=4091;");e.execute("DELETE FROM t WHERE id=4199;");e.execute("UPDATE t SET v='[1,1]' WHERE id=4092;");
   auto changed=ids(e,boundary),changed_tail=ids(e,tail);e.execute("SET search_mode=exact;");assert(ids(e,boundary)==changed&&ids(e,tail)==changed_tail);e.execute("ROLLBACK;");e.execute("SET search_mode=ann;");assert(ids(e,boundary)==before&&ids(e,tail)==last);
   e.close();

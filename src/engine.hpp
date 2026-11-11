@@ -80,6 +80,7 @@ class Engine {
   void put_bucket(const std::string&,const Header&,SlotId,uint32_t);
   uint32_t calibrate(const std::string&,Header&,const std::vector<Column>&);
   Result execute_inner(const Statement&);
+  Result insert_stream(const std::string&);
 public:
   Engine(std::filesystem::path root,size_t budget=8*1024*1024,std::function<void(size_t)> progress={})
     :storage(std::move(root),budget,std::move(progress)){}

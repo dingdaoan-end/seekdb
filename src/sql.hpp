@@ -1,5 +1,7 @@
 #pragma once
 #include <cstdint>
+#include <functional>
+#include <string_view>
 #include <string>
 #include <variant>
 #include <vector>
@@ -11,6 +13,12 @@ struct Column {std::string name;Type type;uint32_t width=0;bool primary=false;};
 struct Expr {std::string column,alias;bool distance=false;std::string query;};
 struct Condition {std::string column,op;std::string literal;bool quoted=false;};
 struct Literal {std::string text;bool quoted=false;};
+// Borrowed for the duration of a streaming row callback. Doubled SQL quotes
+// are decoded by convert() only on the uncommon escaped-literal path.
+struct LiteralView {
+  std::string_view text;bool quoted,escaped;
+  LiteralView(std::string_view t,bool q,bool e):text(t),quoted(q),escaped(e){}
+};
 struct Statement {
   enum Kind {Create,Insert,Select,Update,Delete,Begin,Commit,Rollback,CreateIndex,Set} kind;
   std::string table,index,setting,value;
@@ -24,8 +32,14 @@ struct Statement {
   uint64_t limit=UINT64_MAX;
 };
 Statement parse(const std::string&);
+bool is_insert(const std::string&);
+// Callbacks may run before a later syntax error. The caller must provide
+// statement rollback and must never retry a materializing parser after mutation.
+void parse_insert_rows(const std::string&,const std::function<void(const Statement&)>&,
+                       const std::function<void(const std::vector<LiteralView>&)>&,size_t max_columns=SIZE_MAX);
 size_t unicode_length(const std::string&);
 Value convert(const Literal&,const Column&);
+Value convert(const LiteralView&,const Column&);
 int compare(const Value&,const Value&);
 std::string json(const Value&);
 std::string quote(const std::string&);

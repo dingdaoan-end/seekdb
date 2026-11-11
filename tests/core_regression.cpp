@@ -5,7 +5,9 @@
 #include <cassert>
 #include <filesystem>
 #include <iostream>
+void sql_stream_regressions();
 int main(){
+  sql_stream_regressions();
   const std::filesystem::path root="/tmp/mvdb_core_phase2";
   std::filesystem::remove_all(root);
   mvdb::Result result;
@@ -88,6 +90,28 @@ int main(){
    }
    std::vector<int64_t> descending;e.execute("SELECT id,L2_DISTANCE(v,'"+zero+"') AS d FROM t ORDER BY d,id DESC LIMIT 10;").each([&](const auto& r){descending.push_back(std::get<int64_t>(r[0]));});
    assert(descending.front()==139&&descending.back()==130&&e.read_cache_slots()==0);
+  }
+  // A failed streamed batch can leave unreachable append-only Meta bytes.
+  // Reopen with too little workspace for batching, then reuse that slot through
+  // write_row: invisible bytes must not be treated as an active old row.
+  {auto path=root/"failed_append_reuse";std::string zero="[";for(int j=0;j<128;++j){if(j)zero+=",";zero+="0";}zero+="]";
+   {mvdb::Engine e(path,1<<20);e.execute("CREATE TABLE t (id BIGINT PRIMARY KEY,category VARCHAR(16),v VECTOR(128));");e.execute("INSERT INTO t VALUES (1,'old','"+zero+"');");e.execute("CREATE VECTOR INDEX vi ON t(v);");
+    std::string sql="INSERT INTO t VALUES ";for(int i=0;i<400;++i){if(i)sql+=",";sql+="("+std::to_string(100+i)+",'failed','"+zero+"')";}bool failed=false;try{e.execute(sql+" trailing;");}catch(const std::exception&){failed=true;}assert(failed&&e.active_rows("t")==1);e.close();}
+   {mvdb::Engine e(path,65536);auto one=zero;one[1]='1';e.execute("INSERT INTO t VALUES (9999,'new','"+one+"');");assert(e.active_rows("t")==2);assert(e.mutation_count("t")==1);size_t rows=0;e.execute("SELECT id,v FROM t WHERE category='new' ORDER BY id LIMIT 1;").each([&](const auto& row){assert(std::get<int64_t>(row[0])==9999);auto& v=std::get<std::vector<float>>(row[1]);assert(v.size()==128&&v[0]==1&&v[1]==0);++rows;});assert(rows==1);e.execute("DELETE FROM t WHERE id=9999;");assert(e.active_rows("t")==1);e.close();}
+  }
+  // More vector pages than frames: warming some handles must never make a
+  // later miss reuse a stale borrowed address captured for an earlier page.
+  {mvdb::Engine e(root/"cache_mixed_resident",1<<20);
+   e.execute("CREATE TABLE t (id BIGINT PRIMARY KEY,category VARCHAR(16),v VECTOR(128));");
+   e.execute("BEGIN;");
+   std::string zero="[";for(int j=0;j<128;++j){if(j)zero+=",";zero+="0";}zero+="]";
+   for(int start=0;start<1100;start+=100){std::string sql="INSERT INTO t VALUES ";for(int i=start;i<start+100;++i){if(i!=start)sql+=",";std::string v="["+std::to_string(i%17);for(int j=1;j<128;++j)v+=",0";v+="]";sql+="("+std::to_string(2000-i)+",'same','"+v+"')";}e.execute(sql+";");}
+   e.execute("COMMIT;");
+   auto ranked=[&](bool generic){std::vector<int64_t> out;e.execute("SELECT id,L2_DISTANCE(v,'"+zero+"') AS d"+(generic?",id AS again":"")+" FROM t WHERE category='same' ORDER BY d,id LIMIT 20;").each([&](const auto& values){out.push_back(std::get<int64_t>(values[0]));});return out;};
+   auto expected=ranked(true);for(int pass=0;pass<3;++pass){assert(ranked(false)==expected);assert(e.read_cache_slots()==1100);}
+   e.execute("BEGIN;");e.execute("INSERT INTO t VALUES (0,'same','"+zero+"');");
+   bool failed=false;try{e.execute("INSERT INTO t VALUES (-1,'same','"+zero+"'),(-2,'same','"+zero+"') trailing;");}catch(const std::exception&){failed=true;}assert(failed);
+   assert(e.active_rows("t")==1101);e.execute("ROLLBACK;");assert(ranked(false)==expected);assert(e.budget_peak()<=(1U<<20));
   }
   std::cout<<"result lifetime regression passed\n";
 }

@@ -59,6 +59,7 @@ public:
   ResidentHandle handle(const std::string&,uint64_t);
   const std::byte* resident(ResidentHandle) const;
   void append_extent(const std::string&,uint64_t,const Page&,size_t,size_t);
+  void append_extent_bytes(const std::string&,uint64_t,size_t,const void*,size_t);
   void flush_page(const std::string&,uint64_t);
   void committed();
   void invalidate_prefix(const std::string&);
@@ -128,6 +129,9 @@ public:
   // Only logically invisible new slots/tails; rollback leaves unreachable garbage.
   // Previously logged or shadowed files automatically use normal WAL/undo.
   void append(const std::string&,uint64_t,const Page&,size_t offset,size_t length);
+  // One contiguous page batch of invisible slots; callers publish their
+  // logical row count through normal WAL only after all payload batches finish.
+  void append_bytes(const std::string&,uint64_t,size_t offset,const void*,size_t length);
   std::string begin_region(const std::string& prefix);
   void write_new(const std::string&,uint64_t,const Page&);
   void seal_region(const std::string&);

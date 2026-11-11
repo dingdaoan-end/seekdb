@@ -114,7 +114,7 @@ int main(int argc,char** argv){
     const char* env_directory=std::getenv("VECTORDB_DATA_DIR");
     std::string directory=env_directory&&*env_directory?env_directory:"/data";auto detected=mvdb::default_cli_budget();uint64_t budget=detected.bytes;std::string budget_source=detected.source;bool positional=false;
     for(int i=1;i<argc;++i){std::string arg=argv[i];
-      if(arg=="--help"||arg=="-h"){std::cout<<"usage: minivectordb [--data-dir PATH] [--memory-budget BYTES]\n       minivectordb DATA_DIR [MEMORY_BUDGET]\nDefaults: VECTORDB_DATA_DIR or /data; cgroup min(memory.max,memory.high) * 55%, clamped to 4..12 MiB; unlimited/unreadable: 12582912 bytes. JSONL protocol with legacy SQL-line compatibility.\n";return 0;}
+      if(arg=="--help"||arg=="-h"){std::cout<<"usage: minivectordb [--data-dir PATH] [--memory-budget BYTES]\n       minivectordb DATA_DIR [MEMORY_BUDGET]\nDefaults: VECTORDB_DATA_DIR or /data; cgroup min(memory.max,memory.high) * 55%, clamped to 4..10 MiB; unlimited/unreadable: 10485760 bytes. JSONL protocol with legacy SQL-line compatibility.\n";return 0;}
       if(arg=="--data-dir"||arg=="--memory-budget"){if(positional||i+1==argc)throw std::runtime_error("invalid or mixed command-line arguments");auto value=std::string(argv[++i]);if(arg=="--data-dir"){if(value.empty())throw std::runtime_error("empty data directory");directory=value;}else {budget=positive_bytes(value);budget_source="explicit";}}
       else if(i==1&&!arg.starts_with("-")){positional=true;directory=arg;if(i+1<argc){budget=positive_bytes(argv[++i]);budget_source="explicit";}if(i+1<argc)throw std::runtime_error("too many positional arguments");}
       else throw std::runtime_error("unknown command-line argument: "+arg);

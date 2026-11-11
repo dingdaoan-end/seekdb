@@ -24,6 +24,19 @@ measurements, which must not be substituted for container memory.peak.
 
 The sections below retain the Phase 3 historical reproduction procedure.
 
+Round 9 repeats all three versions (fe90005, 9c8798a, current) through the same
+Linux Docker client and daemon socket. Earlier Windows docker.exe interoperability
+runs are retained as diagnostics because cross-OS pipe scheduling obscured query
+changes; these samples are not mixed into the Linux-client medians. The measured
+database containers still have the same read-only root, dropped capabilities,
+memory limit and fresh volumes. Only the external driver's transport changes.
+The native benchmark retains its legacy SQL-line/JSON response interface for all
+three versions; official binary/container conformance tests use official JSONL.
+`benchmark_cpu` separately measures parsing and in-process queries over five
+warm passes with checksums and page-load counters; it excludes transport and
+serialization and must never be substituted for T. Full data and negative
+experiments are in [the Round 9 report](round9-performance.md).
+
 ## Reproduction
 
 Phase 3 compares the preserved phase-2 binary and the current binary with the

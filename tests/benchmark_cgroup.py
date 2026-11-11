@@ -5,6 +5,7 @@ the DB shutdown so counters include checkpoint writeback before collection.
 """
 import argparse
 import json
+import os
 from pathlib import Path
 import subprocess
 import threading
@@ -22,7 +23,8 @@ def run(args):
            '--pid=host','--cgroupns=host','--mount','type=bind,src=/sys/fs/cgroup,dst=/cg,readonly',
            '--mount','type=bind,src=/proc,dst=/hp,readonly','ubuntu:24.04','sleep','infinity')
     report={'phase':args.phase,'image':args.image,'image_id':docker('image','inspect',args.image,'--format','{{.Id}}').stdout.strip(),
-            'rounds':args.rounds,'notes':{'B':'full target io.stat counters from cgroup creation through DB close, including startup; initial snapshot diagnostic only',
+            'rounds':args.rounds,'driver':{'docker_binary':args.docker,'docker_host':os.environ.get('DOCKER_HOST','default')},
+            'notes':{'B':'full target io.stat counters from cgroup creation through DB close, including startup; initial snapshot diagnostic only',
              'M':'target memory.peak; collector outside target cgroup; no exec into target for stats',
              'T_write':'wall time of 100 pre-encoded INSERT requests plus clean shutdown/checkpoint round trip',
              'T_query':'1000 JSON execute round trips; excludes load,index,20 fixed warmup requests,shutdown',
