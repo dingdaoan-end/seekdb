@@ -11,6 +11,12 @@ using namespace mvdb;
 static std::vector<int64_t> ids(Engine& e,const std::string& q){std::vector<int64_t> out;e.execute(q).each([&](const auto& r){out.push_back(std::get<int64_t>(r[0]));});return out;}
 static std::string query(const std::string& vector,const std::string& filter="") {return "SELECT id,L2_distance(v,'"+vector+"') AS d FROM t "+filter+" ORDER BY d LIMIT 10;";}
 int main(){
+ // Keep both strict boundaries: 25,000 active rows still calibrate regardless
+ // of payload, and a larger table skips only above half its configured budget.
+ assert(!detail::skip_ivf_calibration_for_payload(25000,12800000,1048576));
+ assert(detail::skip_ivf_calibration_for_payload(25001,12800512,1048576));
+ assert(!detail::skip_ivf_calibration_for_payload(25001,524288,1048576));
+ assert(detail::skip_ivf_calibration_for_payload(25001,524289,1048576));
  const std::filesystem::path root="/tmp/mvdb_index_phase3_"+std::to_string(::getpid());std::filesystem::remove_all(root);
  uint32_t recommendation=0;
  {
@@ -71,19 +77,35 @@ int main(){
   auto changed=ids(e,boundary),changed_tail=ids(e,tail);e.execute("SET search_mode=exact;");assert(ids(e,boundary)==changed&&ids(e,tail)==changed_tail);e.execute("ROLLBACK;");e.execute("SET search_mode=ann;");assert(ids(e,boundary)==before&&ids(e,tail)==last);
   e.close();
  }
- // Payloads beyond half the configured budget use a persisted empirical probe
- // count. Automatic searches remain exact until a measured calibration exists.
+ // Bounded tables still measure recall when their payload exceeds half the
+ // budget. Calibration retains only samples and Top10s, not the full payload.
  {
-  auto path=root/"budget_skip";std::string zero="[";for(int j=0;j<32;++j){if(j)zero+=",";zero+="0";}zero+="]";
+  auto path=root/"wide_calibration";std::string zero="[";for(int j=0;j<128;++j){if(j)zero+=",";zero+="0";}zero+="]";
   {
-   Engine e(path,1<<20);e.execute("CREATE TABLE t (id BIGINT PRIMARY KEY,category VARCHAR(16),v VECTOR(32));");e.execute("BEGIN;");
+   Engine e(path,1<<20);e.execute("CREATE TABLE t (id BIGINT PRIMARY KEY,category VARCHAR(16),v VECTOR(128));");e.execute("BEGIN;");
    for(int start=0;start<4200;start+=100){std::string sql="INSERT INTO t VALUES ";for(int i=start;i<std::min(start+100,4200);++i){if(i!=start)sql+=",";sql+="("+std::to_string(i)+",'same','"+zero+"')";}e.execute(sql+";");}e.execute("COMMIT;");
-   auto spills=e.spill_bytes();e.execute("CREATE VECTOR INDEX vi ON t(v);");assert(e.recommended_nprobe("t")==16&&e.calibration_skipped("t")&&e.calibration_query_count("t")==0);
-   e.execute("SET search_mode=ann;");auto result=ids(e,query(zero));assert(e.last_route()=="exact_fallback"&&e.effective_nprobe()==0&&result.size()==10);
+   auto spills=e.spill_bytes();e.execute("CREATE VECTOR INDEX vi ON t(v);");assert(e.recommended_nprobe("t")==1&&!e.calibration_skipped("t")&&e.calibration_query_count("t")==16);
+   e.execute("SET search_mode=ann;");auto result=ids(e,query(zero));assert(e.last_route()=="ivf"&&e.effective_nprobe()==1&&result.size()==10);
+   e.execute("SET search_mode=exact;");assert(ids(e,query(zero))==result);e.execute("SET search_mode=ann;");
    e.execute("SET nprobe=64;");assert(ids(e,query(zero))==result&&e.last_route()=="ivf");assert(e.spill_bytes()==spills);assert(e.budget_peak()<=(1U<<20));e.close();
   }
-  Engine e(path,1<<20);assert(e.calibration_skipped("t")&&e.calibration_query_count("t")==0&&e.recommended_nprobe("t")==16);
-  e.execute("SET search_mode=ann;");ids(e,query(zero));assert(e.last_route()=="exact_fallback");
+  Engine e(path,1<<20);assert(!e.calibration_skipped("t")&&e.calibration_query_count("t")==16&&e.recommended_nprobe("t")==1);
+  e.execute("SET search_mode=ann;");ids(e,query(zero));assert(e.last_route()=="ivf"&&e.effective_nprobe()==1);
+ }
+ // Even a small table must skip calibration when its fixed sample/Top10
+ // workspace cannot fit. Index construction still succeeds and persists this
+ // distinction; automatic search remains exact and an explicit probe works.
+ {
+  auto path=root/"workspace_skip";
+  {
+   Engine e(path,65536);e.execute("CREATE TABLE t (id BIGINT PRIMARY KEY,category VARCHAR(16),v VECTOR(2));");
+   e.execute("BEGIN;");for(int i=0;i<10;++i)e.execute("INSERT INTO t VALUES ("+std::to_string(i)+",'same','[0,0]');");e.execute("COMMIT;");
+   e.execute("CREATE VECTOR INDEX vi ON t(v);");assert(e.calibration_skipped("t")&&e.calibration_query_count("t")==0&&e.recommended_nprobe("t")==4);
+   e.execute("SET search_mode=ann;");auto result=ids(e,query("[0,0]"));assert(e.last_route()=="exact_fallback"&&e.effective_nprobe()==0&&result.size()==10);
+   e.execute("SET nprobe=8;");assert(ids(e,query("[0,0]"))==result&&e.last_route()=="ivf");assert(e.budget_peak()<=65536);e.close();
+  }
+  Engine e(path,65536);assert(e.calibration_skipped("t")&&e.calibration_query_count("t")==0&&e.recommended_nprobe("t")==4);
+  e.execute("SET search_mode=ann;");ids(e,query("[0,0]"));assert(e.last_route()=="exact_fallback");
  }
  // Workspace exhaustion happens after namespace allocation. A failed build
  // must remove that namespace and retain earlier writes in the transaction.

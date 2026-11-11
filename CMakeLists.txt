@@ -39,5 +39,5 @@ execute_process(COMMAND ${Python3_EXECUTABLE} -c "import numpy" RESULT_VARIABLE 
 if(MVDB_NUMPY_STATUS EQUAL 0)
   add_test(NAME dynamic_dml COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/dynamic_dml.py --binary $<TARGET_FILE:mvdb_local> --output ${CMAKE_BINARY_DIR}/dynamic-dml.json)
   add_test(NAME low_memory_regression COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/low_memory.py
-           --binary $<TARGET_FILE:mvdb_local> --phase ctest --output ${CMAKE_BINARY_DIR}/low-memory.json --enforce-latency)
+           --binary $<TARGET_FILE:mvdb_local> --phase ctest --output ${CMAKE_BINARY_DIR}/low-memory.json --enforce-latency --require-ivf)
 endif()

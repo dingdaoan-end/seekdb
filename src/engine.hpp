@@ -4,6 +4,13 @@
 #include <cstdio>
 #include <memory>
 namespace mvdb {
+namespace detail {
+// A bounded table can afford one exact pass for all calibration samples even
+// when its vector payload does not fit. Larger tables retain the I/O guard.
+constexpr bool skip_ivf_calibration_for_payload(uint64_t active_rows,uint64_t payload_bytes,size_t budget_bytes){
+  return active_rows>25000&&payload_bytes>budget_bytes/2;
+}
+}
 struct Result {
   int64_t affected_rows=0;
   std::vector<std::string> columns;

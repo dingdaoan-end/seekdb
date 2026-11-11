@@ -57,7 +57,7 @@ class Client:
         for f in (self.p.stdin,self.p.stdout,self.p.stderr): f.close()
 
 
-def run(binary, budget, phase, count):
+def run(binary, budget, phase, count, require_ivf=False):
     root=Path('/tmp/mvdb_low_memory')/phase/str(budget)
     assert root.resolve().parent.parent == Path('/tmp/mvdb_low_memory')
     shutil.rmtree(root,ignore_errors=True);root.mkdir(parents=True)
@@ -69,13 +69,18 @@ def run(binary, budget, phase, count):
         rows=[f"({i+1},'cat-{int(categories[i]):02d}','content-{i+1:06d}','{vector_literal(vectors[i])}')" for i in range(first,first+100)]
         client.sql('INSERT INTO t VALUES '+','.join(rows)+';',label='insert_batch')
     client.sql('CREATE VECTOR INDEX vi ON t(embedding);',label='create_index')
-    recalls={}
+    recalls={};ann_routes={};ann_probes=set()
     sqls=statements(queries,qcats)
     for mode in ('exact','ann'):
         hits=[[],[]]
         for i,(sql,expected) in enumerate(zip(sqls,truth)):
             actual=[row[0] for row in client.sql(sql,mode,label='query')['rows']]
             if mode=='exact':assert actual==expected,(actual,expected)
+            else:
+                metrics=records[-1]['metrics'];route=metrics['ann_route']
+                ann_routes[route]=ann_routes.get(route,0)+1;ann_probes.add(metrics['effective_nprobe'])
+                if require_ivf:
+                    assert route=='ivf' and metrics['effective_nprobe']==5 and metrics['recommended_nprobe']==5,metrics
             hits[i>=count//2].append(len(set(actual)&set(expected))/len(expected))
         recalls[mode]=[float(np.mean(x)) for x in hits]
         print(f'{phase} budget={budget} {mode} {count} queries recall={recalls[mode]}',flush=True)
@@ -99,6 +104,8 @@ def run(binary, budget, phase, count):
                    'max_seconds':max(r['seconds'] for r in group)}
              for kind in sorted({r['kind'] for r in records}) if (group:=[r for r in records if r['kind']==kind])}
     return {'budget':budget,'records':records,'summary':summary,'recalls':recalls,
+            'ann_route_counts':ann_routes,'ann_effective_nprobes':sorted(ann_probes),
+            'index_below_03s':summary['create_index']['seconds']<.3,
             'single_sql_below_05s':all(r['seconds']<.5 for r in request_records),
             'max_request_seconds':max(r['seconds'] for r in request_records),
             'recall_at_least_095':all(x>=.95 for x in recalls['ann'])}
@@ -109,14 +116,15 @@ if __name__=='__main__':
     p.add_argument('--phase',required=True);p.add_argument('--output',type=Path,required=True)
     p.add_argument('--budgets',type=int,nargs='+',default=[4194304,8388608]);p.add_argument('--queries',type=int,default=1000)
     p.add_argument('--enforce-latency',action='store_true')
+    p.add_argument('--require-ivf',action='store_true',help='clustered 10k must auto-route IVF at measured probe 5')
     a=p.parse_args();assert a.queries>0 and a.queries%2==0
     report={'phase':a.phase,'binary_sha256':hashlib.sha256(a.binary.read_bytes()).hexdigest(),'datasets':[]}
     try:
         for budget in a.budgets:
-            result=run(a.binary.resolve(),budget,a.phase,a.queries);report['datasets'].append(result)
+            result=run(a.binary.resolve(),budget,a.phase,a.queries,a.require_ivf);report['datasets'].append(result)
             a.output.parent.mkdir(parents=True,exist_ok=True);a.output.write_text(json.dumps(report,indent=2))
             print(f'{a.phase} budget={budget} maxSQL={result["max_request_seconds"]:.6f}s below0.5={result["single_sql_below_05s"]}',flush=True)
     finally:
         a.output.parent.mkdir(parents=True,exist_ok=True);a.output.write_text(json.dumps(report,indent=2))
     if a.enforce_latency:
-        assert all(d['single_sql_below_05s'] and d['recall_at_least_095'] for d in report['datasets']), 'latency or recall threshold failed; see report'
+        assert all(d['single_sql_below_05s'] and d['index_below_03s'] and d['recall_at_least_095'] for d in report['datasets']), 'latency or recall threshold failed; see report'

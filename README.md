@@ -100,7 +100,9 @@ CREATE VECTOR INDEX 在新分配的索引区内构建，N>=4096使用64桶，小
 16条样本（无过滤/高频等值过滤各8条），在一次向量扫描中维护各样本Top-10，
 再比较各nprobe召回，选择两组均达到平均Recall@10>=0.985的最小值，
 将 recommended_nprobe 写入索引元数据。查询不依赖外部Python校准。
-若有效向量payload超过引擎预算一半或校准工作区不足，跳过抽样校准，持久化
+当有效行数不超过25000时，只要校准工作区可分配就执行这次单遍校准，
+不再因payload超过预算一半而跳过。仅在行数超过25000且payload也超出
+预算一半，或校准工作区不可分配时，跳过抽样校准并持久化
 经验推荐max(4,nlist/4)（不超过nlist）和calibration_skipped。该推荐没有召回证明，
 自动ANN保守使用Exact；手动NPROBE仍可选择IVF。
 
@@ -162,11 +164,12 @@ python3 tests/benchmark_local.py --phase after --automatic-ann --default-budget 
 ## 小预算防超时复验
 
 ```sh
-python3 tests/low_memory.py --binary work/build/mvdb_local --phase after --output work/low-memory.json --enforce-latency
+python3 tests/low_memory.py --binary work/build/mvdb_local --phase after --output work/low-memory.json --enforce-latency --require-ivf
 ```
 
 固定种子10k×128D，在4MiB/8MiB引擎预算下各执行100批写入、建索引、
 Exact/ANN各1000查询、全表事务修改/回滚、强杀恢复并校验已提交数据。
-每条SQL响应必须低于0.5秒，输出保存全部请求计时；该指标是本机实测，
+每条SQL响应必须低于0.5秒、建索引低于0.3秒，聚类10k自动ANN要求
+使用校准所得IVF/nprobe=5，输出保存全部请求计时；该指标是本机实测，
 不能当成任意硬件或任意SQL规模的时限保证。
 NumPy可用时CTest包含此完整回归及16MiB预算下的增量IVF维护验证。

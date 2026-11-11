@@ -152,7 +152,7 @@ void Engine::create_index(const Statement& s,const std::vector<Column>& cols){
     for(uint32_t candidate=0;candidate<h.nlist;++candidate){auto distance=l2_fast(p,centers[candidate].data(),dim,m.reserved==0&&safe[candidate]);if(distance<nearest){nearest=distance;b=candidate;}}
     put_bucket(s.table,h,slot,b);posting(region,b,slot,true);}
   }
-  h.calibration_skipped=uint64_t(count)*dim*sizeof(float)>storage.budget.limit/2;
+  h.calibration_skipped=detail::skip_ivf_calibration_for_payload(count,uint64_t(count)*dim*sizeof(float),storage.budget.limit);
   h.calibration_queries=h.calibration_skipped?0:16;
   h.recommended_nprobe=h.calibration_skipped?std::min(h.nlist,std::max<uint32_t>(4,h.nlist/4)):calibrate(s.table,h,cols);h.calibration_stale=0;
   h.mutations_since_calibration=0;h.rows_at_calibration=count;
