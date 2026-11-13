@@ -14,10 +14,6 @@ COPY mysqltest/ ./mysqltest/
 RUN cmake -S . -B /build -DCMAKE_BUILD_TYPE=Release \
     && cmake --build /build --target mvdb_local -j2
 
-FROM build AS test
-RUN cmake --build /build -j2 \
-    && ctest --test-dir /build --output-on-failure
-
 FROM ubuntu:24.04 AS runtime
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \

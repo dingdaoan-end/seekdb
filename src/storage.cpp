@@ -61,7 +61,12 @@ uint32_t checksum(const std::string& s) {
 std::string delta(const std::string& file,uint64_t page,const Page& old,const Page& next) {
   require(!file.empty()&&file.size()<128&&file.find('/')==std::string::npos&&file.find("..") == std::string::npos,"unsafe page file");
   std::string out;append_value(out,static_cast<uint8_t>(file.size()));out+=file;append_value(out,page);
-  size_t i=0;while(i<PAGE){while(i<PAGE&&old[i]==next[i])++i;if(i==PAGE)break;
+  size_t i=0;while(i<PAGE){
+    // Skip equal words without alignment/aliasing assumptions. The byte scan
+    // still finds the identical first difference and preserves every WAL run.
+    while(i+sizeof(uint64_t)<=PAGE){uint64_t a,b;std::memcpy(&a,old.data()+i,sizeof(a));std::memcpy(&b,next.data()+i,sizeof(b));if(a!=b)break;i+=sizeof(a);}
+    while(i<PAGE&&old[i]==next[i])++i;
+    if(i==PAGE)break;
     size_t start=i++,end=i;while(i<PAGE){if(old[i]!=next[i])end=i+1;if(i>=end+8)break;++i;}
     append_value(out,static_cast<uint16_t>(start));append_value(out,static_cast<uint16_t>(end-start));
     out.append(reinterpret_cast<const char*>(next.data()+start),end-start);i=end;

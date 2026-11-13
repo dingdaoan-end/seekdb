@@ -61,6 +61,9 @@ def run(binary, budget, phase, count, require_ivf=False):
     root=Path('/tmp/mvdb_low_memory')/phase/str(budget)
     assert root.resolve().parent.parent == Path('/tmp/mvdb_low_memory')
     shutil.rmtree(root,ignore_errors=True);root.mkdir(parents=True)
+    # Establish the same clean filesystem boundary before each timed dataset.
+    # Cleanup/sync is outside SQL request timing; durability remains in-engine.
+    os.sync()
     vectors,categories,queries,qcats,*_=make_data('clustered',10000,count,20261109,2)
     truth=oracle(vectors,categories,queries,qcats)
     records=[];client=Client(binary,root,budget,records)
@@ -117,11 +120,12 @@ if __name__=='__main__':
     p.add_argument('--phase',required=True);p.add_argument('--output',type=Path,required=True)
     p.add_argument('--budgets',type=int,nargs='+',default=[4194304,8388608,9227468,10485760]);p.add_argument('--queries',type=int,default=1000)
     p.add_argument('--enforce-latency',action='store_true')
+    p.add_argument('--no-default-budget',action='store_true',help='Skip the additional CLI-default run (CTest selects three explicit budgets)')
     p.add_argument('--require-ivf',action='store_true',help='clustered 10k must auto-route IVF at measured probe 5')
     a=p.parse_args();assert a.queries>0 and a.queries%2==0
     report={'phase':a.phase,'binary_sha256':hashlib.sha256(a.binary.read_bytes()).hexdigest(),'datasets':[]}
     try:
-        for budget in [*a.budgets,None]:
+        for budget in [*a.budgets,*([] if a.no_default_budget else [None])]:
             result=run(a.binary.resolve(),budget,a.phase,a.queries,a.require_ivf);report['datasets'].append(result)
             a.output.parent.mkdir(parents=True,exist_ok=True);a.output.write_text(json.dumps(report,indent=2))
             print(f'{a.phase} budget={budget} maxSQL={result["max_request_seconds"]:.6f}s below0.5={result["single_sql_below_05s"]}',flush=True)

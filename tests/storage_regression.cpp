@@ -229,6 +229,13 @@ void resident_handles(){
 }
 int main(int argc,char** argv){
  multifile_cache_retention();
+ // Delta boundaries cross aligned and unaligned words and the page tail.
+ {auto d=base/"delta_boundaries";std::filesystem::remove_all(d);
+  child([&]{Storage s(d,65536);s.begin();Page p{};
+   for(int page=0;page<32;++page){for(size_t at:{size_t(0),size_t(7),size_t(8),size_t(15),size_t(16),PAGE-1})p[(at+page)%PAGE]=std::byte(page+1);s.write("edges",page,p);}
+   s.commit();s.begin();Page p2{};for(int page=0;page<32;++page)s.write("edges",page,p2);s.rollback();kill_now();},true);
+  Storage s(d,65536);Page expected{};for(int page=0;page<32;++page){for(size_t at:{size_t(0),size_t(7),size_t(8),size_t(15),size_t(16),PAGE-1})expected[(at+page)%PAGE]=std::byte(page+1);assert(s.read("edges",page)==expected);}
+ }
  ::unsetenv("MVDB_USE_ODIRECT");
  if(argc==2){std::filesystem::remove_all(base);std::string test=argv[1];
   if(test=="buffered")buffered_default();else if(test=="metadata")metadata_scan();else if(test=="sync")transaction_sync_boundary();else if(test=="interrupt")interrupted_io();else if(test=="append")invisible_append();else if(test=="resident")resident_handles();else if(test=="batch")batched_append();else return 2;return 0;}

@@ -1,5 +1,79 @@
 # R10-Safe验证与线上回执复盘
 
+## 当前：镜像构建防护与差量扫描优化
+
+本节为642d6b6之后的防御性修复；下方第一版Safe记录（包括容器8/9）保留为历史，不代表本次最终结果。
+
+### 归因核对
+
+0.403s来自本机4MiB，不能直接与容器10MiB的0.502589s比较。旧容器相同流程的4/8/8.8/10/default最大SQL分别为0.497560/0.509002/0.501212/0.502589/0.496518s，未显示单调的预算退化；R9存储没有>8MiB的不同刷页分支，未证明脏页积压是根因。
+gprof采样中delta占CPU样本79.88%，诊断包含UPDATE/ROLLBACK及数据副本操作，其wall时间不能当作正式端到端T。对大量相同页字节逐一比较是可验证的CPU热点。
+仅将相等区查找改为memcpy读取uint64_t比较，再逐字节定位首差异。区间合并、记录格式、CRC、Undo顺序和页读写/提交恢复流程不变；1200组稀疏/密集/边界输入与R9编码器逐字节相同，正反向应用全部还原。
+### 构建路径
+
+同一Dockerfile中，仅移动test阶段无法阻止legacy builder按顺序执行它。默认Dockerfile彻底去除test阶段；独立Dockerfile.test基于显式构建的build镜像执行CTest。默认旧构建器实际构建成功，日志没有ctest调用。
+```sh
+DOCKER_BUILDKIT=0 docker build -t minivectordb:legacy-buildsafe .
+docker build --target build -t minivectordb-build:test .
+docker build -f Dockerfile.test --target test -t minivectordb-tests:final .
+```
+测试镜像base通过BUILD_IMAGE可覆盖；普通平台构建无需上述测试步骤。不能声称默认Dockerfile的--target test仍可用，显式测试需-f Dockerfile.test。
+### 实测验证
+
+本机CTest9/9（19.57s）；显式容器CTest连续两次9/9（19.20s、21.05s，第二次--no-cache）。0.5s/建索引0.3s门槛均保持；官方二进制和只读容器各20/20、95条SQL。
+
+|容器预算MiB|最大SQL s|全表UPDATE s|全表ROLLBACK s|
+|---|---:|---:|---:|
+|4|0.250615|0.189105|0.119034|
+|8|0.248182|0.183757|0.117905|
+|10|0.260280|0.196950|0.120598|
+
+CTest代表预算为4/8/10MiB，运行前删除独立临时目录并在计时外sync。完整五预算（含8.8MiB及CLI默认）另外运行全部1000 Exact/ANN查询、回滚和强杀恢复，全部保留原门槛通过；不是仅靠减少预算组数通过测试。
+```text
+Test project /mnt/d/clone/seekdb-2026/work/build
+    Start 1: budget_regression
+1/9 Test #1: budget_regression ................   Passed    0.01 sec
+    Start 2: storage_regression
+2/9 Test #2: storage_regression ...............   Passed    0.91 sec
+    Start 3: core_regression
+3/9 Test #3: core_regression ..................   Passed    0.28 sec
+    Start 4: simd_regression
+4/9 Test #4: simd_regression ..................   Passed    0.01 sec
+    Start 5: index_regression
+5/9 Test #5: index_regression .................   Passed    1.01 sec
+    Start 6: protocol_regression
+6/9 Test #6: protocol_regression ..............   Passed    0.89 sec
+    Start 7: all
+7/9 Test #7: all ..............................   Passed    1.98 sec
+    Start 8: dynamic_dml
+8/9 Test #8: dynamic_dml ......................   Passed    3.51 sec
+    Start 9: low_memory_regression
+9/9 Test #9: low_memory_regression ............   Passed   10.87 sec
+
+100% tests passed, 0 tests failed out of 9
+
+Total Test time (real) =  19.57 sec
+```
+
+证据文件新校验：
+```json
+{
+  "bytes": 122675,
+  "sha256": "0919daa34b67a1ab7296640a375d89d3fa545b23efa69b523b3350332faa19cf",
+  "unique_valid_pointers": 62,
+  "old28_units_and56_pointer_values_context_unchanged": true,
+  "old9_prompts_followups_summaries_unchanged": true,
+  "strict_utf8": true,
+  "duplicate_keys": 0,
+  "nonfinite": 0
+}
+```
+
+---
+
+## 第一版Safe历史记录
+
+
 2026-11-13。用户报告6f91b44线上准入失败；具体失败case/异常日志未提供，以下三项是风险归因，不能认定为已复现的唯一根因。
 
 ## 回退范围

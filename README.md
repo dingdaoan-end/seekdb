@@ -59,11 +59,13 @@ docker run --rm -i --network none --mount type=volume,src=minivectordb-data,dst=
 
 ```sh
 docker run --rm -i --network none --mount type=volume,src=minivectordb-data,dst=/data minivectordb:final --data-dir /data/custom --memory-budget 33554432
-docker build --target test -t minivectordb-tests:final .
+docker build --target build -t minivectordb-build:test .
+docker build -f Dockerfile.test --target test -t minivectordb-tests:final .
 python3 tests/docker_smoke.py --image minivectordb:final
 ```
 
-`test`镜像目标在Ubuntu24.04/GCC13中运行完整CTest。Docker烟测另外检查无网络端口、
+测试目标位于独立`Dockerfile.test`，默认Dockerfile不包含测试阶段，旧构建器也不会执行CTest。
+显式`test`镜像目标在Ubuntu24.04/GCC13中运行完整CTest。Docker烟测另外检查无网络端口、
 默认目录、命名卷重启、SIGKILL撤销未提交事务，以及自定义数据目录。
 
 ## 记录布局
@@ -139,8 +141,9 @@ IVF模式仅在子集大小不超过`max(64, nprobe*active_rows/(nlist*4))`时�
 使用单查询对四向量的AVX2/FMA批处理，潜在赢家仍用float64复算。过滤ANN
 因此可返回精确Top-10，但并非所有分布都保证更低核心耗时。
 
-R10-Safe将存储、追加页缓存、索引格式及事务/WAL/恢复完全恢复至R9，
-仅保留上述内存计算优化。不再使用`.pidx.r*`打包、冷页绕过页池直写或读后逐页回收。
+R10-Safe将追加页缓存、索引格式及事务/WAL/恢复流程恢复至R9，
+保留上述内存计算优化；后续仅优化差量编码的相等字节查找，日志字节格式不变。
+不再使用`.pidx.r*`打包、冷页绕过页池直写或读后逐页回收。
 R10实验数据目录不能交给本版本直接续用；应使用R9数据备份或重新装载。
 此前[Round 10报告](docs/round10-final-performance.md)及[路由调优报告](docs/round10-routing-tuning.md)
 记录历史实验，不代表Safe版性能；回退核验和新回归见[Safe验证报告](docs/round10-safe.md)。
@@ -220,7 +223,8 @@ python3 tests/benchmark_local.py --phase after --automatic-ann --default-budget 
 python3 tests/low_memory.py --binary work/build/mvdb_local --phase after --output work/low-memory.json --enforce-latency --require-ivf
 ```
 
-固定种子10k×128D，在4MiB/8MiB引擎预算下各执行100批写入、建索引、
+固定种子10k×128D，完整脚本在4/8/8.8/10MiB及CLI默认预算下各执行100批写入、建索引；
+CTest选取4/8/10MiB三个代表预算，逐组清理独立临时目录并在计时外同步。每组继续执行
 Exact/ANN各1000查询、全表事务修改/回滚、强杀恢复并校验已提交数据。
 每条SQL响应必须低于0.5秒、建索引低于0.3秒，聚类10k自动ANN要求
 使用校准所得IVF/nprobe=5，输出保存全部请求计时；该指标是本机实测，

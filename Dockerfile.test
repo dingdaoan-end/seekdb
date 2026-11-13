@@ -1,0 +1,6 @@
+# Prepare with: docker build --target build -t minivectordb-build:test .
+# Run with: docker build -f Dockerfile.test --target test .
+ARG BUILD_IMAGE=minivectordb-build:test
+FROM ${BUILD_IMAGE} AS test
+RUN cmake --build /build -j2 \
+    && ctest --test-dir /build --output-on-failure
