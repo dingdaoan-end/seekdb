@@ -133,6 +133,19 @@ work/build/benchmark_cpu DATA_COPY QUERY_SQL_LINES ann 10485760
 
 `benchmark_cpu`仅用于进程内归因，须使用可丢弃的数据副本，不能代替端到端成绩。
 
+Round 10为低基数字典增加有序SlotId倒排表，小类别过滤可精确扫描子集；驻留页
+使用单查询对四向量的AVX2/FMA批处理，潜在赢家仍用float64复算。过滤ANN
+因此可返回精确Top-10，但并非所有分布都保证更低核心耗时。
+
+纯追加页未驻留时直接写入，避免为冷payload填充BufferPool。建索引前同步后，
+已读干净页仅在预算大于8MiB且单文件不超过页池容量时逐段提示回收内核缓存；
+小预算、超大单文件或无法读取文件大小时继续保留内核缓存复用。
+新索引以`.pidx.r*`命名，SlotId列表按2KiB逻辑块共用物理页，减少64文件的页填充。
+未发布索引区直接写出并在发布表头前同步，WAL仅发布元数据；普通后续修改仍有Undo/WAL。
+R10保留读取R9旧索引的路径；不保证旧二进制读取新索引，回退版本应使用原数据备份。
+失败或强杀构建留下的未引用索引区暂不回收，以保留恢复期间的安全性。
+四代实测、完整检查与局限见[Round 10报告](docs/round10-final-performance.md)。
+
 ## 索引与内建校准
 
 CREATE VECTOR INDEX 在新分配的索引区内构建，N>=4096使用64桶，小表最多8桶。
@@ -198,7 +211,8 @@ python3 tests/benchmark_local.py --phase after --automatic-ann --default-budget 
 默认基准不会传入内存预算或NPROBE；旧版省略预算时为8MiB，新版由cgroup决定。
 对比报告区分预算变化和提交路径变化，不能将全部性能差异归因于单一修改。
 安装NumPy的Python被CMake选中时，CTest包含dynamic_dml：10k建索引后各50次
-插入/更新/删除，校验150次可见性及1200次ANN的IVF/5路径和独立真值召回。
+插入/更新/删除，校验150次可见性及1200次ANN的独立真值召回；无过滤保持IVF/5，
+小类别等值过滤走精确倒排子集，另核对结果顺序与可见性。
 最终交互证据在`agent/conversation.json`和根目录`conversation.json`，两份字节一致。
 
 ## 小预算防超时复验

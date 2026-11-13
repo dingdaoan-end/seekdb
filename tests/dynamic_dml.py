@@ -82,8 +82,10 @@ def run(args, report):
             client.sql('SET SEARCH_MODE = ann;')
             ann = execute_queries(client, sql, truth, label + ' ann')
             for row in ann['records']:
-                assert row['metrics']['ann_route'] == 'ivf', row
-                assert row['metrics']['effective_nprobe'] == recommendation, row
+                filtered=row['group']=='filtered'
+                assert row['metrics']['ann_route'] == ('ann_filter_exact' if filtered else 'ivf'), row
+                assert row['metrics']['effective_nprobe'] == (0 if filtered else recommendation), row
+                if filtered:assert row['ordered_ids_match'],row
                 assert row['metrics']['recommended_nprobe'] == recommendation, row
             assert all(ann['summary'][group]['recall_at_10'] >= .98
                        for group in ('unfiltered', 'filtered')), ann['summary']

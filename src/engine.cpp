@@ -1,3 +1,4 @@
+#include "simd.hpp"
 #include "engine.hpp"
 #include <algorithm>
 #include <cmath>
@@ -63,18 +64,23 @@ std::vector<Column> Engine::schema(const Header& h){require(h.schema_size<sizeof
 Engine::Meta Engine::meta(const std::string& t,SlotId s){auto p=storage.pool.view(t+".rows",s/(PAGE/sizeof(Meta)));Meta m;std::memcpy(&m,p+(s%(PAGE/sizeof(Meta)))*sizeof(Meta),sizeof(m));return m;}
 void Engine::put_meta(const std::string& t,SlotId s,const Meta& m){auto id=s/(PAGE/sizeof(Meta));auto p=storage.read(t+".rows",id);std::memcpy(p.data()+(s%(PAGE/sizeof(Meta)))*sizeof(Meta),&m,sizeof(m));storage.write(t+".rows",id,p);}
 std::string Engine::read_blob(const std::string& t,uint64_t offset,uint32_t n){std::string out;out.reserve(n);while(n){auto page=storage.pool.view(t+".blob",offset/PAGE);auto count=std::min<uint64_t>(n,PAGE-offset%PAGE);out.append(reinterpret_cast<const char*>(page+offset%PAGE),count);offset+=count;n-=count;}return out;}
-void Engine::write_blob(const std::string& t,uint64_t offset,const std::string& s,bool append){size_t pos=0;while(pos<s.size()){auto p=offset/PAGE;auto page=storage.read(t+".blob",p);auto n=std::min<uint64_t>(s.size()-pos,PAGE-offset%PAGE);std::memcpy(page.data()+offset%PAGE,s.data()+pos,n);if(append)storage.append(t+".blob",p,page,offset%PAGE,n);else storage.write(t+".blob",p,page);offset+=n;pos+=n;}}
+void Engine::write_blob(const std::string& t,uint64_t offset,const std::string& s,bool append){size_t pos=0;while(pos<s.size()){auto p=offset/PAGE;auto n=std::min<uint64_t>(s.size()-pos,PAGE-offset%PAGE);if(append)storage.append_bytes(t+".blob",p,offset%PAGE,s.data()+pos,n);else {auto page=storage.read(t+".blob",p);std::memcpy(page.data()+offset%PAGE,s.data()+pos,n);storage.write(t+".blob",p,page);}offset+=n;pos+=n;}}
 const float* Engine::vector_view(const std::string& t,SlotId s,size_t i,const Column& c){auto count=PAGE/stride(c);auto p=storage.pool.view(t+".v"+std::to_string(i),s/count);return reinterpret_cast<const float*>(p+(s%count)*stride(c));}
 const float* Engine::center_view(const std::string& t,uint32_t b,size_t dim){auto bytes=((dim+7)/8)*32;auto count=PAGE/bytes;auto p=storage.pool.view(t+".centers",b/count);return reinterpret_cast<const float*>(p+(b%count)*bytes);}
 std::vector<Value> Engine::row(const std::string& t,SlotId s,const Meta& m,const std::vector<Column>& cols,bool vectors){auto r=unpack_values(read_blob(t,m.offset,m.length));require(r.size()==cols.size(),"corrupt row width");if(vectors)for(size_t i=0;i<cols.size();++i)if(cols[i].type==Type::Vector){auto p=vector_view(t,s,i,cols[i]);r[i]=std::vector<float>(p,p+cols[i].width);}return r;}
 void Engine::bitmap(const std::string& t,SlotId slot,bool active){auto p=slot/(PAGE*8);auto page=storage.read(t+".valid",p);auto bit=slot%(PAGE*8);auto x=std::to_integer<unsigned char>(page[bit/8]);x=active?x|(1U<<(bit%8)):x&~(1U<<(bit%8));page[bit/8]=std::byte(x);storage.write(t+".valid",p,page);}
 void Engine::posting(const std::string& t,uint32_t bucket,SlotId slot,bool add){
-  auto f=t+".ivf"+std::to_string(bucket);auto h=storage.read(f,0);uint32_t n;std::memcpy(&n,h.data(),4);
-  auto get=[&](uint32_t i){uint64_t offset=16+uint64_t(i)*4;auto p=storage.read(f,offset/PAGE);uint32_t x;std::memcpy(&x,p.data()+offset%PAGE,4);return x;};
-  auto put=[&](uint32_t i,uint32_t x){uint64_t offset=16+uint64_t(i)*4;auto p=storage.read(f,offset/PAGE);std::memcpy(p.data()+offset%PAGE,&x,4);storage.write(f,offset/PAGE,p);};
+  const bool packed=t.find(".pidx.r")!=std::string::npos;
+  const auto f=packed?t+".lists":t+".ivf"+std::to_string(bucket);
+  auto address=[&](uint64_t logical){return packed?std::pair<uint64_t,size_t>{(logical/2048)*8+bucket/8,(bucket%8)*2048+logical%2048}:std::pair<uint64_t,size_t>{logical/PAGE,logical%PAGE};};
+  auto read=[&](uint64_t logical){auto [number,offset]=address(logical);auto page=storage.read(f,number);uint32_t x;std::memcpy(&x,page.data()+offset,4);return x;};
+  auto write=[&](uint64_t logical,uint32_t x){auto [number,offset]=address(logical);auto page=storage.read(f,number);std::memcpy(page.data()+offset,&x,4);storage.write(f,number,page);};
+  uint32_t n=read(0);
+  auto get=[&](uint32_t i){return read(16+uint64_t(i)*4);};
+  auto put=[&](uint32_t i,uint32_t x){write(16+uint64_t(i)*4,x);};
   if(add){require(n<UINT32_MAX,"IVF list full");put(n++,slot);}else{for(uint32_t i=0;i<n;++i)if(get(i)==slot){auto last=get(n-1);--n;if(i<n)put(i,last);break;}}
-  // Slot writes can modify page zero; reload before publishing its count.
-  h=storage.read(f,0);std::memcpy(h.data(),&n,4);storage.write(f,0,h);
+  // Reload the physical page because another list may share its count page.
+  write(0,n);
 }
 std::string Engine::index_base(const std::string& t,const Header& h) const {return h.index_region[0]?std::string(h.index_region):t;}
 uint32_t Engine::bucket(const std::string& t,const Header& h,SlotId slot){
@@ -98,7 +104,7 @@ void Engine::write_row(const std::string& t,SlotId slot,std::vector<Value> value
     }
     for(size_t i=0;i<cols.size();++i)if(cols[i].type==Type::Vector){auto& v=std::get<std::vector<float>>(values[i]);m.reserved|=has_extreme(v.data(),v.size())?1:0;
       bool unchanged=old.active&&std::memcmp(vector_view(t,slot,i,cols[i]),v.data(),v.size()*sizeof(float))==0;
-      if(!unchanged){auto count=PAGE/stride(cols[i]);auto p=slot/count;auto bytes=storage.read(t+".v"+std::to_string(i),p);std::memcpy(bytes.data()+(slot%count)*stride(cols[i]),v.data(),v.size()*4);if(slot>=h.slots)storage.append(t+".v"+std::to_string(i),p,bytes,(slot%count)*stride(cols[i]),v.size()*4);else storage.write(t+".v"+std::to_string(i),p,bytes);}values[i]=std::vector<float>{};}
+      if(!unchanged){auto count=PAGE/stride(cols[i]);auto p=slot/count;const auto offset=(slot%count)*stride(cols[i]);auto file=t+".v"+std::to_string(i);if(slot>=h.slots)storage.append_bytes(file,p,offset,v.data(),v.size()*4);else {auto bytes=storage.read(file,p);std::memcpy(bytes.data()+offset,v.data(),v.size()*4);storage.write(file,p,bytes);}}values[i]=std::vector<float>{};}
     for(size_t i=0;i<cols.size();++i)if(cols[i].type!=Type::Vector&&!cols[i].primary){
       auto f=t+".s"+std::to_string(i);auto p=slot/(PAGE/8);auto hash=scalar_hash(values[i]);uint64_t prior=0;if(old.active)std::memcpy(&prior,storage.pool.view(f,p)+(slot%(PAGE/8))*8,8);
       if(!old.active||prior!=hash){auto bytes=storage.read(f,p);std::memcpy(bytes.data()+(slot%(PAGE/8))*8,&hash,8);storage.write(f,p,bytes);}
@@ -119,9 +125,10 @@ void Engine::write_row(const std::string& t,SlotId slot,std::vector<Value> value
 }
 void Engine::create_index(const Statement& s,const std::vector<Column>& cols){
   auto h=header(s.table);require(!h.nlist,"vector index already exists");auto col=column(cols,s.value);require(cols[col].type==Type::Vector,"index requires VECTOR column");
+  storage.reclaim_clean_pages();
   uint32_t count=0;for(SlotId slot=0;slot<h.slots;++slot)if(meta(s.table,slot).active)++count;
   h.nlist=std::min<uint32_t>(count>=4096?64:8,count);h.ivector=static_cast<uint32_t>(col);require(h.nlist>0,"cannot train IVF on empty table");
-  auto region=storage.begin_region(s.table+".index");require(region.size()<sizeof(h.index_region),"index namespace too long");
+  auto region=storage.begin_region(s.table+".pidx");require(region.size()<sizeof(h.index_region),"index namespace too long");
   std::memcpy(h.index_region,region.c_str(),region.size()+1);h.active_count=count;
   auto dim=cols[col].width;
   {
@@ -146,11 +153,15 @@ void Engine::create_index(const Statement& s,const std::vector<Column>& cols){
       for(uint32_t b=0;b<h.nlist;++b)if(sizes[b])for(size_t j=0;j<dim;++j)centers[b][j]=static_cast<float>(sums[b][j]/sizes[b]);
     }
   }
-  for(uint32_t b=0;b<h.nlist;++b){auto count=PAGE/stride(cols[col]);auto page=storage.read(region+".centers",b/count);std::memcpy(page.data()+(b%count)*stride(cols[col]),centers[b].data(),dim*4);storage.write_new(region+".centers",b/count,page);}
+  for(uint32_t b=0;b<h.nlist;++b){auto count=PAGE/stride(cols[col]);storage.append_bytes(region+".centers",b/count,(b%count)*stride(cols[col]),centers[b].data(),dim*4);}
   std::vector<bool> safe;for(auto& center:centers)safe.push_back(!has_extreme(center.data(),dim));
+  std::array<uint32_t,64> list_sizes{};
   for(SlotId slot=0;slot<h.slots;++slot){auto m=meta(s.table,slot);if(!m.active)continue;auto p=vector_view(s.table,slot,col,cols[col]);uint32_t b=0;double nearest=INFINITY;
     for(uint32_t candidate=0;candidate<h.nlist;++candidate){auto distance=l2_fast(p,centers[candidate].data(),dim,m.reserved==0&&safe[candidate]);if(distance<nearest){nearest=distance;b=candidate;}}
-    put_bucket(s.table,h,slot,b);posting(region,b,slot,true);}
+    storage.append_bytes(region+".buckets",slot/(PAGE/4),(slot%(PAGE/4))*4,&b,4);
+    const auto logical=16+uint64_t(list_sizes[b]++)*4;
+    storage.append_bytes(region+".lists",(logical/2048)*8+b/8,(b%8)*2048+logical%2048,&slot,4);}
+  for(uint32_t b=0;b<h.nlist;++b)storage.append_bytes(region+".lists",b/8,(b%8)*2048,&list_sizes[b],4);
   }
   h.calibration_skipped=detail::skip_ivf_calibration_for_payload(count,uint64_t(count)*dim*sizeof(float),storage.budget.limit);
   h.calibration_queries=h.calibration_skipped?0:16;
@@ -158,8 +169,8 @@ void Engine::create_index(const Statement& s,const std::vector<Column>& cols){
   h.mutations_since_calibration=0;h.rows_at_calibration=count;
   last_lists=h.nlist;last_recommended=h.recommended_nprobe;
   // Publish only after all fresh-region pages and calibration are complete.
-  storage.store(s.table+".header",0,h);
   storage.seal_region(region);
+  storage.store(s.table+".header",0,h);
 }
 uint32_t Engine::calibrate(const std::string& t,Header& h,const std::vector<Column>& cols){
   // Keep 16 query vectors and bounded Top10 heaps. Exact ground truth is built
@@ -243,7 +254,7 @@ Engine::TableReadCache* Engine::cache(const std::string& t,const Header& h,const
   // Charge fixed capacities, including dictionary strings and container metadata.
   // High cardinality columns stop after 128 distinct values or 16 KiB UTF-8.
   size_t bytes=4096+size_t(h.slots)*17+center_count*4+size_t(h.nlist+2)*4+vector_pages*sizeof(BufferPool::ResidentHandle)+
-    cols.size()*sizeof(TableReadCache::Dictionary)+varchar_count*(size_t(h.slots)*2+32768);
+    cols.size()*sizeof(TableReadCache::Dictionary)+varchar_count*(size_t(h.slots)*6+32768+129*sizeof(uint32_t));
   if(bytes>(storage.budget.limit-storage.budget.used)/2)return nullptr;
   auto c=std::make_unique<TableReadCache>();c->reservation=std::make_shared<Reservation>(storage.budget,bytes);
   c->vector_pages.resize(vector_pages);c->table=t;c->slots=h.slots;c->keys.resize(h.slots);c->flags.resize(h.slots);c->dictionaries.resize(cols.size());c->active_slots.reserve(h.slots);
@@ -265,6 +276,15 @@ Engine::TableReadCache* Engine::cache(const std::string& t,const Header& h,const
   for(size_t i=1;i<c->offsets.size();++i)c->offsets[i]+=c->offsets[i-1];
   c->postings.resize(c->offsets.back());auto next=c->offsets;
   for(SlotId slot=0;slot<h.slots;++slot)if(c->flags[slot]&1)c->postings[next[h.nlist?bucket(t,h,slot):0]++]=slot;
+  // Each dictionary range contains active slots in storage order. Flat ranges
+  // avoid per-value allocations and allow page-ordered scans after a cache miss.
+  for(auto& d:c->dictionaries)if(d.supported){
+    d.offsets.resize(d.values.size()+1);
+    for(auto slot:c->active_slots)++d.offsets[d.ids[slot]+1];
+    for(size_t i=1;i<d.offsets.size();++i)d.offsets[i]+=d.offsets[i-1];
+    d.postings.resize(c->active_slots.size());auto next=d.offsets;
+    for(auto slot:c->active_slots)d.postings[next[d.ids[slot]]++]=slot;
+  }
   c->centers.resize(center_count);
   for(uint32_t b=0;b<h.nlist;++b){auto dim=cols[h.ivector].width;auto p=center_view(index_base(t,h),b,dim);std::copy(p,p+dim,c->centers.begin()+size_t(b)*dim);}
   read_cache=std::move(c);return read_cache.get();
@@ -292,13 +312,28 @@ bool Engine::fast_topk(const Statement& s,const Header& h,const std::vector<Colu
   auto dim=cols[selected[distance]].width;const size_t vector_stride=stride(cols[selected[distance]]),count=PAGE/vector_stride;auto& query=queries[distance];bool safe=!has_extreme(query.data(),dim);
   bool ivf=ann&&h.nlist&&selected[distance]==h.ivector;route="exact";last_probes=0;
   if(ivf&&!nprobe&&(h.active_count<4096||stale(h)||h.calibration_skipped||!h.recommended_nprobe||h.recommended_nprobe>h.nlist/2)){ivf=false;route="exact_fallback";}
+  const TableReadCache::Dictionary* subset=nullptr;uint32_t subset_begin=0,subset_end=0;
+  if(predicates.size()==1&&filters.size()==1){
+    auto [column,id]=filters.front();auto& d=c->dictionaries[column];
+    if(id!=UINT16_MAX){subset_begin=d.offsets[id];subset_end=d.offsets[id+1];}
+    const auto probes=std::min(nprobe?nprobe:h.recommended_nprobe,h.nlist);
+    const auto threshold=std::max(uint64_t(1024),uint64_t(probes)*(h.nlist?h.active_count/h.nlist:0));
+    if(!ann||subset_end-subset_begin<=threshold){
+      subset=&d;ivf=false;route=ann?"ann_filter_exact":"exact_filter";filters.clear();
+    }
+  }
   size_t workspace=size_t(h.slots)*4+c->vector_pages.size()*sizeof(const std::byte*)+size_t(h.nlist)*sizeof(std::pair<double,uint32_t>)+size_t(s.limit)*(sizeof(double)+sizeof(SlotId)+sizeof(Value)*2+sizeof(std::vector<Value>)+64)+4096;
   if(workspace>storage.budget.limit-storage.budget.used){read_cache.reset();return false;}
   auto reservation=std::make_shared<Reservation>(storage.budget,workspace);
   // Validate without loading: loading one missing page could evict any earlier
   // borrowed address. The all-resident scan below makes no pool calls at all.
   std::vector<const std::byte*> bases(c->vector_pages.size());bool all_resident=true;
-  for(size_t i=0;i<bases.size();++i){bases[i]=storage.pool.resident(c->vector_pages[i]);all_resident&=bases[i]!=nullptr;}
+  if(subset){
+    for(auto at=subset_begin;at<subset_end;++at){auto page=subset->postings[at]/count;
+      if(!bases[page])bases[page]=storage.pool.resident(c->vector_pages[page]);
+      if(!bases[page]){all_resident=false;break;}
+    }
+  }else for(size_t i=0;i<bases.size();++i){bases[i]=storage.pool.resident(c->vector_pages[i]);all_resident&=bases[i]!=nullptr;}
   std::vector<SlotId> candidates;
   std::vector<std::pair<double,uint32_t>> distances;
   if(ivf){route="ivf";last_probes=std::min(nprobe?nprobe:h.recommended_nprobe,h.nlist);distances.reserve(h.nlist);
@@ -321,31 +356,60 @@ bool Engine::fast_topk(const Statement& s,const Header& h,const std::vector<Colu
     return c->keys[a.slot]<c->keys[b.slot];
   };
   const std::byte* vector_page=nullptr;uint64_t current=UINT64_MAX;auto file=s.table+".v"+std::to_string(selected[distance]);
-  auto consume=[&]<bool Resident128>(SlotId slot) __attribute__((always_inline)) {bool yes=true;for(auto [i,id]:filters)if(c->dictionaries[i].ids[slot]!=id){yes=false;break;}if(!yes)return;
-    if(impossible_key||(key_filter&&c->keys[slot]!=*key_filter))return;
+  auto accepts=[&](SlotId slot) __attribute__((always_inline)) {
+    for(auto [i,id]:filters)if(c->dictionaries[i].ids[slot]!=id)return false;
+    return !impossible_key&&(!key_filter||c->keys[slot]==*key_filter);
+  };
+  auto finish=[&](SlotId slot,const float* p,double fast) __attribute__((always_inline)) {
+    if(heap.size()==s.limit){auto worst=heap.front().squared;
+      auto error=std::max(1e-5,4.0*dim*std::numeric_limits<float>::epsilon());
+      if(fast>worst+error*std::max({1.0,std::abs(fast),std::abs(worst)}))return;}
+    // Every potential winner is widened, preserving underflow and SQL PK ties.
+    Neighbor neighbor{l2_squared_exact(p,query.data(),dim),slot};
+    if(heap.size()<s.limit){heap.push_back(neighbor);std::push_heap(heap.begin(),heap.end(),less);}else if(less(neighbor,heap.front())){std::pop_heap(heap.begin(),heap.end(),less);heap.back()=neighbor;std::push_heap(heap.begin(),heap.end(),less);}
+  };
+  auto consume=[&]<bool Resident128>(SlotId slot) __attribute__((always_inline)) {
+    if(!accepts(slot))return;
     const float* p;
     if constexpr(Resident128)p=reinterpret_cast<const float*>(bases[slot>>5]+((slot&31U)<<9));
     else {auto page=slot/count;if(all_resident)vector_page=bases[page];else if(page!=current){
       auto& handle=c->vector_pages[page];vector_page=storage.pool.resident(handle);
       if(!vector_page){handle=storage.pool.handle(file,page);vector_page=storage.pool.resident(handle);}current=page;
     }
-    // No pool operations occur while consuming this page. Handles validate
-    // frame reuse on every page transition; no borrowed pointer crosses it.
+    // Borrowed pointers never survive a pool operation in the paged path.
     p=reinterpret_cast<const float*>(vector_page+(slot%count)*vector_stride);}
-    if(heap.size()==s.limit){auto fast=l2_squared_fast(p,query.data(),dim,safe&&!(c->flags[slot]&2));auto worst=heap.front().squared;
-      auto error=std::max(1e-5,4.0*dim*std::numeric_limits<float>::epsilon());
-      if(fast>worst+error*std::max({1.0,std::abs(fast),std::abs(worst)}))return;}
-    Neighbor neighbor{l2_squared_exact(p,query.data(),dim),slot};
-    if(heap.size()<s.limit){heap.push_back(neighbor);std::push_heap(heap.begin(),heap.end(),less);}else if(less(neighbor,heap.front())){std::pop_heap(heap.begin(),heap.end(),less);heap.back()=neighbor;std::push_heap(heap.begin(),heap.end(),less);}
+    auto fast=heap.size()==s.limit?l2_squared_fast(p,query.data(),dim,safe&&!(c->flags[slot]&2)):0;
+    finish(slot,p,fast);
   };
-  auto scan=[&]<bool Resident128,bool Prefetch>(auto first,auto last){for(auto it=first;it!=last;++it){
+  auto scan=[&]<bool Resident128,bool Prefetch>(auto first,auto last){
+    // Gather only accepted active slots. All addresses are validated before
+    // entering this path; batching never introduces a pool load or eviction.
+    if(all_resident){
+      SlotId slots[4];const float* vectors[4];size_t filled=0;
+      auto flush=[&]() __attribute__((always_inline)) {double fast[4];bool batch_safe=safe;
+        for(size_t j=0;j<4;++j)batch_safe&=!(c->flags[slots[j]]&2);
+        l2_sq_f32_batch4(query.data(),vectors,dim,fast,batch_safe);
+        for(size_t j=0;j<4;++j)finish(slots[j],vectors[j],fast[j]);
+        filled=0;
+      };
+      for(auto it=first;it!=last;++it){auto slot=*it;if(!accepts(slot))continue;
+        slots[filled]=slot;
+        if constexpr(Resident128)vectors[filled]=reinterpret_cast<const float*>(bases[slot>>5]+((slot&31U)<<9));
+        else vectors[filled]=reinterpret_cast<const float*>(bases[slot/count]+(slot%count)*vector_stride);
+        ++filled;
 #if defined(__GNUC__) || defined(__clang__)
-    if constexpr(Prefetch){if(it+1!=last){auto next=*(it+1);__builtin_prefetch(bases[next>>5]+((next&31U)<<9),0,1);}}
+        if constexpr(Prefetch){if(it+1!=last){auto next=*(it+1);
+          if constexpr(Resident128)__builtin_prefetch(bases[next>>5]+((next&31U)<<9),0,1);
+          else __builtin_prefetch(bases[next/count]+(next%count)*vector_stride,0,1);}}
 #endif
-    consume.template operator()<Resident128>(*it);
-  }};
+        if(filled==4)flush();
+      }
+      for(size_t j=0;j<filled;++j)consume.template operator()<Resident128>(slots[j]);
+    }else for(auto it=first;it!=last;++it)consume.template operator()<Resident128>(*it);
+  };
   auto run=[&]<bool Resident128,bool Prefetch>(){
-    if(ivf&&all_resident){for(size_t i=0;i<last_probes;++i){auto b=distances[i].second;scan.template operator()<Resident128,Prefetch>(c->postings.begin()+c->offsets[b],c->postings.begin()+c->offsets[b+1]);}}
+    if(subset)scan.template operator()<Resident128,Prefetch>(subset->postings.begin()+subset_begin,subset->postings.begin()+subset_end);
+    else if(ivf&&all_resident){for(size_t i=0;i<last_probes;++i){auto b=distances[i].second;scan.template operator()<Resident128,Prefetch>(c->postings.begin()+c->offsets[b],c->postings.begin()+c->offsets[b+1]);}}
     else if(ivf)scan.template operator()<Resident128,Prefetch>(candidates.begin(),candidates.end());
     else scan.template operator()<Resident128,Prefetch>(c->active_slots.begin(),c->active_slots.end());
   };
@@ -394,7 +458,7 @@ Result Engine::insert_stream(const std::string& sql){
     size_t i=0;for(;i<pages.size();++i)if(pages[i].file==file&&pages[i].page==page)break;
     if(i==pages.size()){
       if(pages.size()==capacity){flush(pages.front());pages.erase(pages.begin());}
-      Pending p;p.file=file;p.page=page;p.bytes=storage.read(file,page);p.append=append;pages.push_back(std::move(p));i=pages.size()-1;
+      Pending p;p.file=file;p.page=page;if(!append)p.bytes=storage.read(file,page);p.append=append;pages.push_back(std::move(p));i=pages.size()-1;
     }
     auto& p=pages[i];std::memcpy(p.bytes.data()+offset,data,length);p.first=std::min(p.first,offset);p.last=std::max(p.last,offset+length);
   };
@@ -488,7 +552,15 @@ Result Engine::execute_inner(const Statement& s){
     return reinterpret_cast<const float*>(lease.data+(slot%count)*stride(cols[c]));
   };
   for(uint64_t start=0;start<h.slots;start+=4096){std::array<uint64_t,64> candidates{};
-    if(use_ivf){for(auto b:buckets){auto f=index_base(s.table,h)+".ivf"+std::to_string(b);auto page=storage.read(f,0);uint32_t count;std::memcpy(&count,page.data(),4);for(uint32_t i=0;i<count;++i){uint64_t offset=16+uint64_t(i)*4;if(offset%PAGE==0)page=storage.read(f,offset/PAGE);uint32_t slot;std::memcpy(&slot,page.data()+offset%PAGE,4);if(slot>=start&&slot<start+4096)candidates[(slot-start)/64]|=uint64_t(1)<<((slot-start)%64);}}}
+    if(use_ivf){auto base=index_base(s.table,h);
+      for(auto b:buckets){const bool packed=base.find(".pidx.r")!=std::string::npos;
+        const auto f=packed?base+".lists":base+".ivf"+std::to_string(b);
+        auto address=[&](uint64_t logical){return packed?std::pair<uint64_t,size_t>{(logical/2048)*8+b/8,(b%8)*2048+logical%2048}:std::pair<uint64_t,size_t>{logical/PAGE,logical%PAGE};};
+        auto [number,offset]=address(0);auto page=storage.read(f,number);uint32_t count;std::memcpy(&count,page.data()+offset,4);
+        for(uint32_t i=0;i<count;++i){auto [next,at]=address(16+uint64_t(i)*4);if(next!=number){page=storage.read(f,next);number=next;}
+          uint32_t slot;std::memcpy(&slot,page.data()+at,4);if(slot>=start&&slot<start+4096)candidates[(slot-start)/64]|=uint64_t(1)<<((slot-start)%64);}
+      }
+    }
     else candidates.fill(UINT64_MAX);
     std::array<uint64_t,64> visible{};
     auto valid=storage.pool.view(s.table+".valid",start/(PAGE*8));

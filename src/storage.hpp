@@ -56,6 +56,8 @@ public:
   std::function<void(const std::string&,uint64_t)> before_flush;
   bool transaction_active=false;
   struct ResidentHandle { size_t frame=0; uint64_t version=0; };
+  // Lookup only: never reads, ages, or admits a page.
+  std::optional<ResidentHandle> find(const std::string&,uint64_t) const;
   ResidentHandle handle(const std::string&,uint64_t);
   const std::byte* resident(ResidentHandle) const;
   void append_extent(const std::string&,uint64_t,const Page&,size_t,size_t);
@@ -63,7 +65,7 @@ public:
   void flush_page(const std::string&,uint64_t);
   void committed();
   void invalidate_prefix(const std::string&);
-  void sync_all();
+  void sync_all(bool release_cache=true);
   uint64_t physical_reads=0,vector_reads=0,data_page_write_bytes=0;
   BufferPool(std::filesystem::path, MemoryBudget&);
   ~BufferPool();
@@ -88,7 +90,7 @@ class Storage {
   size_t written_cursor=0, written_reservation=0;
   bool normal_written(const std::string&);
   void mark_written(const std::string&);
-  std::vector<std::string> regions;
+  std::vector<std::string> regions, sealed_regions;
   void protect(const std::string&,uint64_t);
   void restore_shadow();
   bool fresh_region(const std::string&) const;
@@ -132,6 +134,10 @@ public:
   // One contiguous page batch of invisible slots; callers publish their
   // logical row count through normal WAL only after all payload batches finish.
   void append_bytes(const std::string&,uint64_t,size_t offset,const void*,size_t length);
+  // Sync a phase boundary; release only cache already represented in frames.
+  void reclaim_clean_pages();
+  // Allocation markers reserve unique names permanently. Fresh payload omits
+  // redo; seal syncs it before publishing metadata. Undo owns it until COMMIT.
   std::string begin_region(const std::string& prefix);
   void write_new(const std::string&,uint64_t,const Page&);
   void seal_region(const std::string&);

@@ -23,7 +23,7 @@ def run(args):
            '--pid=host','--cgroupns=host','--mount','type=bind,src=/sys/fs/cgroup,dst=/cg,readonly',
            '--mount','type=bind,src=/proc,dst=/hp,readonly','ubuntu:24.04','sleep','infinity')
     report={'phase':args.phase,'image':args.image,'image_id':docker('image','inspect',args.image,'--format','{{.Id}}').stdout.strip(),
-            'rounds':args.rounds,'driver':{'docker_binary':args.docker,'docker_host':os.environ.get('DOCKER_HOST','default')},
+            'rounds':args.rounds,'require_filter_exact':args.require_filter_exact,'driver':{'docker_binary':args.docker,'docker_host':os.environ.get('DOCKER_HOST','default')},
             'notes':{'B':'full target io.stat counters from cgroup creation through DB close, including startup; initial snapshot diagnostic only',
              'M':'target memory.peak; collector outside target cgroup; no exec into target for stats',
              'T_write':'wall time of 100 pre-encoded INSERT requests plus clean shutdown/checkpoint round trip',
@@ -100,6 +100,7 @@ def run(args):
                                     ids=[r[0] for r in result['rows']]
                                     assert len(ids)==10 and len(set(ids))==10
                                     if mode=='exact':assert ids==expected,(ids,expected)
+                                    if args.require_filter_exact and mode=='ann' and i>=500:assert ids==expected,(ids,expected)
                                     hits[i>=500].append(len(set(ids)&set(expected))/10)
                                 recalls=[float(np.mean(x)) for x in hits];assert min(recalls)>=.95
                             _,close_seconds=request(op='shutdown')
@@ -154,4 +155,5 @@ if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('--docker',default='docker');p.add_argument('--image',required=True)
     p.add_argument('--phase',required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--rounds',type=int,default=3)
     p.add_argument('--memories',nargs='+',default=['16m','2g']);p.add_argument('--distributions',nargs='+',default=['clustered','uniform'])
+    p.add_argument('--require-filter-exact',action='store_true')
     p.add_argument('--projects',nargs='+',default=['write','exact','ann']);run(p.parse_args())

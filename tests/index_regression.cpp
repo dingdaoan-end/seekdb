@@ -56,6 +56,30 @@ int main(){
   Engine e(root,1<<20);assert(e.mutation_count("t")==841&&e.rows_at_calibration("t")==4200&&e.calibration_stale("t"));
   e.execute("SET search_mode=ann;");ids(e,query("[17000,17000]"));assert(e.last_route()=="exact_fallback");
  }
+ // Single dictionary equality can scan its sorted active slots exactly,
+ // including under manual probes; large postings retain the IVF planner.
+ {
+  // Two MiB leaves room for the 8400-row cache after its metadata grows.
+  Engine e(root/"dictionary_postings",2<<20);e.execute("CREATE TABLE t (id BIGINT PRIMARY KEY,category VARCHAR(16),v VECTOR(2));");
+  e.execute("BEGIN;");
+  for(int start=0;start<4200;start+=100){std::string sql="INSERT INTO t VALUES ";for(int i=start;i<start+100;++i){if(i!=start)sql+=",";auto cat=i<1024?"small":i<2049?"large":"rest";sql+="("+std::to_string(5000-i)+",'"+cat+"','["+std::to_string(i%17)+",0]')";}e.execute(sql+";");}e.execute("COMMIT;");
+  e.execute("CREATE VECTOR INDEX vi ON t(v);");
+  const auto small=query("[0,0]","WHERE category='small'");
+  auto exact=ids(e,small);assert(exact.size()==10&&e.last_route()=="exact_filter");
+  e.execute("SET search_mode=ann;");e.execute("SET nprobe=5;");
+  for(int pass=0;pass<3;++pass){assert(ids(e,small)==exact);assert(e.last_route()=="ann_filter_exact"&&e.effective_nprobe()==0);}
+  auto reads=e.vector_page_reads();assert(ids(e,query("[0,0]","WHERE category='absent'")).empty());assert(e.last_route()=="ann_filter_exact"&&e.effective_nprobe()==0&&reads==e.vector_page_reads());
+  ids(e,query("[0,0]","WHERE category='large'"));assert(e.last_route()=="ivf"&&e.effective_nprobe()==5);
+  e.execute("SET nprobe=64;");ids(e,query("[0,0]","WHERE category='large'"));assert(e.last_route()=="ann_filter_exact"&&e.effective_nprobe()==0);e.execute("SET nprobe=5;");
+  ids(e,query("[0,0]","WHERE category='small' AND category='small'"));assert(e.last_route()=="ivf"&&e.effective_nprobe()==5);
+  ids(e,query("[0,0]"));assert(e.last_route()=="ivf"&&e.effective_nprobe()==5);
+  e.execute("BEGIN;");e.execute("UPDATE t SET category='changed' WHERE category='small';");assert(ids(e,small).empty()&&e.last_route()=="ann_filter_exact");e.execute("ROLLBACK;");assert(ids(e,small)==exact);
+  bool failed=false;try{e.execute("INSERT INTO t VALUES (99999,'small','[0,0]'),(5000,'small','[0,0]');");}catch(const std::exception&){failed=true;}assert(failed);assert(ids(e,small)==exact);
+  // A larger explicit probe count raises the cost threshold above 1024.
+  e.execute("BEGIN;");for(int start=4200;start<8400;start+=100){std::string sql="INSERT INTO t VALUES ";for(int i=start;i<start+100;++i){if(i!=start)sql+=",";sql+="("+std::to_string(5000-i)+",'rest','[0,0]')";}e.execute(sql+";");}e.execute("COMMIT;");
+  e.execute("SET nprobe=8;");ids(e,query("[0,0]","WHERE category='large'"));assert(e.read_cache_slots()==8400);assert(e.last_route()=="ann_filter_exact"&&e.effective_nprobe()==0);
+  e.execute("DELETE FROM t WHERE category='small';");assert(ids(e,small).empty()&&e.last_route()=="ann_filter_exact");assert(e.budget_peak()<=(2U<<20));
+ }
  // Build inside an explicit transaction, then rollback its fresh namespace.
  {
   Engine e(root/"rollback",1<<20);e.execute("CREATE TABLE t (id BIGINT PRIMARY KEY,category VARCHAR(16),v VECTOR(2));");e.execute("INSERT INTO t VALUES (1,'red','[0,0]'),(2,'blue','[1,1]');");
@@ -63,7 +87,9 @@ int main(){
   assert(e.drift_threshold("t")==64&&e.rows_at_calibration("t")==3&&e.mutation_count("t")==0);
   bool duplicate=false;try{e.execute("UPDATE t SET id=10;");}catch(const std::exception&){duplicate=true;}assert(duplicate);assert(ids(e,"SELECT id FROM t ORDER BY id LIMIT 10;")==std::vector<int64_t>({1,2,3}));assert(!e.calibration_stale("t")&&e.mutation_count("t")==0);
   e.execute("ROLLBACK;");assert(e.recommended_nprobe("t")==0&&e.active_rows("t")==2);
-  e.execute("CREATE VECTOR INDEX vi ON t(v);");e.execute("SET search_mode=ann;");ids(e,query("[0,0]"));assert(e.last_route()=="exact_fallback");e.execute("SET nprobe=1;");ids(e,query("[0,0]"));assert(e.last_route()=="ivf");
+  e.execute("CREATE VECTOR INDEX vi ON t(v);");e.execute("SET search_mode=ann;");ids(e,query("[0,0]"));assert(e.last_route()=="exact_fallback");
+  assert(ids(e,query("[0,0]","WHERE category='red'"))==std::vector<int64_t>{1});assert(e.last_route()=="ann_filter_exact"&&e.effective_nprobe()==0);
+  e.execute("SET nprobe=1;");ids(e,query("[0,0]"));assert(e.last_route()=="ivf");
  }
  // A degenerate training set puts >4092 slots in bucket zero. Its slots
  // cross the compact page-zero header boundary and a following page.
@@ -105,6 +131,7 @@ int main(){
    e.execute("BEGIN;");for(int i=0;i<10;++i)e.execute("INSERT INTO t VALUES ("+std::to_string(i)+",'same','[0,0]');");e.execute("COMMIT;");
    e.execute("CREATE VECTOR INDEX vi ON t(v);");assert(e.calibration_skipped("t")&&e.calibration_query_count("t")==0&&e.recommended_nprobe("t")==4);
    e.execute("SET search_mode=ann;");auto result=ids(e,query("[0,0]"));assert(e.last_route()=="exact_fallback"&&e.effective_nprobe()==0&&result.size()==10);
+   assert(ids(e,query("[0,0]","WHERE category='same'"))==result&&e.read_cache_slots()==0);
    e.execute("SET nprobe=8;");assert(ids(e,query("[0,0]"))==result&&e.last_route()=="ivf");assert(e.budget_peak()<=65536);e.close();
   }
   Engine e(path,65536);assert(e.calibration_skipped("t")&&e.calibration_query_count("t")==0&&e.recommended_nprobe("t")==4);

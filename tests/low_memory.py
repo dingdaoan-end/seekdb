@@ -80,7 +80,9 @@ def run(binary, budget, phase, count, require_ivf=False):
                 metrics=records[-1]['metrics'];route=metrics['ann_route']
                 ann_routes[route]=ann_routes.get(route,0)+1;ann_probes.add(metrics['effective_nprobe'])
                 if require_ivf:
-                    assert route=='ivf' and metrics['effective_nprobe']==5 and metrics['recommended_nprobe']==5,metrics
+                    wanted='ivf' if i<count//2 else 'ann_filter_exact'
+                    assert route==wanted and metrics['effective_nprobe']==(5 if i<count//2 else 0) and metrics['recommended_nprobe']==5,metrics
+                    if i>=count//2:assert actual==expected,(actual,expected)
             hits[i>=count//2].append(len(set(actual)&set(expected))/len(expected))
         recalls[mode]=[float(np.mean(x)) for x in hits]
         print(f'{phase} budget={budget} {mode} {count} queries recall={recalls[mode]}',flush=True)
