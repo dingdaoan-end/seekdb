@@ -133,7 +133,9 @@ work/build/benchmark_cpu DATA_COPY QUERY_SQL_LINES ann 10485760
 
 `benchmark_cpu`仅用于进程内归因，须使用可丢弃的数据副本，不能代替端到端成绩。
 
-Round 10为低基数字典增加有序SlotId倒排表，小类别过滤可精确扫描子集；驻留页
+Round 10为低基数字典增加有序SlotId倒排表；Exact及ANN回退扫描始终使用过滤子集。
+IVF模式仅在子集大小不超过`max(64, nprobe*active_rows/(nlist*4))`时直接扫描子集，
+其余保留桶探测与字典过滤。驻留页
 使用单查询对四向量的AVX2/FMA批处理，潜在赢家仍用float64复算。过滤ANN
 因此可返回精确Top-10，但并非所有分布都保证更低核心耗时。
 
@@ -145,6 +147,7 @@ Round 10为低基数字典增加有序SlotId倒排表，小类别过滤可精确
 R10保留读取R9旧索引的路径；不保证旧二进制读取新索引，回退版本应使用原数据备份。
 失败或强杀构建留下的未引用索引区暂不回收，以保留恢复期间的安全性。
 四代实测、完整检查与局限见[Round 10报告](docs/round10-final-performance.md)。
+后续ANN阈值微调及召回复测见[路由调优报告](docs/round10-routing-tuning.md)。
 
 ## 索引与内建校准
 
@@ -212,7 +215,7 @@ python3 tests/benchmark_local.py --phase after --automatic-ann --default-budget 
 对比报告区分预算变化和提交路径变化，不能将全部性能差异归因于单一修改。
 安装NumPy的Python被CMake选中时，CTest包含dynamic_dml：10k建索引后各50次
 插入/更新/删除，校验150次可见性及1200次ANN的独立真值召回；无过滤保持IVF/5，
-小类别等值过滤走精确倒排子集，另核对结果顺序与可见性。
+常规类别过滤也走IVF/5；Exact另核对有序倒排结果与可见性。
 最终交互证据在`agent/conversation.json`和根目录`conversation.json`，两份字节一致。
 
 ## 小预算防超时复验

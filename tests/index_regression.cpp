@@ -62,20 +62,25 @@ int main(){
   // Two MiB leaves room for the 8400-row cache after its metadata grows.
   Engine e(root/"dictionary_postings",2<<20);e.execute("CREATE TABLE t (id BIGINT PRIMARY KEY,category VARCHAR(16),v VECTOR(2));");
   e.execute("BEGIN;");
-  for(int start=0;start<4200;start+=100){std::string sql="INSERT INTO t VALUES ";for(int i=start;i<start+100;++i){if(i!=start)sql+=",";auto cat=i<1024?"small":i<2049?"large":"rest";sql+="("+std::to_string(5000-i)+",'"+cat+"','["+std::to_string(i%17)+",0]')";}e.execute(sql+";");}e.execute("COMMIT;");
+  for(int start=0;start<4200;start+=100){std::string sql="INSERT INTO t VALUES ";for(int i=start;i<start+100;++i){if(i!=start)sql+=",";auto cat=i<64?"small":i<129?"large":i<211?"boundary":i<294?"over":"rest";sql+="("+std::to_string(5000-i)+",'"+cat+"','["+std::to_string(i%17)+",0]')";}e.execute(sql+";");}e.execute("COMMIT;");
   e.execute("CREATE VECTOR INDEX vi ON t(v);");
   const auto small=query("[0,0]","WHERE category='small'");
   auto exact=ids(e,small);assert(exact.size()==10&&e.last_route()=="exact_filter");
   e.execute("SET search_mode=ann;");e.execute("SET nprobe=5;");
   for(int pass=0;pass<3;++pass){assert(ids(e,small)==exact);assert(e.last_route()=="ann_filter_exact"&&e.effective_nprobe()==0);}
   auto reads=e.vector_page_reads();assert(ids(e,query("[0,0]","WHERE category='absent'")).empty());assert(e.last_route()=="ann_filter_exact"&&e.effective_nprobe()==0&&reads==e.vector_page_reads());
-  ids(e,query("[0,0]","WHERE category='large'"));assert(e.last_route()=="ivf"&&e.effective_nprobe()==5);
+  // 5*4200/(64*4)=82: multiply before dividing. Exactly82 uses postings,
+  // 83 uses IVF. With one probe the64-row floor applies, then65 uses IVF.
+  ids(e,query("[0,0]","WHERE category='boundary'"));assert(e.last_route()=="ann_filter_exact"&&e.effective_nprobe()==0);
+  ids(e,query("[0,0]","WHERE category='over'"));assert(e.last_route()=="ivf"&&e.effective_nprobe()==5);
+  e.execute("SET nprobe=1;");assert(ids(e,small)==exact);assert(e.last_route()=="ann_filter_exact");
+  ids(e,query("[0,0]","WHERE category='large'"));assert(e.last_route()=="ivf"&&e.effective_nprobe()==1);e.execute("SET nprobe=5;");
   e.execute("SET nprobe=64;");ids(e,query("[0,0]","WHERE category='large'"));assert(e.last_route()=="ann_filter_exact"&&e.effective_nprobe()==0);e.execute("SET nprobe=5;");
   ids(e,query("[0,0]","WHERE category='small' AND category='small'"));assert(e.last_route()=="ivf"&&e.effective_nprobe()==5);
   ids(e,query("[0,0]"));assert(e.last_route()=="ivf"&&e.effective_nprobe()==5);
   e.execute("BEGIN;");e.execute("UPDATE t SET category='changed' WHERE category='small';");assert(ids(e,small).empty()&&e.last_route()=="ann_filter_exact");e.execute("ROLLBACK;");assert(ids(e,small)==exact);
   bool failed=false;try{e.execute("INSERT INTO t VALUES (99999,'small','[0,0]'),(5000,'small','[0,0]');");}catch(const std::exception&){failed=true;}assert(failed);assert(ids(e,small)==exact);
-  // A larger explicit probe count raises the cost threshold above 1024.
+  // A larger table/probe count raises the cost threshold to262.
   e.execute("BEGIN;");for(int start=4200;start<8400;start+=100){std::string sql="INSERT INTO t VALUES ";for(int i=start;i<start+100;++i){if(i!=start)sql+=",";sql+="("+std::to_string(5000-i)+",'rest','[0,0]')";}e.execute(sql+";");}e.execute("COMMIT;");
   e.execute("SET nprobe=8;");ids(e,query("[0,0]","WHERE category='large'"));assert(e.read_cache_slots()==8400);assert(e.last_route()=="ann_filter_exact"&&e.effective_nprobe()==0);
   e.execute("DELETE FROM t WHERE category='small';");assert(ids(e,small).empty()&&e.last_route()=="ann_filter_exact");assert(e.budget_peak()<=(2U<<20));

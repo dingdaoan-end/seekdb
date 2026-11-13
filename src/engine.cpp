@@ -317,8 +317,8 @@ bool Engine::fast_topk(const Statement& s,const Header& h,const std::vector<Colu
     auto [column,id]=filters.front();auto& d=c->dictionaries[column];
     if(id!=UINT16_MAX){subset_begin=d.offsets[id];subset_end=d.offsets[id+1];}
     const auto probes=std::min(nprobe?nprobe:h.recommended_nprobe,h.nlist);
-    const auto threshold=std::max(uint64_t(1024),uint64_t(probes)*(h.nlist?h.active_count/h.nlist:0));
-    if(!ann||subset_end-subset_begin<=threshold){
+    const auto threshold=std::max(uint64_t(64),h.nlist?uint64_t(probes)*h.active_count/(uint64_t(h.nlist)*4):0);
+    if(!ivf||subset_end-subset_begin<=threshold){
       subset=&d;ivf=false;route=ann?"ann_filter_exact":"exact_filter";filters.clear();
     }
   }
