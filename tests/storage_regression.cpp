@@ -22,14 +22,15 @@ int reject_direct=0;unsigned direct_rejections=0;
 int kill_append_write_stage=0;
 bool audit_io=false;
 unsigned direct_opens=0,data_syncs=0,full_syncs=0,cache_drops=0,data_file_syncs=0,wal_file_syncs=0;
-unsigned extent_write_calls=0;
+unsigned extent_write_calls=0,data_cache_drops=0;
+unsigned required_data_syncs=0;
 unsigned sync_interruptions=0,index_read_interruptions=0,index_write_interruptions=0;
 std::string descriptor_path(int fd){
  char path[512];auto link="/proc/self/fd/"+std::to_string(fd);auto n=::readlink(link.c_str(),path,sizeof(path));
  return n>0?std::string(path,static_cast<size_t>(n)):std::string{};
 }
 bool shadow_index(int fd){return descriptor_path(fd).find("/index/")!=std::string::npos;}
-void reset_audit(){extent_write_calls=0;direct_opens=data_syncs=full_syncs=cache_drops=data_file_syncs=wal_file_syncs=0;}
+void reset_audit(){data_cache_drops=required_data_syncs=0;extent_write_calls=0;direct_opens=data_syncs=full_syncs=cache_drops=data_file_syncs=wal_file_syncs=0;}
 }
 extern "C" int open(const char* path,int flags,...){
  if(audit_io&&(flags&O_DIRECT))++direct_opens;
@@ -56,10 +57,12 @@ extern "C" ssize_t pwrite(int fd,const void* data,size_t n,off_t offset){
 extern "C" int fdatasync(int fd){if(audit_io){++data_syncs;if(descriptor_path(fd).find("/wal")!=std::string::npos)++wal_file_syncs;}if(sync_interruptions){--sync_interruptions;errno=EINTR;return -1;}return static_cast<int>(::syscall(SYS_fdatasync,fd));}
 extern "C" int fsync(int fd){if(audit_io){++full_syncs;if(descriptor_path(fd).find("/data/")!=std::string::npos)++data_file_syncs;}if(sync_interruptions){--sync_interruptions;errno=EINTR;return -1;}return static_cast<int>(::syscall(SYS_fsync,fd));}
 extern "C" int posix_fadvise(int fd,off_t offset,off_t length,int advice) noexcept {
- if(audit_io&&advice==POSIX_FADV_DONTNEED)++cache_drops;
+ if(audit_io&&advice==POSIX_FADV_DONTNEED){++cache_drops;
+  if(descriptor_path(fd).find("/data/")!=std::string::npos){++data_cache_drops;assert(offset==0&&length==0);assert(data_file_syncs>=required_data_syncs);}
+ }
  auto result=::syscall(SYS_fadvise64,fd,offset,length,advice);return result<0?errno:static_cast<int>(result);
 }
-const std::filesystem::path base="/tmp/mvdb_storage_phase3";
+const std::filesystem::path base=std::getenv("MVDB_STORAGE_TEST_ROOT")?std::getenv("MVDB_STORAGE_TEST_ROOT"):"/tmp/mvdb_storage_phase3";
 void multifile_cache_retention(){
  for(size_t limit:{size_t(9227468),size_t(10485760)}){
   auto dir=base/("multifile_"+std::to_string(limit));std::filesystem::create_directories(dir);
@@ -73,6 +76,62 @@ void multifile_cache_retention(){
   audit_io=false;assert(cache_drops==0);assert(budget.peak<=limit);
  }
 }
+// Handoff is one global proof over data/, never a per-file scan decision.
+void quiescent_cache_handoff(){
+ const size_t limit=10*1024*1024;
+ auto disk_pages=[](const std::filesystem::path& path,size_t pages){
+  std::ofstream out(path,std::ios::binary);Page bytes{};
+  for(size_t i=0;i<pages;++i)out.write(reinterpret_cast<const char*>(bytes.data()),PAGE);
+ };
+ {
+  Storage s(base/"handoff_small",limit);s.begin();Page p{};p[0]=std::byte(17);
+  // More files than descriptor slots, including both metadata classes.
+  for(int i=0;i<20;++i)s.write("f"+std::to_string(i),0,p);
+  s.write("t.header",0,p);s.write("t.pk",0,p);
+  reset_audit();audit_io=true;assert(!s.quiescent_handoff());audit_io=false;
+  assert(data_cache_drops==0&&data_file_syncs==0);
+  s.commit();assert(s.pool.lifetime_evictions==0);auto reads=s.pool.physical_reads;
+  reset_audit();required_data_syncs=22;audit_io=true;
+  assert(s.quiescent_handoff());audit_io=false;
+  assert(data_cache_drops==22&&data_file_syncs==22&&s.pool.quiescent_handoffs==1);
+  assert(s.pool.physical_reads==reads);
+  reset_audit();required_data_syncs=22;audit_io=true;
+  s.checkpoint([&](size_t stage){if(stage==1)assert(data_cache_drops==22&&data_file_syncs==22);});audit_io=false;
+  assert(data_cache_drops==22&&s.pool.quiescent_handoffs==2);
+  s.begin();reset_audit();audit_io=true;bool rejected=false;
+  try{s.checkpoint();}catch(const std::runtime_error&){rejected=true;}
+  assert(rejected&&!s.quiescent_handoff());audit_io=false;assert(data_cache_drops==0&&data_file_syncs==0);s.rollback();
+ }
+ for(const std::string kind:{"missing","unopened_metadata","unaligned","evicted","dirty_large","small_budget"}){
+  auto dir=base/("handoff_"+kind);Storage s(dir,kind=="small_budget"?8*1024*1024:limit);
+  disk_pages(dir/"data"/"t.v1",2);s.read("t.v1",0);
+  if(kind!="missing")s.read("t.v1",1);
+  if(kind=="unopened_metadata")disk_pages(dir/"data"/"t.pk",1);
+  if(kind=="unaligned"){std::ofstream out(dir/"data"/"bad.header");out<<"x";}
+  if(kind=="evicted"){
+   for(size_t i=0;i<600;++i)s.read("scan",i);
+   assert(s.pool.lifetime_evictions>0);s.pool.invalidate_prefix("scan");std::filesystem::remove(dir/"data"/"scan");
+   s.read("t.v1",0);s.read("t.v1",1);
+  }
+  if(kind=="dirty_large"){
+   s.begin();Page p{};p[0]=std::byte(23);
+   for(size_t i=0;i<450;++i)s.write("large",i,p);
+   s.commit();assert(s.pool.lifetime_evictions==0);
+  }
+  reset_audit();audit_io=true;assert(!s.quiescent_handoff());audit_io=false;
+  assert(data_cache_drops==0&&data_file_syncs==0&&s.pool.quiescent_handoffs==0);
+  reset_audit();audit_io=true;s.checkpoint();audit_io=false;assert(data_cache_drops==0);
+ }
+ for(size_t bytes:{size_t(9227468),size_t(10485760)}){
+  auto dir=base/("handoff_multifile_"+std::to_string(bytes));Storage s(dir,bytes);
+  for(int file=0;file<4;++file)disk_pages(dir/"data"/("f"+std::to_string(file)),256);
+  reset_audit();audit_io=true;
+  for(int pass=0;pass<2;++pass)for(int page=0;page<256;++page)for(int file=0;file<4;++file)s.read("f"+std::to_string(file),page);
+  assert(!s.quiescent_handoff());s.checkpoint();audit_io=false;
+  assert(data_cache_drops==0&&s.pool.lifetime_evictions>0);
+ }
+}
+
 template<class F> void child(F action,bool killed=false){auto c=fork();assert(c>=0);if(!c){action();_exit(0);}int status;assert(waitpid(c,&status,0)==c);assert(killed?WIFSIGNALED(status)&&WTERMSIG(status)==SIGKILL:WIFEXITED(status)&&WEXITSTATUS(status)==0);}
 void kill_now(){::kill(getpid(),SIGKILL);}
 // Returning to implicit direct I/O would make default reads fail this audit.
@@ -113,7 +172,7 @@ void transaction_sync_boundary(){
  assert(s.wal_syncs-syncs==1);
  reset_audit();audit_io=true;
  s.checkpoint([&](size_t stage){if(stage==1)assert(data_file_syncs>0);});audit_io=false;
- assert(data_file_syncs>0&&full_syncs>0&&cache_drops>0);
+ assert(data_file_syncs>0&&full_syncs>0&&cache_drops==0&&data_cache_drops==0);
 }
 // Graceful shutdown signals may interrupt a checkpoint or shadow operation.
 // Retry these syscall boundaries rather than turning a signal into I/O failure.
@@ -238,8 +297,8 @@ int main(int argc,char** argv){
  }
  ::unsetenv("MVDB_USE_ODIRECT");
  if(argc==2){std::filesystem::remove_all(base);std::string test=argv[1];
-  if(test=="buffered")buffered_default();else if(test=="metadata")metadata_scan();else if(test=="sync")transaction_sync_boundary();else if(test=="interrupt")interrupted_io();else if(test=="append")invisible_append();else if(test=="resident")resident_handles();else if(test=="batch")batched_append();else return 2;return 0;}
- std::filesystem::remove_all(base);buffered_default();metadata_scan();transaction_sync_boundary();interrupted_io();invisible_append();batched_append();resident_handles();
+  if(test=="handoff")quiescent_cache_handoff();else if(test=="buffered")buffered_default();else if(test=="metadata")metadata_scan();else if(test=="sync")transaction_sync_boundary();else if(test=="interrupt")interrupted_io();else if(test=="append")invisible_append();else if(test=="resident")resident_handles();else if(test=="batch")batched_append();else return 2;return 0;}
+ std::filesystem::remove_all(base);quiescent_cache_handoff();buffered_default();metadata_scan();transaction_sync_boundary();interrupted_io();invisible_append();batched_append();resident_handles();
  for(int mode=1;mode<=3;mode++){
   ::setenv("MVDB_USE_ODIRECT","1",1);
   auto fallback=base/("direct_fallback"+std::to_string(mode));reject_direct=mode;direct_rejections=0;

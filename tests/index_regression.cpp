@@ -5,12 +5,32 @@
 #include <cassert>
 #include <filesystem>
 #include <iostream>
+#include <fstream>
+#include <cstring>
 #include <set>
 #include <unistd.h>
 using namespace mvdb;
+void compact_crash_regressions();
 static std::vector<int64_t> ids(Engine& e,const std::string& q){std::vector<int64_t> out;e.execute(q).each([&](const auto& r){out.push_back(std::get<int64_t>(r[0]));});return out;}
 static std::string query(const std::string& vector,const std::string& filter="") {return "SELECT id,L2_distance(v,'"+vector+"') AS d FROM t "+filter+" ORDER BY d,id LIMIT 10;";}
+// Produce an old .index/.ivf fixture from a committed compact image. The
+// private header fields retain their offsets; find the fixed namespace string.
+static void legacy_lists(const std::filesystem::path& path){
+ auto data=path/"data";std::string base;
+ for(auto& f:std::filesystem::directory_iterator(data))if(f.path().filename().string().ends_with(".lists"))base=f.path().filename().string().substr(0,f.path().filename().string().size()-6);
+ assert(!base.empty());auto old=base;old.replace(old.find(".cidx."),6,".index.");
+ std::fstream header(data/"t.header",std::ios::in|std::ios::out|std::ios::binary);std::string bytes(PAGE,'\0');header.read(bytes.data(),PAGE);auto at=bytes.find(base);assert(at!=std::string::npos);std::memset(bytes.data()+at,0,128);std::memcpy(bytes.data()+at,old.data(),old.size());header.seekp(0);header.write(bytes.data(),PAGE);header.close();
+ std::ifstream packed(data/(base+".lists"),std::ios::binary);
+ for(uint32_t b=0;b<64;++b){
+  auto read=[&](uint64_t logical){uint32_t value=0;packed.clear();packed.seekg(((logical/2048)*8+b/8)*PAGE+(b%8)*2048+logical%2048);packed.read(reinterpret_cast<char*>(&value),4);return value;};
+  uint32_t n=read(0);std::ofstream list(data/(old+".ivf"+std::to_string(b)),std::ios::binary);std::array<char,16> head{};std::memcpy(head.data(),&n,4);list.write(head.data(),head.size());
+  for(uint32_t i=0;i<n;++i){auto slot=read(16+uint64_t(i)*4);list.write(reinterpret_cast<const char*>(&slot),4);}
+  auto end=16+uint64_t(n)*4;std::string padding((PAGE-end%PAGE)%PAGE,'\0');list.write(padding.data(),padding.size());
+ }
+ for(auto suffix:{".centers",".buckets"})std::filesystem::rename(data/(base+suffix),data/(old+suffix));
+}
 int main(){
+ compact_crash_regressions();
  // Keep both strict boundaries: 25,000 active rows still calibrate regardless
  // of payload, and a larger table skips only above half its configured budget.
  assert(!detail::skip_ivf_calibration_for_payload(25000,12800000,1048576));
@@ -96,8 +116,8 @@ int main(){
   assert(ids(e,query("[0,0]","WHERE category='red'"))==std::vector<int64_t>{1});assert(e.last_route()=="ann_filter_exact"&&e.effective_nprobe()==0);
   e.execute("SET nprobe=1;");ids(e,query("[0,0]"));assert(e.last_route()=="ivf");
  }
- // A degenerate training set puts >4092 slots in bucket zero. Its slots
- // cross the compact page-zero header boundary and a following page.
+ // A degenerate training set crosses many 508/512-slot compact blocks.
+ // Generic ANN must follow the interleaved physical-page mapping.
  {
   Engine e(root/"wide_bucket",1<<20);e.execute("CREATE TABLE t (id BIGINT PRIMARY KEY,category VARCHAR(16),v VECTOR(2));");e.execute("BEGIN;");
   for(int start=0;start<4200;start+=100){std::string sql="INSERT INTO t VALUES ";for(int i=start;i<std::min(start+100,4200);++i){if(i!=start)sql+=",";sql+="("+std::to_string(i)+",'same','[0,0]')";}e.execute(sql+";");}e.execute("COMMIT;");
@@ -109,8 +129,17 @@ int main(){
   auto hot=query("[0,0]","WHERE category='same'");auto hot_ids=ids(e,hot);assert(e.read_cache_slots()==4200);assert(ids(e,hot)==hot_ids);assert(ids(e,hot)==hot_ids);
   e.execute("BEGIN;");e.execute("DELETE FROM t WHERE id=4091;");e.execute("DELETE FROM t WHERE id=4199;");e.execute("UPDATE t SET v='[1,1]' WHERE id=4092;");
   auto changed=ids(e,boundary),changed_tail=ids(e,tail);e.execute("SET search_mode=exact;");assert(ids(e,boundary)==changed&&ids(e,tail)==changed_tail);e.execute("ROLLBACK;");e.execute("SET search_mode=ann;");assert(ids(e,boundary)==before&&ids(e,tail)==last);
-  e.close();
+  // Grow across another logical block; the shared list header and swapped
+  // tail must roll back together with inserts and deletes.
+  e.execute("BEGIN;");
+  for(int start=4200;start<4700;start+=100){std::string sql="INSERT INTO t VALUES ";for(int i=start;i<start+100;++i){if(i!=start)sql+=",";sql+="("+std::to_string(i)+",'same','[0,0]')";}e.execute(sql+";");}
+  auto grown=ids(e,query("[0,0]","WHERE id>=4598"));assert(grown.front()==4598&&grown.back()==4607);
+  e.execute("DELETE FROM t WHERE id=4599;");auto removed=ids(e,query("[0,0]","WHERE id>=4598"));assert(removed.front()==4598&&removed[1]==4600);
+  e.execute("ROLLBACK;");assert(ids(e,boundary)==before&&ids(e,tail)==last);e.close();
  }
+ // The old namespace and per-bucket files remain readable and writable.
+ legacy_lists(root/"wide_bucket");
+ {Engine e(root/"wide_bucket",1<<20);e.execute("SET search_mode=ann;");e.execute("SET nprobe=64;");auto q=query("[0,0]","WHERE id>=4090");auto before=ids(e,q);assert(before.front()==4090&&before.back()==4099);e.execute("BEGIN;");e.execute("DELETE FROM t WHERE id=4091;");assert(ids(e,q)[1]==4092);e.execute("ROLLBACK;");assert(ids(e,q)==before);e.close();}
  // Bounded tables still measure recall when their payload exceeds half the
  // budget. Calibration retains only samples and Top10s, not the full payload.
  {

@@ -23,6 +23,15 @@ uint64_t scalar_hash(const Value& value){
   else throw std::runtime_error("invalid sketch scalar");
   return h;
 }
+// Compact lists interleave eight 2 KiB bucket blocks per physical page.
+// Names are versioned so existing .index regions retain their legacy layout.
+struct ListAddress {uint64_t page;size_t offset;};
+bool compact_lists(const std::string& base){return base.find(".cidx.r")!=std::string::npos;}
+std::string list_file(const std::string& base,uint32_t bucket,bool compact){return compact?base+".lists":base+".ivf"+std::to_string(bucket);}
+ListAddress list_address(bool compact,uint32_t bucket,uint64_t logical){
+  if(compact)return {(logical/2048)*8+bucket/8,(bucket%8)*2048+logical%2048};
+  return {logical/PAGE,size_t(logical%PAGE)};
+}
 constexpr off_t SPILL_CACHE_CHUNK=4*1024*1024;
 void spill_progress(FILE* f,off_t before){auto after=::ftello(f);if(before/SPILL_CACHE_CHUNK!=after/SPILL_CACHE_CHUNK)::posix_fadvise(::fileno(f),0,after/PAGE*PAGE,POSIX_FADV_DONTNEED);}
 // Sort/result files are disposable after process death. They need no durability
@@ -70,12 +79,12 @@ const float* Engine::center_view(const std::string& t,uint32_t b,size_t dim){aut
 std::vector<Value> Engine::row(const std::string& t,SlotId s,const Meta& m,const std::vector<Column>& cols,bool vectors){auto r=unpack_values(read_blob(t,m.offset,m.length));require(r.size()==cols.size(),"corrupt row width");if(vectors)for(size_t i=0;i<cols.size();++i)if(cols[i].type==Type::Vector){auto p=vector_view(t,s,i,cols[i]);r[i]=std::vector<float>(p,p+cols[i].width);}return r;}
 void Engine::bitmap(const std::string& t,SlotId slot,bool active){auto p=slot/(PAGE*8);auto page=storage.read(t+".valid",p);auto bit=slot%(PAGE*8);auto x=std::to_integer<unsigned char>(page[bit/8]);x=active?x|(1U<<(bit%8)):x&~(1U<<(bit%8));page[bit/8]=std::byte(x);storage.write(t+".valid",p,page);}
 void Engine::posting(const std::string& t,uint32_t bucket,SlotId slot,bool add){
-  auto f=t+".ivf"+std::to_string(bucket);auto h=storage.read(f,0);uint32_t n;std::memcpy(&n,h.data(),4);
-  auto get=[&](uint32_t i){uint64_t offset=16+uint64_t(i)*4;auto p=storage.read(f,offset/PAGE);uint32_t x;std::memcpy(&x,p.data()+offset%PAGE,4);return x;};
-  auto put=[&](uint32_t i,uint32_t x){uint64_t offset=16+uint64_t(i)*4;auto p=storage.read(f,offset/PAGE);std::memcpy(p.data()+offset%PAGE,&x,4);storage.write(f,offset/PAGE,p);};
+  bool compact=compact_lists(t);auto f=list_file(t,bucket,compact);auto head=list_address(compact,bucket,0);auto h=storage.read(f,head.page);uint32_t n;std::memcpy(&n,h.data()+head.offset,4);
+  auto get=[&](uint32_t i){auto a=list_address(compact,bucket,16+uint64_t(i)*4);auto p=storage.read(f,a.page);uint32_t x;std::memcpy(&x,p.data()+a.offset,4);return x;};
+  auto put=[&](uint32_t i,uint32_t x){auto a=list_address(compact,bucket,16+uint64_t(i)*4);auto p=storage.read(f,a.page);std::memcpy(p.data()+a.offset,&x,4);storage.write(f,a.page,p);};
   if(add){require(n<UINT32_MAX,"IVF list full");put(n++,slot);}else{for(uint32_t i=0;i<n;++i)if(get(i)==slot){auto last=get(n-1);--n;if(i<n)put(i,last);break;}}
-  // Slot writes can modify page zero; reload before publishing its count.
-  h=storage.read(f,0);std::memcpy(h.data(),&n,4);storage.write(f,0,h);
+  // Slot writes can modify the header's shared physical page; reload it.
+  h=storage.read(f,head.page);std::memcpy(h.data()+head.offset,&n,4);storage.write(f,head.page,h);
 }
 std::string Engine::index_base(const std::string& t,const Header& h) const {return h.index_region[0]?std::string(h.index_region):t;}
 uint32_t Engine::bucket(const std::string& t,const Header& h,SlotId slot){
@@ -122,7 +131,7 @@ void Engine::create_index(const Statement& s,const std::vector<Column>& cols){
   auto h=header(s.table);require(!h.nlist,"vector index already exists");auto col=column(cols,s.value);require(cols[col].type==Type::Vector,"index requires VECTOR column");
   uint32_t count=0;for(SlotId slot=0;slot<h.slots;++slot)if(meta(s.table,slot).active)++count;
   h.nlist=std::min<uint32_t>(count>=4096?64:8,count);h.ivector=static_cast<uint32_t>(col);require(h.nlist>0,"cannot train IVF on empty table");
-  auto region=storage.begin_region(s.table+".index");require(region.size()<sizeof(h.index_region),"index namespace too long");
+  auto region=storage.begin_region(s.table+".cidx");require(region.size()<sizeof(h.index_region),"index namespace too long");
   std::memcpy(h.index_region,region.c_str(),region.size()+1);h.active_count=count;
   auto dim=cols[col].width;
   {
@@ -326,6 +335,16 @@ bool Engine::fast_topk(const Statement& s,const Header& h,const std::vector<Colu
   }else for(size_t i=0;i<bases.size();++i){bases[i]=storage.pool.resident(c->vector_pages[i]);all_resident&=bases[i]!=nullptr;}
   std::vector<SlotId> candidates;
   std::vector<std::pair<double,uint32_t>> distances;
+  const bool selective_index=h.nlist&&!stale(h)&&!h.calibration_skipped&&h.recommended_nprobe&&h.recommended_nprobe<=h.nlist/2;
+  bool use_pruning=!(h.nlist&&h.recommended_nprobe>h.nlist/2);
+  pruning_policy=use_pruning?"enabled":"unselective_index";
+  uint32_t seed_bucket=UINT32_MAX;
+  if(!ivf&&all_resident&&!subset&&predicates.empty()&&selective_index&&selected[distance]==h.ivector){
+    double nearest=INFINITY;
+    for(uint32_t b=0;b<h.nlist;++b){auto center=c->centers.data()+size_t(b)*dim;auto d=l2_squared_fast(query.data(),center,dim,safe&&!has_extreme(center,dim));if(d<nearest){nearest=d;seed_bucket=b;}}
+    // Do not seed when the list cannot establish a full threshold.
+    if(seed_bucket!=UINT32_MAX&&c->offsets[seed_bucket+1]-c->offsets[seed_bucket]<s.limit)seed_bucket=UINT32_MAX;
+  }
   if(ivf){route="ivf";last_probes=std::min(nprobe?nprobe:h.recommended_nprobe,h.nlist);distances.reserve(h.nlist);
     for(uint32_t b=0;b<h.nlist;++b)distances.emplace_back(l2_squared_fast(query.data(),c->centers.data()+size_t(b)*dim,dim,safe&&!has_extreme(c->centers.data()+size_t(b)*dim,dim)),b);
     std::sort(distances.begin(),distances.end());
@@ -334,6 +353,18 @@ bool Engine::fast_topk(const Statement& s,const Header& h,const std::vector<Colu
     if(!all_resident){all_resident=true;for(size_t i=0;i<last_probes&&all_resident;++i){auto b=distances[i].second;for(auto at=c->offsets[b];at<c->offsets[b+1];++at)if(!bases[c->postings[at]/count]){all_resident=false;break;}}}
     if(!all_resident){candidates.reserve(h.slots);for(size_t i=0;i<last_probes;++i){auto b=distances[i].second;candidates.insert(candidates.end(),c->postings.begin()+c->offsets[b],c->postings.begin()+c->offsets[b+1]);}std::sort(candidates.begin(),candidates.end());}
   }
+  // Prefix checks amortize over larger accepted scans. This estimate changes
+  // only the distance kernel, never candidate visibility or probe selection.
+  uint64_t estimated_scan=subset?subset_end-subset_begin:h.active_count;
+  if(ivf){
+    estimated_scan=0;for(size_t i=0;i<last_probes;++i){auto b=distances[i].second;estimated_scan+=c->offsets[b+1]-c->offsets[b];}
+    if(filters.size()==1&&h.active_count){auto [column,id]=filters.front();auto& dictionary=c->dictionaries[column];
+      estimated_scan=id==UINT16_MAX?0:estimated_scan*(dictionary.offsets[id+1]-dictionary.offsets[id])/h.active_count;
+    }
+  }
+  if(key_filter)estimated_scan=1;
+  if(impossible_key)estimated_scan=0;
+  if(use_pruning&&estimated_scan<1024){use_pruning=false;pruning_policy="small_scan";}
   struct Neighbor{double squared;SlotId slot;};std::vector<Neighbor> heap;heap.reserve(s.limit);
   auto less=[&](const Neighbor& a,const Neighbor& b){
     if(a.squared!=b.squared){
@@ -350,9 +381,23 @@ bool Engine::fast_topk(const Statement& s,const Header& h,const std::vector<Colu
     for(auto [i,id]:filters)if(c->dictionaries[i].ids[slot]!=id)return false;
     return !impossible_key&&(!key_filter||c->keys[slot]==*key_filter);
   };
+  // Inflate to the existing float rejection margin. A certified partial sum
+  // above this threshold is rejected by finish just like a full float sum.
+  const auto error=std::max(1e-5,4.0*dim*std::numeric_limits<float>::epsilon());
+  double cached_worst=-1,cached_threshold=std::numeric_limits<double>::infinity();
+  auto prune_threshold=[&]() __attribute__((always_inline)) {
+    if(heap.size()!=s.limit)return std::numeric_limits<double>::infinity();
+    auto worst=heap.front().squared;
+    // Key tie changes do not affect the distance bound. Reuse the identical
+    // threshold until a new squared distance reaches the top of the heap.
+    if(worst!=cached_worst){
+      cached_threshold=std::nextafter(std::max(worst+error,worst/(1-error)),std::numeric_limits<double>::infinity());
+      cached_worst=worst;
+    }
+    return cached_threshold;
+  };
   auto finish=[&](SlotId slot,const float* p,double fast) __attribute__((always_inline)) {
     if(heap.size()==s.limit){auto worst=heap.front().squared;
-      auto error=std::max(1e-5,4.0*dim*std::numeric_limits<float>::epsilon());
       if(fast>worst+error*std::max({1.0,std::abs(fast),std::abs(worst)}))return;}
     // Every potential winner is widened, preserving underflow and SQL PK ties.
     Neighbor neighbor{l2_squared_exact(p,query.data(),dim),slot};
@@ -368,21 +413,46 @@ bool Engine::fast_topk(const Statement& s,const Header& h,const std::vector<Colu
     }
     // Borrowed pointers never survive a pool operation in the paged path.
     p=reinterpret_cast<const float*>(vector_page+(slot%count)*vector_stride);}
-    auto fast=heap.size()==s.limit?l2_squared_fast(p,query.data(),dim,safe&&!(c->flags[slot]&2)):0;
+    double fast=0;if(heap.size()==s.limit){auto normal=safe&&!(c->flags[slot]&2);
+      fast=use_pruning?l2_sq_f32_pruned(p,query.data(),dim,prune_threshold(),normal,&pruning):l2_squared_fast(p,query.data(),dim,normal);
+    }
     finish(slot,p,fast);
   };
-  auto scan=[&]<bool Resident128,bool Prefetch>(auto first,auto last){
+  auto scan=[&]<bool Resident128,bool Prefetch,bool Dense>(auto first,auto last){
     // Gather only accepted active slots. All addresses are validated before
     // entering this path; batching never introduces a pool load or eviction.
     if(all_resident){
       SlotId slots[4];const float* vectors[4];size_t filled=0;
       auto flush=[&]() __attribute__((always_inline)) {double fast[4];bool batch_safe=safe;
         for(size_t j=0;j<4;++j)batch_safe&=!(c->flags[slots[j]]&2);
-        l2_sq_f32_batch4(query.data(),vectors,dim,fast,batch_safe);
+        if(use_pruning)l2_sq_f32_batch4_pruned(query.data(),vectors,dim,prune_threshold(),fast,batch_safe,&pruning);
+        else l2_sq_f32_batch4(query.data(),vectors,dim,fast,batch_safe);
         for(size_t j=0;j<4;++j)finish(slots[j],vectors[j],fast[j]);
         filled=0;
       };
-      for(auto it=first;it!=last;++it){auto slot=*it;if(!accepts(slot))continue;
+      const bool unfiltered=filters.empty()&&!key_filter&&!impossible_key;
+      for(auto it=first;it!=last;++it){auto slot=*it;
+        if constexpr(Resident128&&Dense){
+          // Every input range is sorted and unique. Thirty-two entries with
+          // these endpoints therefore prove a complete active resident page.
+          if(unfiltered&&!(slot&31U)&&last-it>=32&&*(it+31)==slot+31){
+            // A sparse previous page can leave a partial batch. Consume those
+            // earlier candidates before entering the direct page groups.
+            for(size_t j=0;j<filled;++j)consume.template operator()<Resident128>(slots[j]);
+            filled=0;auto base=reinterpret_cast<const float*>(bases[slot>>5]);
+            for(uint32_t offset=0;offset<32;offset+=4){
+              auto first_slot=slot+offset;const float* group[4]={base+offset*128,base+(offset+1)*128,base+(offset+2)*128,base+(offset+3)*128};
+              bool batch_safe=safe&&!((c->flags[first_slot]|c->flags[first_slot+1]|c->flags[first_slot+2]|c->flags[first_slot+3])&2);
+              double fast[4];
+              if(use_pruning)l2_sq_f32_batch4_pruned(query.data(),group,128,prune_threshold(),fast,batch_safe,&pruning);
+              else l2_sq_f32_batch4(query.data(),group,128,fast,batch_safe);
+              finish(first_slot,group[0],fast[0]);finish(first_slot+1,group[1],fast[1]);
+              finish(first_slot+2,group[2],fast[2]);finish(first_slot+3,group[3],fast[3]);
+            }
+            dense_groups+=8;it+=31;continue;
+          }
+        }
+        if(!accepts(slot))continue;
         slots[filled]=slot;
         if constexpr(Resident128)vectors[filled]=reinterpret_cast<const float*>(bases[slot>>5]+((slot&31U)<<9));
         else vectors[filled]=reinterpret_cast<const float*>(bases[slot/count]+(slot%count)*vector_stride);
@@ -398,10 +468,18 @@ bool Engine::fast_topk(const Statement& s,const Header& h,const std::vector<Colu
     }else for(auto it=first;it!=last;++it)consume.template operator()<Resident128>(*it);
   };
   auto run=[&]<bool Resident128,bool Prefetch>(){
-    if(subset)scan.template operator()<Resident128,Prefetch>(subset->postings.begin()+subset_begin,subset->postings.begin()+subset_end);
-    else if(ivf&&all_resident){for(size_t i=0;i<last_probes;++i){auto b=distances[i].second;scan.template operator()<Resident128,Prefetch>(c->postings.begin()+c->offsets[b],c->postings.begin()+c->offsets[b+1]);}}
-    else if(ivf)scan.template operator()<Resident128,Prefetch>(candidates.begin(),candidates.end());
-    else scan.template operator()<Resident128,Prefetch>(c->active_slots.begin(),c->active_slots.end());
+    if(subset)scan.template operator()<Resident128,Prefetch,false>(subset->postings.begin()+subset_begin,subset->postings.begin()+subset_end);
+    else if(ivf&&all_resident){for(size_t i=0;i<last_probes;++i){auto b=distances[i].second;scan.template operator()<Resident128,Prefetch,false>(c->postings.begin()+c->offsets[b],c->postings.begin()+c->offsets[b+1]);}}
+    else if(ivf)scan.template operator()<Resident128,Prefetch,false>(candidates.begin(),candidates.end());
+    else if(seed_bucket!=UINT32_MAX){
+      auto first=c->postings.begin()+c->offsets[seed_bucket],last=c->postings.begin()+c->offsets[seed_bucket+1];
+      scan.template operator()<Resident128,Prefetch,false>(first,last);
+      // Merge the sorted ranges once. The workspace already reserves one
+      // SlotId per row, and the remainder retains sequential vector access.
+      candidates.reserve(c->active_slots.size());auto seed=first;
+      for(auto slot:c->active_slots){if(seed!=last&&*seed==slot)++seed;else candidates.push_back(slot);}
+      scan.template operator()<Resident128,Prefetch,true>(candidates.begin(),candidates.end());
+    }else scan.template operator()<Resident128,Prefetch,true>(c->active_slots.begin(),c->active_slots.end());
   };
   // The common 128D resident path uses fixed shifts/masks. Exact scans already
   // visit slots in storage order; prefetching every next slot adds no value.
@@ -416,7 +494,7 @@ bool Engine::fast_topk(const Statement& s,const Header& h,const std::vector<Colu
 }
 Result Engine::execute(const std::string& sql){
   try {
-  last_probes=last_lists=last_recommended=0;route="none";
+  last_probes=last_lists=last_recommended=0;route="none";pruning_policy="generic";
   if(is_insert(sql)){
     read_cache.reset();Reservation input(storage.budget,sql.size()+512);
     bool automatic=!storage.in_transaction();if(automatic)storage.begin();auto point=storage.savepoint();
@@ -431,8 +509,13 @@ Result Engine::execute(const std::string& sql){
   if(s.kind==Statement::Rollback){storage.rollback();return {};}
   if(s.kind==Statement::Set){if(s.setting=="search_mode"){require(s.value=="exact"||s.value=="ann","invalid local search mode");ann=s.value=="ann";}else if(s.setting=="nprobe"){auto value=convert({s.value,false},{"",Type::Bigint});auto n=std::get<int64_t>(value);require(n>=0&&n<=64,"nprobe must be 0..64");nprobe=static_cast<uint32_t>(n);}else throw std::runtime_error("unknown local setting");return {};}
   bool writes=s.kind!=Statement::Select;bool automatic=writes&&!storage.in_transaction();if(automatic)storage.begin();auto point=storage.savepoint();
-  try{auto result=execute_inner(s);if(automatic)storage.commit();return result;}
+  Result result;
+  try{result=execute_inner(s);if(automatic)storage.commit();}
   catch(...){if(writes){storage.rollback_to(point);if(automatic)storage.rollback();}throw;}
+  // The durable commit is authoritative. Failure to release redundant kernel
+  // cache pages is optional and cannot roll back or fail the committed DDL.
+  if(automatic&&s.kind==Statement::CreateIndex){try{storage.quiescent_handoff();}catch(const std::exception&){}}
+  return result;
   }catch(...){read_cache.reset();throw;}
 }
 Result Engine::insert_stream(const std::string& sql){
@@ -542,7 +625,7 @@ Result Engine::execute_inner(const Statement& s){
     return reinterpret_cast<const float*>(lease.data+(slot%count)*stride(cols[c]));
   };
   for(uint64_t start=0;start<h.slots;start+=4096){std::array<uint64_t,64> candidates{};
-    if(use_ivf){for(auto b:buckets){auto f=index_base(s.table,h)+".ivf"+std::to_string(b);auto page=storage.read(f,0);uint32_t count;std::memcpy(&count,page.data(),4);for(uint32_t i=0;i<count;++i){uint64_t offset=16+uint64_t(i)*4;if(offset%PAGE==0)page=storage.read(f,offset/PAGE);uint32_t slot;std::memcpy(&slot,page.data()+offset%PAGE,4);if(slot>=start&&slot<start+4096)candidates[(slot-start)/64]|=uint64_t(1)<<((slot-start)%64);}}}
+    if(use_ivf){for(auto b:buckets){auto base=index_base(s.table,h);bool compact=compact_lists(base);auto f=list_file(base,b,compact);auto a=list_address(compact,b,0);auto page=storage.read(f,a.page);auto current_page=a.page;uint32_t count;std::memcpy(&count,page.data()+a.offset,4);for(uint32_t i=0;i<count;++i){a=list_address(compact,b,16+uint64_t(i)*4);if(a.page!=current_page){page=storage.read(f,a.page);current_page=a.page;}uint32_t slot;std::memcpy(&slot,page.data()+a.offset,4);if(slot>=start&&slot<start+4096)candidates[(slot-start)/64]|=uint64_t(1)<<((slot-start)%64);}}}
     else candidates.fill(UINT64_MAX);
     std::array<uint64_t,64> visible{};
     auto valid=storage.pool.view(s.table+".valid",start/(PAGE*8));

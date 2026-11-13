@@ -1,6 +1,7 @@
 #pragma once
 #include "sql.hpp"
 #include "storage.hpp"
+#include "simd.hpp"
 #include <cstdio>
 #include <memory>
 namespace mvdb {
@@ -21,6 +22,9 @@ struct Result {
 };
 class Engine {
   Storage storage;
+  L2PruneCounters pruning;
+  uint64_t dense_groups=0;
+  std::string pruning_policy="none";
   bool ann=false;
   uint32_t nprobe=0; // Zero selects the persisted calibration and cost model.
   uint32_t last_probes=0,last_lists=0,last_recommended=0;
@@ -99,9 +103,16 @@ public:
   uint32_t last_nlist() const{return last_lists;}
   uint32_t last_recommended_nprobe() const{return last_recommended;}
   const std::string& last_route() const{return route;}
+  const std::string& last_pruning_policy() const{return pruning_policy;}
+  uint64_t dense_page_groups() const{return dense_groups;}
+  const L2PruneCounters& pruning_counters() const{return pruning;}
+  void reset_pruning_counters(){pruning={};}
   uint64_t vector_page_reads() const {return storage.pool.vector_reads;}
   size_t budget_peak() const {return storage.budget.peak;}
   uint64_t spill_bytes() const;
+  uint64_t lifetime_evictions() const{return storage.pool.lifetime_evictions;}
+  uint64_t quiescent_handoffs() const{return storage.pool.quiescent_handoffs;}
+  size_t frame_capacity_bytes() const{return storage.pool.frame_capacity_bytes();}
   uint64_t data_page_write_bytes() const{return storage.pool.data_page_write_bytes;}
   uint64_t undo_spill_bytes() const{return storage.undo_spill_bytes;}
   uint64_t wal_bytes_written() const{return storage.wal_bytes_written;}

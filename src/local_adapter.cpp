@@ -156,6 +156,9 @@ int main(int argc,char** argv){
       metrics.number("wal_syncs",engine.wal_syncs());
       metrics.number("vector_page_reads",engine.vector_page_reads()-before);
       metrics.number("budget_peak",engine.budget_peak());
+      metrics.number("buffer_pool_evictions",engine.lifetime_evictions());
+      metrics.number("buffer_pool_capacity_bytes",engine.frame_capacity_bytes());
+      metrics.number("quiescent_handoffs",engine.quiescent_handoffs());
       metrics.number("spill_bytes",engine.spill_bytes()-spill_before);
       metrics.number("data_page_write_bytes",engine.data_page_write_bytes());
       metrics.number("undo_spill_bytes",engine.undo_spill_bytes());
@@ -179,6 +182,9 @@ int main(int argc,char** argv){
     metrics.number("undo_spill_bytes",engine.undo_spill_bytes());
     metrics.number("wal_bytes_written",engine.wal_bytes_written());
     metrics.number("budget_peak",engine.budget_peak());
+    metrics.number("buffer_pool_evictions",engine.lifetime_evictions());
+    metrics.number("buffer_pool_capacity_bytes",engine.frame_capacity_bytes());
+    metrics.number("quiescent_handoffs",engine.quiescent_handoffs());
     metrics.number("process_read_bytes",read_bytes);
     metrics.number("process_write_bytes",write_bytes);
     metrics.number("vm_hwm_bytes",high_water);

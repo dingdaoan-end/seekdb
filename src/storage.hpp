@@ -29,6 +29,7 @@ struct MemoryBudget {
 // A fixed userspace allocation: frame and replacement metadata grow only with
 // frame count. Buffered I/O also uses reclaimable, externally charged kernel cache.
 class BufferPool {
+  friend class Storage;
   struct Frame { std::string file; uint64_t page=0, age=0, version=0; bool valid=false, dirty=false, uncommitted=false, metadata=false; uint32_t pins=0; };
   std::filesystem::path directory;
   MemoryBudget& budget;
@@ -41,6 +42,8 @@ class BufferPool {
   int descriptor(const std::string&);
   size_t pin(const std::string&, uint64_t);
   void flush(size_t);
+  bool handoff_eligible(bool clean) const;
+  bool handoff_clean_cache();
 public:
   struct PageGuard {
     BufferPool* owner=nullptr;size_t frame=0;const std::byte* data=nullptr;
@@ -65,6 +68,9 @@ public:
   void invalidate_prefix(const std::string&);
   void sync_all();
   uint64_t physical_reads=0,vector_reads=0,data_page_write_bytes=0;
+  // Monotonic across transactions/checkpoints; scans count as replacements.
+  uint64_t lifetime_evictions=0,quiescent_handoffs=0;
+  size_t frame_capacity_bytes() const { return frames.size()*PAGE; }
   BufferPool(std::filesystem::path, MemoryBudget&);
   ~BufferPool();
   BufferPool(const BufferPool&)=delete;
@@ -118,6 +124,9 @@ public:
   // Includes recovery and checkpoint epoch initialization; use deltas for commits.
   uint64_t wal_syncs=0;
   void checkpoint(const std::function<void(size_t)>& stage={});
+  // Optional committed statement boundary. No work during an active TX.
+  // A hint is allowed only after a global resident/clean proof and all fsyncs.
+  bool quiescent_handoff();
   bool in_transaction() const { return active; }
   uint64_t savepoint() const { return undo_top; }
   void begin();

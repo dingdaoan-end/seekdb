@@ -80,6 +80,25 @@ int main(){
    size_t none=0;e.execute("SELECT id,L2_DISTANCE(v,'[0,0]') AS d FROM extremes WHERE id=2 AND id=3 ORDER BY d LIMIT 4;").each([&](const auto&){++none;});assert(none==0);
    assert(e.budget_peak()<=(1U<<20));
   }
+  // Broad calibrated probes indicate an unselective index. Keep resident
+  // batches on the plain kernel rather than paying prefix checks on uniforms.
+  {mvdb::Engine e(root/"uniform_pruning_policy",2<<20);
+   e.execute("CREATE TABLE t (id BIGINT PRIMARY KEY,v VECTOR(128));");
+   uint32_t state=123456789;std::string zero="[0";for(int j=1;j<128;++j)zero+=",0";zero+="]";
+   e.execute("BEGIN;");for(int start=0;start<256;start+=32){std::string sql="INSERT INTO t VALUES ";for(int i=start;i<start+32;++i){if(i!=start)sql+=",";std::string v="[";for(int j=0;j<128;++j){state^=state<<13;state^=state>>17;state^=state<<5;if(j)v+=",";v+=std::to_string(int(state%201)-100);}v+="]";sql+="("+std::to_string(i)+",'"+v+"')";}e.execute(sql+";");}e.execute("COMMIT;");e.execute("CREATE VECTOR INDEX vi ON t(v);");
+   assert(e.recommended_nprobe("t")>4);
+   auto ranked=[&](bool generic){std::vector<std::pair<int64_t,double>> out;e.execute("SELECT id,L2_DISTANCE(v,'"+zero+"') AS d"+(generic?",id AS again":"")+" FROM t ORDER BY d,id LIMIT 10;").each([&](const auto& r){out.emplace_back(std::get<int64_t>(r[0]),std::get<double>(r[1]));});return out;};
+   auto expected=ranked(true);e.reset_pruning_counters();for(int pass=0;pass<3;++pass)assert(ranked(false)==expected);assert(e.last_pruning_policy()=="unselective_index"&&e.pruning_counters().trials==0);
+   e.execute("SET search_mode=ann;");e.execute("SET nprobe=8;");for(int pass=0;pass<2;++pass)assert(ranked(false)==expected);assert(e.last_pruning_policy()=="unselective_index"&&e.pruning_counters().trials==0);
+  }
+  // Seeding a different list first must preserve sqrt-rounded distance ties.
+  {mvdb::Engine e(root/"seed_rounded",2<<20);
+   e.execute("CREATE TABLE t (id BIGINT PRIMARY KEY,v VECTOR(128));");
+   std::string zero="[0",one="[1",near="[1";for(int j=1;j<128;++j){zero+=",0";one+=",0";near+=j==127?",1.5e-8":",0";}zero+="]";one+="]";near+="]";
+   e.execute("INSERT INTO t VALUES (2,'"+one+"'),(1,'"+near+"');");e.execute("CREATE VECTOR INDEX vi ON t(v);");
+   auto ranked=[&](bool generic){std::vector<std::pair<int64_t,double>> out;e.execute("SELECT id,L2_DISTANCE(v,'"+zero+"') AS d"+(generic?",id AS again":"")+" FROM t ORDER BY d,id LIMIT 1;").each([&](const auto& r){out.emplace_back(std::get<int64_t>(r[0]),std::get<double>(r[1]));});return out;};
+   auto expected=ranked(true);assert(expected.front().first==1&&expected.front().second==1);for(int pass=0;pass<3;++pass)assert(ranked(false)==expected);
+  }
   // The measured workload specifies an explicit ascending PK tiebreaker.
   // Both the projected alias and the underlying column must use the cache.
   {mvdb::Engine e(root/"cache_order_shape",12<<20);
@@ -90,6 +109,14 @@ int main(){
     std::vector<int64_t> ids;e.execute("SELECT id AS pk,L2_DISTANCE(v,'"+zero+"') AS d FROM t WHERE category='same' ORDER BY d,"+suffix+" LIMIT 10;").each([&](const auto& r){ids.push_back(std::get<int64_t>(r[0]));});
     assert(ids.size()==10&&ids.front()==0&&ids.back()==9);assert(e.read_cache_slots()==140);
    }
+   // Full pages use eight direct four-vector groups. A deletion at slot32
+   // makes the next page sparse and leaves pending candidates before page64.
+   e.execute("SELECT id,L2_DISTANCE(v,'"+zero+"') AS d FROM t ORDER BY d,id LIMIT 10;");
+   assert(e.dense_page_groups()>0);
+   assert(e.last_pruning_policy()=="small_scan"&&e.pruning_counters().trials==0);
+   e.execute("DELETE FROM t WHERE id=107;");
+   auto dense_ranked=[&](bool generic){std::vector<std::pair<int64_t,double>> out;e.execute("SELECT id,L2_DISTANCE(v,'"+zero+"') AS d"+(generic?",id AS again":"")+" FROM t ORDER BY d,id LIMIT 10;").each([&](const auto& r){out.emplace_back(std::get<int64_t>(r[0]),std::get<double>(r[1]));});return out;};
+   auto dense_expected=dense_ranked(true);auto groups=e.dense_page_groups();for(int pass=0;pass<3;++pass)assert(dense_ranked(false)==dense_expected);assert(e.dense_page_groups()>groups);
    std::vector<int64_t> descending;e.execute("SELECT id,L2_DISTANCE(v,'"+zero+"') AS d FROM t ORDER BY d,id DESC LIMIT 10;").each([&](const auto& r){descending.push_back(std::get<int64_t>(r[0]));});
    assert(descending.front()==139&&descending.back()==130&&e.read_cache_slots()==0);
   }
@@ -107,6 +134,10 @@ int main(){
     auto ranked=[&](bool generic){std::vector<int64_t> ids;e.execute("SELECT id,L2_DISTANCE(v,'"+zero+"') AS d"+(generic?",id AS again":"")+" FROM t"+filter+" ORDER BY d,id LIMIT 29;").each([&](const auto& r){ids.push_back(std::get<int64_t>(r[0]));});return ids;};
     auto expected=ranked(true);for(int pass=0;pass<3;++pass)assert(ranked(false)==expected);
    }
+   e.execute("CREATE VECTOR INDEX vi ON t(v);");
+   auto indexed=[&](bool generic){std::vector<std::pair<int64_t,double>> out;e.execute("SELECT id,L2_DISTANCE(v,'"+zero+"') AS d"+(generic?",id AS again":"")+" FROM t ORDER BY d,id LIMIT 29;").each([&](const auto& r){out.emplace_back(std::get<int64_t>(r[0]),std::get<double>(r[1]));});return out;};
+   auto expected=indexed(true);for(int pass=0;pass<3;++pass)assert(indexed(false)==expected);
+   e.execute("BEGIN;");e.execute("INSERT INTO t VALUES (-1,'same','"+zero+"');");e.execute("DELETE FROM t WHERE id=99;");auto changed=indexed(true);for(int pass=0;pass<3;++pass)assert(indexed(false)==changed);e.execute("ROLLBACK;");assert(indexed(false)==expected);
    assert(e.budget_peak()<=(2U<<20));
   }
   // A failed streamed batch can leave unreachable append-only Meta bytes.

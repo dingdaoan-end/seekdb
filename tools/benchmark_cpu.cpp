@@ -22,14 +22,20 @@ int main(int argc,char** argv){
     mvdb::Engine engine(argv[1],budget);engine.execute(std::string("SET SEARCH_MODE = ")+argv[3]+";");
     // A full pass establishes the same deterministic in-process warmup.
     for(auto& sql:queries)engine.execute(sql).each([&](const auto& row){checksum+=static_cast<uint64_t>(std::get<int64_t>(row[0]));});
+    engine.reset_pruning_counters();
     auto pages=engine.vector_page_reads();start=Clock::now();
     for(unsigned r=0;r<5;++r)for(auto& sql:queries)
       engine.execute(sql).each([&](const auto& row){checksum+=static_cast<uint64_t>(std::get<int64_t>(row[0]));});
     double execute_seconds=std::chrono::duration<double>(Clock::now()-start).count()/5;
     auto reads=engine.vector_page_reads()-pages;
+    const auto& pruning=engine.pruning_counters();
+    const double trials=pruning.trials?double(pruning.trials):1;
     std::cout<<"{\"queries\":"<<queries.size()<<",\"mode\":"<<mvdb::quote(argv[3])
       <<",\"parse_seconds\":"<<parse_seconds<<",\"engine_seconds\":"<<execute_seconds
       <<",\"vector_page_loads_measured\":"<<reads<<",\"budget_bytes\":"<<budget
+      <<",\"last_query_pruning_policy\":"<<mvdb::quote(engine.last_pruning_policy())
+      <<",\"pruning_trials\":"<<pruning.trials<<",\"pruned32\":"<<pruning.pruned32<<",\"pruned64\":"<<pruning.pruned64
+      <<",\"pruned32_rate\":"<<pruning.pruned32/trials<<",\"pruned64_rate\":"<<pruning.pruned64/trials
       <<",\"checksum\":"<<checksum<<"}\n";
     engine.close();
   }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}
