@@ -60,6 +60,19 @@ extern "C" int posix_fadvise(int fd,off_t offset,off_t length,int advice) noexce
  auto result=::syscall(SYS_fadvise64,fd,offset,length,advice);return result<0?errno:static_cast<int>(result);
 }
 const std::filesystem::path base="/tmp/mvdb_storage_phase3";
+void multifile_cache_retention(){
+ for(size_t limit:{size_t(9227468),size_t(10485760)}){
+  auto dir=base/("multifile_"+std::to_string(limit));std::filesystem::create_directories(dir);
+  Page bytes{};
+  for(int file=0;file<4;++file){std::ofstream out(dir/("f"+std::to_string(file)),std::ios::binary);
+   for(int page=0;page<256;++page){bytes[0]=std::byte((file+page)%251);out.write(reinterpret_cast<const char*>(bytes.data()),PAGE);}}
+  MemoryBudget budget(limit);BufferPool pool(dir,budget);
+  reset_audit();audit_io=true;
+  for(int pass=0;pass<3;++pass)for(int page=0;page<256;++page)for(int file=0;file<4;++file){
+   auto bytes=pool.get("f"+std::to_string(file),page);assert(bytes[0]==std::byte((file+page)%251));}
+  audit_io=false;assert(cache_drops==0);assert(budget.peak<=limit);
+ }
+}
 template<class F> void child(F action,bool killed=false){auto c=fork();assert(c>=0);if(!c){action();_exit(0);}int status;assert(waitpid(c,&status,0)==c);assert(killed?WIFSIGNALED(status)&&WTERMSIG(status)==SIGKILL:WIFEXITED(status)&&WEXITSTATUS(status)==0);}
 void kill_now(){::kill(getpid(),SIGKILL);}
 // Returning to implicit direct I/O would make default reads fail this audit.
@@ -71,22 +84,6 @@ void buffered_default(){
   assert(direct_opens==0&&cache_drops==0);
  }
  ::unsetenv("MVDB_USE_ODIRECT");
-}
-// A budget above 8 MiB is insufficient when one vector file exceeds its
-// frame arena. Preserve kernel cache for that case, including phase handoff.
-void oversized_cache_guard(){
- for(size_t memory:{size_t(4),size_t(8),size_t(10)})for(bool oversized:{false,true}){
-  auto d=base/("cache_guard_"+std::to_string(memory)+(oversized?"_large":"_small"));
-  Storage s(d,memory*1024*1024);auto file=d/"data"/"t.v1";
-  {std::ofstream out(file,std::ios::binary);assert(out.good());}
-  std::filesystem::resize_file(file,(oversized?16:4)*1024*1024);
-  auto reads=s.pool.physical_reads;reset_audit();audit_io=true;
-  s.read("t.v1",0);s.read("t.v1",1);audit_io=false;
-  assert(s.pool.physical_reads==reads+2);
-  assert(cache_drops==(memory>8&&!oversized?2u:0u));
-  reset_audit();audit_io=true;s.reclaim_clean_pages();audit_io=false;
-  assert(data_file_syncs>0&&cache_drops==(memory>8&&!oversized?2u:0u));
- }
 }
 // A three-frame pool must retain hot table and primary metadata across a
 // streaming payload scan, while still admitting payload and dirty evictions.
@@ -221,49 +218,6 @@ void batched_append(){
   s.append_bytes("t.v1",1,0,batch.data(),batch.size());s.commit();kill_now();},true);
  {Storage s(d,65536);assert(s.read("t.v1",0)[0]==std::byte(9));assert(s.read("t.v1",1)[0]==std::byte(42));}
 }
-// Invisible append batches must not read or evict payload frames. Existing
-// resident prefixes still receive the appended bytes immediately.
-void lazy_append(){
- Storage s(base/"lazy_append",65536);s.begin();
- auto header=s.pool.handle("t.header",0),primary=s.pool.handle("t.pk",0);
- auto reads=s.pool.physical_reads;std::array<std::byte,512> bytes;bytes.fill(std::byte(42));
- assert(!s.pool.find("t.v1",0));
- for(unsigned i=0;i<80;i++)s.append_bytes("t.v1",i,512,bytes.data(),bytes.size());
- assert(s.pool.physical_reads==reads&&!s.pool.find("t.v1",0));
- assert(s.pool.resident(header)&&s.pool.resident(primary));
- auto p=s.read("t.v1",0);assert(p[511]==std::byte(0)&&p[512]==std::byte(42)&&p[1024]==std::byte(0));
- auto resident=s.pool.handle("t.v1",0);bytes.fill(std::byte(77));
- s.append_bytes("t.v1",0,1024,bytes.data(),bytes.size());
- assert(s.pool.resident(resident)[512]==std::byte(42)&&s.pool.resident(resident)[1024]==std::byte(77));
- s.pool.invalidate_prefix("t.v1");reads=s.pool.physical_reads;
- s.append_bytes("t.v1",0,2048,bytes.data(),bytes.size());
- assert(s.pool.physical_reads==reads&&!s.pool.find("t.v1",0));
- p=s.read("t.v1",0);assert(p[512]==std::byte(42)&&p[1024]==std::byte(77)&&p[2048]==std::byte(77));
- s.rollback();
-}
-// Fresh region pages omit payload redo. The sealed original remains available
-// through subsequent normal shadow updates and interrupted recovery/checkpoint.
-void durable_regions(){
- for(unsigned stage=0;stage<=4;stage++){
-  auto d=base/("durable_region"+std::to_string(stage));
-  child([&]{Storage s(d,65536);s.begin();auto r=s.begin_region("index");Page p{};
-   auto wal=s.wal_bytes_written,reads=s.pool.physical_reads;
-   p[0]=std::byte(42);p[PAGE-1]=std::byte(31);
-   for(unsigned i=0;i<20;i++)s.write_new(r+".lists",i,p);
-   assert(s.wal_bytes_written==wal&&s.pool.physical_reads==reads);
-   s.seal_region(r);assert(s.wal_bytes_written==wal);
-   Page h{};std::memcpy(h.data(),r.c_str(),r.size()+1);s.write("t.header",0,h);s.commit();
-   if(stage)s.checkpoint([&](size_t n){if(n==stage)kill_now();});
-   else {s.begin();p[0]=std::byte(99);s.write(r+".lists",0,p);s.pool.flush_all();kill_now();}
-  },true);
-  if(stage<3)for(int i=0;i<2;i++)child([&]{Storage s(d,65536,[](size_t n){if(n==1)kill_now();});},true);
-  Storage s(d,65536);auto h=s.read("t.header",0);std::string r(reinterpret_cast<const char*>(h.data()));
-  for(unsigned i=0;i<20;i++){auto p=s.read(r+".lists",i);assert(p[0]==std::byte(42)&&p[PAGE-1]==std::byte(31));}
- }
- auto d=base/"region_uncommitted";
- child([&]{Storage s(d,65536);s.begin();auto r=s.begin_region("index");Page p{};p[0]=std::byte(42);s.write_new(r+".lists",0,p);s.seal_region(r);Page h{};h[0]=std::byte(1);s.write("t.header",0,h);s.pool.flush_all();kill_now();},true);
- Storage s(d,65536);assert(s.read("t.header",0)[0]==std::byte(0));
-}
 void resident_handles(){
  Storage s(base/"resident_handles",65536);auto h=s.pool.handle("v",0);assert(s.pool.resident(h));
  for(unsigned i=1;i<10;i++)s.read("v",i);
@@ -274,10 +228,11 @@ void resident_handles(){
  assert(large.pool.physical_reads==reads+480&&large.budget.peak<=large.budget.limit);
 }
 int main(int argc,char** argv){
+ multifile_cache_retention();
  ::unsetenv("MVDB_USE_ODIRECT");
  if(argc==2){std::filesystem::remove_all(base);std::string test=argv[1];
-  if(test=="buffered")buffered_default();else if(test=="cache_guard")oversized_cache_guard();else if(test=="metadata")metadata_scan();else if(test=="sync")transaction_sync_boundary();else if(test=="interrupt")interrupted_io();else if(test=="append")invisible_append();else if(test=="resident")resident_handles();else if(test=="batch")batched_append();else if(test=="lazy")lazy_append();else if(test=="regions")durable_regions();else return 2;return 0;}
- std::filesystem::remove_all(base);buffered_default();oversized_cache_guard();metadata_scan();transaction_sync_boundary();interrupted_io();invisible_append();batched_append();lazy_append();durable_regions();resident_handles();
+  if(test=="buffered")buffered_default();else if(test=="metadata")metadata_scan();else if(test=="sync")transaction_sync_boundary();else if(test=="interrupt")interrupted_io();else if(test=="append")invisible_append();else if(test=="resident")resident_handles();else if(test=="batch")batched_append();else return 2;return 0;}
+ std::filesystem::remove_all(base);buffered_default();metadata_scan();transaction_sync_boundary();interrupted_io();invisible_append();batched_append();resident_handles();
  for(int mode=1;mode<=3;mode++){
   ::setenv("MVDB_USE_ODIRECT","1",1);
   auto fallback=base/("direct_fallback"+std::to_string(mode));reject_direct=mode;direct_rejections=0;

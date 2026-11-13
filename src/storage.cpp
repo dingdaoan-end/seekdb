@@ -6,7 +6,6 @@
 #include <limits>
 #include <stdexcept>
 #include <unistd.h>
-#include <sys/stat.h>
 #include <fstream>
 #include <zlib.h>
 
@@ -21,10 +20,6 @@ bool disable_direct(int fd){
   if(flags<0||!(flags&O_DIRECT))return false;
   require(::fcntl(fd,F_SETFL,flags&~O_DIRECT)==0,"buffered I/O fallback failed");
   ::posix_fadvise(fd,0,0,POSIX_FADV_RANDOM);return true;
-}
-bool file_fits_pool(int fd,size_t capacity){
-  struct stat info{};
-  return retry_eintr([&]{return ::fstat(fd,&info);})==0&&info.st_size>=0&&static_cast<uint64_t>(info.st_size)<=capacity;
 }
 ssize_t page_read(int fd,void* data,size_t n,off_t offset){
   ssize_t got;
@@ -168,9 +163,6 @@ size_t BufferPool::pin(const std::string& file,uint64_t page) {
   flush(victim);if(frames[victim].valid)lookup.erase(frames[victim].file+":"+std::to_string(frames[victim].page));auto p=arena+victim*PAGE;std::memset(p,0,PAGE);
   auto n=page_read(descriptor(file),p,PAGE,static_cast<off_t>(page*PAGE));
   require(n==0||n==static_cast<ssize_t>(PAGE),"short/corrupt data page");
-  // Hand off cache only if this file can fit in the pool. Larger files and
-  // small budgets still need kernel cache when scans revisit evicted frames.
-  if(n>0&&budget.limit>8*1024*1024){auto fd=descriptor(file);if(file_fits_pool(fd,frames.size()*PAGE))::posix_fadvise(fd,static_cast<off_t>(page*PAGE),PAGE,POSIX_FADV_DONTNEED); }
   ++physical_reads;
   auto marker=file.rfind(".v");
   if(marker!=std::string::npos&&marker+2<file.size()&&file[marker+2]>='0'&&file[marker+2]<='9')++vector_reads;
@@ -183,21 +175,17 @@ BufferPool::PageGuard BufferPool::lease(const std::string& f,uint64_t p){auto i=
 void BufferPool::put(const std::string& f,uint64_t p,const Page& bytes) {
   auto i=pin(f,p);std::memcpy(arena+i*PAGE,bytes.data(),PAGE);frames[i].dirty=true;frames[i].uncommitted=transaction_active;
 }
-std::optional<BufferPool::ResidentHandle> BufferPool::find(const std::string& f,uint64_t p) const {
-  auto it=lookup.find(f+":"+std::to_string(p));if(it==lookup.end())return {};
-  return ResidentHandle{it->second,frames[it->second].version};
-}
 BufferPool::ResidentHandle BufferPool::handle(const std::string& f,uint64_t p){auto i=pin(f,p);return {i,frames[i].version};}
 const std::byte* BufferPool::resident(ResidentHandle h) const {
   if(h.frame>=frames.size()||!frames[h.frame].valid||frames[h.frame].version!=h.version)return nullptr;
   return arena+h.frame*PAGE;
 }
-void BufferPool::flush_page(const std::string& f,uint64_t p){if(auto h=find(f,p))flush(h->frame);}
+void BufferPool::flush_page(const std::string& f,uint64_t p){flush(pin(f,p));}
 void BufferPool::append_extent(const std::string& f,uint64_t p,const Page& bytes,size_t offset,size_t length){
   append_extent_bytes(f,p,offset,bytes.data()+offset,length);
 }
 void BufferPool::append_extent_bytes(const std::string& f,uint64_t p,size_t offset,const void* bytes,size_t length){
-  auto existing=find(f,p);require(!existing||!frames[existing->frame].dirty,"append requires flushed page");
+  auto i=pin(f,p);require(!frames[i].dirty,"append requires flushed page");
   int fd=descriptor(f);
   // An extent can be unaligned; explicit O_DIRECT remains supported by switching
   // this descriptor to buffered writes before publishing the appended payload.
@@ -208,17 +196,16 @@ void BufferPool::append_extent_bytes(const std::string& f,uint64_t p,size_t offs
   if(static_cast<uint64_t>(size)<(p+1)*PAGE)require(::ftruncate(fd,static_cast<off_t>((p+1)*PAGE))==0,"append page extension failed");
   size_t remaining=length;const std::byte* source=static_cast<const std::byte*>(bytes);uint64_t position=p*PAGE+offset;
   while(remaining){auto done=retry_eintr([&]{return ::pwrite(fd,source,remaining,static_cast<off_t>(position));});require(done>0,"append write failed");source+=done;remaining-=done;position+=done;}
-  data_page_write_bytes+=length;
-  if(existing){auto i=existing->frame;std::memcpy(arena+i*PAGE+offset,bytes,length);frames[i].dirty=frames[i].uncommitted=false;}
+  data_page_write_bytes+=length;std::memcpy(arena+i*PAGE+offset,bytes,length);
+  frames[i].dirty=frames[i].uncommitted=false;
 }
 void BufferPool::committed(){transaction_active=false;for(auto& f:frames)f.uncommitted=false;}
 void BufferPool::invalidate_prefix(const std::string& prefix){
   for(auto& f:frames)if(f.valid&&(f.file==prefix||f.file.rfind(prefix+".",0)==0)){require(!f.pins,"discard pinned region");lookup.erase(f.file+":"+std::to_string(f.page));f.valid=f.dirty=false;++f.version;}
   for(auto it=descriptors.begin();it!=descriptors.end();)if(it->first==prefix||it->first.rfind(prefix+".",0)==0){::close(it->second);it=descriptors.erase(it);}else ++it;
 }
-void BufferPool::sync_all(bool release_cache){
-  for(auto& e:std::filesystem::directory_iterator(directory)){int fd=page_fd(e.path());try{require(retry_eintr([&]{return ::fsync(fd);})==0,"data file sync failed");if(release_cache)::posix_fadvise(fd,0,0,POSIX_FADV_DONTNEED);}catch(...){::close(fd);throw;}::close(fd);}sync_directory(directory);
-  if(!release_cache&&budget.limit>8*1024*1024)for(auto& f:frames)if(f.valid&&!f.dirty){auto fd=descriptor(f.file);if(file_fits_pool(fd,frames.size()*PAGE))::posix_fadvise(fd,static_cast<off_t>(f.page*PAGE),PAGE,POSIX_FADV_DONTNEED);}
+void BufferPool::sync_all(){
+  for(auto& e:std::filesystem::directory_iterator(directory)){int fd=page_fd(e.path());try{require(retry_eintr([&]{return ::fsync(fd);})==0,"data file sync failed");::posix_fadvise(fd,0,0,POSIX_FADV_DONTNEED);}catch(...){::close(fd);throw;}::close(fd);}sync_directory(directory);
 }
 void BufferPool::flush_all() {for(size_t i=0;i<frames.size();++i) flush(i);}
 
@@ -377,7 +364,7 @@ void Storage::restore_shadow(){
   require(::ftruncate(shadow,static_cast<off_t>(pos))==0,"truncate torn shadow failed");sync_file(shadow);
 }
 bool Storage::fresh_region(const std::string& file)const{
-  for(auto& r:regions)if((file==r||file.rfind(r+".",0)==0)&&std::find(sealed_regions.begin(),sealed_regions.end(),r)==sealed_regions.end())return true;
+  for(auto& r:regions)if(file==r||file.rfind(r+".",0)==0)return true;
   return false;
 }
 std::string Storage::begin_region(const std::string& prefix){
@@ -387,20 +374,8 @@ std::string Storage::begin_region(const std::string& prefix){
   for(;;){name=prefix+".r"+std::to_string(++id);int fd=::open((root/"regions"/name).c_str(),O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC,0600);if(fd>=0){sync_file(fd);::close(fd);sync_directory(root/"regions");sync_directory(root);break;}require(errno==EEXIST,"allocate region failed");}
   std::string data(1,'\0');data+=name;uint32_t n=data.size();undo_write(data.data(),n,undo_top);undo_write(reinterpret_cast<const char*>(&n),4,undo_top+n);undo_top+=n+4;regions.push_back(name);return name;
 }
-void Storage::reclaim_clean_pages(){require(!closed,"storage is closed");pool.flush_all();pool.sync_all(false);}
-void Storage::seal_region(const std::string& prefix){
-  require(active&&std::find(regions.begin(),regions.end(),prefix)!=regions.end(),"seal outside fresh region");
-  if(std::find(sealed_regions.begin(),sealed_regions.end(),prefix)!=sealed_regions.end())return;
-  // Payload becomes durable before callers publish its namespace in WAL-backed
-  // metadata. Allocation ownership survives sealing until COMMIT or rollback.
-  for(auto& e:std::filesystem::directory_iterator(root/"data")){auto name=e.path().filename().string();if(name==prefix||name.rfind(prefix+".",0)==0){int fd=page_fd(e.path());try{sync_file(fd);::posix_fadvise(fd,0,0,POSIX_FADV_DONTNEED);}catch(...){::close(fd);throw;}::close(fd);}}
-  sync_directory(root/"data");sealed_regions.push_back(prefix);
-}
-void Storage::write_new(const std::string& file,uint64_t page,const Page& bytes){
-  require(!closed&&active&&fresh_region(file),"write_new outside fresh region");
-  require(!file.empty()&&file.size()<128&&file.find('/')==std::string::npos&&file.find("..") == std::string::npos,"unsafe region file");
-  pool.flush_page(file,page);pool.append_extent_bytes(file,page,0,bytes.data(),PAGE);
-}
+void Storage::seal_region(const std::string& prefix){require(active,"seal outside transaction");regions.erase(std::remove(regions.begin(),regions.end(),prefix),regions.end());}
+void Storage::write_new(const std::string& file,uint64_t page,const Page& bytes){require(!closed&&active&&fresh_region(file),"write_new outside fresh region");write_redo(file,page,bytes);}
 void Storage::discard_region(const std::string& prefix){
   pool.invalidate_prefix(prefix);
   for(auto& e:std::filesystem::directory_iterator(root/"data")){auto name=e.path().filename().string();if(name==prefix||name.rfind(prefix+".",0)==0)std::filesystem::remove(e.path());}
@@ -414,8 +389,8 @@ void Storage::undo_read(char* p,size_t n,uint64_t offset){
   if(n)require(read_all(undo,p,n,offset-undo_capacity),"undo record missing");
 }
 void Storage::begin(){require(!closed,"storage is closed");require(!active,"transaction already active");require(::ftruncate(undo,0)==0,"undo reset failed");undo_top=0;redo_buffer.clear();transaction_crc=0;transaction_start=::lseek(wal,0,SEEK_END);record('B',"MV2");active=true;pool.transaction_active=true;}
-void Storage::commit(){require(!closed&&active,"no active transaction");try{for(auto& region:regions)if(std::find(sealed_regions.begin(),sealed_regions.end(),region)==sealed_regions.end())seal_region(region);flush_redo();std::string payload;append_value(payload,transaction_crc);record('C',payload);sync_wal();
-  active=false;pool.committed();regions.clear();sealed_regions.clear();undo_top=0;
+void Storage::commit(){require(!closed&&active,"no active transaction");try{flush_redo();std::string payload;append_value(payload,transaction_crc);record('C',payload);sync_wal();
+  active=false;pool.committed();regions.clear();undo_top=0;
   if(::lseek(wal,0,SEEK_END)>=64*1024*1024)checkpoint();
   }catch(...){closed=true;throw;}
 }
@@ -440,9 +415,8 @@ void Storage::mark_written(const std::string& f){
   cache_written(f,true);
 }
 void Storage::write_redo(const std::string& f,uint64_t p,const Page& bytes){auto old=pool.get(f,p);if(old==bytes)return;mark_written(f);record('P',delta(f,p,old,bytes));pool.put(f,p,bytes);}
-void Storage::write(const std::string& f,uint64_t p,const Page& bytes){require(!closed&&active,"write outside transaction");
+void Storage::write(const std::string& f,uint64_t p,const Page& bytes){require(!closed&&active,"write outside transaction");auto before=pool.get(f,p);if(before==bytes)return;
   if(fresh_region(f)){write_new(f,p,bytes);return;}
-  auto before=pool.get(f,p);if(before==bytes)return;
   auto data=delta(f,p,bytes,before);uint32_t n=data.size();undo_write(data.data(),n,undo_top);undo_write(reinterpret_cast<const char*>(&n),4,undo_top+n);undo_top+=n+4;
   mark_written(f);record('P',delta(f,p,before,bytes));pool.put(f,p,bytes);
 }
@@ -477,10 +451,10 @@ void Storage::append_bytes(const std::string& f,uint64_t p,size_t offset,const v
   pool.append_extent_bytes(f,p,offset,data,length);
 }
 void Storage::rollback_to(uint64_t target){require(active&&target<=undo_top,"invalid savepoint");while(undo_top>target){uint32_t n=0;undo_read(reinterpret_cast<char*>(&n),4,undo_top-4);require(n<=2*PAGE+256&&n+4<=undo_top-target,"invalid undo length");std::string data(n,'\0');undo_read(data.data(),n,undo_top-n-4);
-  if(!data.empty()&&data[0]=='\0'){auto prefix=data.substr(1);record('P',data);discard_region(prefix);regions.erase(std::remove(regions.begin(),regions.end(),prefix),regions.end());sealed_regions.erase(std::remove(sealed_regions.begin(),sealed_regions.end(),prefix),sealed_regions.end());undo_top-=n+4;continue;}
+  if(!data.empty()&&data[0]=='\0'){auto prefix=data.substr(1);record('P',data);discard_region(prefix);regions.erase(std::remove(regions.begin(),regions.end(),prefix),regions.end());undo_top-=n+4;continue;}
   std::string file;uint64_t page;Page bytes{};apply_delta(data,file,page,bytes,true);bytes=pool.get(file,page);apply_delta(data,file,page,bytes);write_redo(file,page,bytes);undo_top-=n+4;
 }}
-void Storage::rollback(){rollback_to(0);redo_buffer.clear();require(::ftruncate(wal,static_cast<off_t>(transaction_start))==0,"rollback WAL truncation failed");active=false;pool.committed();regions.clear();sealed_regions.clear();}
+void Storage::rollback(){rollback_to(0);redo_buffer.clear();require(::ftruncate(wal,static_cast<off_t>(transaction_start))==0,"rollback WAL truncation failed");active=false;pool.committed();regions.clear();}
 void Storage::checkpoint(const std::function<void(size_t)>& stage){
   if(closed)return;
   require(!active,"checkpoint inside transaction");

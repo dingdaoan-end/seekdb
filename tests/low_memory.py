@@ -18,7 +18,7 @@ class Client:
     def __init__(self, binary, root, budget, records):
         self.records = records;self.sequence = 0;self.metrics = queue.Queue()
         start = time.perf_counter()
-        self.p = subprocess.Popen([str(binary), '--data-dir', str(root), '--memory-budget', str(budget)],
+        self.p = subprocess.Popen([str(binary), '--data-dir', str(root)]+([] if budget is None else ['--memory-budget', str(budget)]),
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.final = None
         def drain():
@@ -115,13 +115,13 @@ def run(binary, budget, phase, count, require_ivf=False):
 if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('--binary',type=Path,required=True)
     p.add_argument('--phase',required=True);p.add_argument('--output',type=Path,required=True)
-    p.add_argument('--budgets',type=int,nargs='+',default=[4194304,8388608]);p.add_argument('--queries',type=int,default=1000)
+    p.add_argument('--budgets',type=int,nargs='+',default=[4194304,8388608,9227468,10485760]);p.add_argument('--queries',type=int,default=1000)
     p.add_argument('--enforce-latency',action='store_true')
     p.add_argument('--require-ivf',action='store_true',help='clustered 10k must auto-route IVF at measured probe 5')
     a=p.parse_args();assert a.queries>0 and a.queries%2==0
     report={'phase':a.phase,'binary_sha256':hashlib.sha256(a.binary.read_bytes()).hexdigest(),'datasets':[]}
     try:
-        for budget in a.budgets:
+        for budget in [*a.budgets,None]:
             result=run(a.binary.resolve(),budget,a.phase,a.queries,a.require_ivf);report['datasets'].append(result)
             a.output.parent.mkdir(parents=True,exist_ok=True);a.output.write_text(json.dumps(report,indent=2))
             print(f'{a.phase} budget={budget} maxSQL={result["max_request_seconds"]:.6f}s below0.5={result["single_sql_below_05s"]}',flush=True)
