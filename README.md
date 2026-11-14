@@ -135,34 +135,25 @@ work/build/benchmark_cpu DATA_COPY QUERY_SQL_LINES ann 10485760
 
 `benchmark_cpu`仅用于进程内归因，须使用可丢弃的数据副本，不能代替端到端成绩。
 
-Round 10为低基数字典增加有序SlotId倒排表；Exact及ANN回退扫描始终使用过滤子集。
-IVF模式仅在子集大小不超过`max(64, nprobe*active_rows/(nlist*4))`时直接扫描子集，
-其余保留桶探测与字典过滤。驻留页
-使用单查询对四向量的AVX2/FMA批处理，潜在赢家仍用float64复算。过滤ANN
-因此可返回精确Top-10，但并非所有分布都保证更低核心耗时。
+## 当前内核与历史实验
 
-R10-Safe将追加页缓存、索引格式及事务/WAL/恢复流程恢复至R9，
-保留上述内存计算优化；后续仅优化差量编码的相等字节查找，日志字节格式不变。
-不再使用`.pidx.r*`打包、冷页绕过页池直写或读后逐页回收。
-R10实验数据目录不能交给本版本直接续用；应使用R9数据备份或重新装载。
-此前[Round 10报告](docs/round10-final-performance.md)及[路由调优报告](docs/round10-routing-tuning.md)
-记录历史实验，不代表Safe版性能；回退核验和新回归见[Safe验证报告](docs/round10-safe.md)。
+当前存储、索引、SQL和SIMD恢复至R9（a4c5bf5），仅移植Safe版的uint64_t相等区间
+扫描；差量日志输出字节不变。R10/R11的字典倒排子集、batch4、分块剪枝、半径排序、
+紧凑.cidx桶页及新增的静止边界缓存交接均已撤回。R9原有Checkpoint同步及缓存提示保持原样。
+
+此前[Safe验证](docs/round10-safe.md)、[Round 11实验](docs/round11-validation.md)和
+[论文机制实验](docs/round11-paper-transfer.md)均为历史记录，不代表当前内核或性能。
+R10/R11新格式数据目录不能直接交给本版本续用；应使用R9数据备份或新目录重新装载。
+本次源码等价检查、线上反馈与本地因果对照、三轮全周期测量见[回退验证报告](docs/round11-rollback.md)。
+
+协议层使用预留16KiB的响应字符串直接追加JSON转义与GENERAL17数值，常规预热组装不产生
+C++堆分配。超大响应仍可能扩容，超过256KiB的容量按R9策略释放，响应上限仍为16MiB。
+stdout使用64KiB缓冲，每条JSON连同换行通过fwrite及显式fflush输出；stdin沿用原有
+64KiB原始read与poll，避免stdio预读和poll混用。小响应仅在确认阻塞管道、空stdio缓冲且不超过PIPE_BUF时采用EINTR整条重试；
+大响应或其他输出类型暂缓SIGTERM/SIGINT至flush结束，再按原流程回滚/关闭。
+这条快路径针对Ubuntu/glibc；不承诺对永不读取的对端限时退出。
 
 ## 索引与内建校准
-
-Round 11以标准BufferPool/WAL写入`.cidx.r*`紧凑桶页，兼容读取旧`.index/.ivf`索引；
-新格式不能交给旧二进制续用，回退版本应使用原数据备份。所有索引修改仍受Undo/Redo保护。
-32/64维提前终止保留保守浮点证书和float64赢家复算，最近桶预热仅用于全驻留、有效选择性索引。
-预计候选少于1024或均匀宽探测时回原批核；`benchmark_cpu`输出实际入核候选的剪枝率。
-数据PageCache仅在静止边界、预算>8MiB、全局数据量<=真实页池85%、从未换页且每页干净驻留时交接。
-零换页不等于全页已入池；当前10k默认预算未满足交接门槛，不能声称实现45%峰值下降。
-五代数据、三轮新测及安全/性能局限见[Round 11验证报告](docs/round11-validation.md)。
-
-Round 11补充在内存中维护半径有序桶，使用计入float32半径舍入误差的反三角下界、
-中心向外窗口及缺页前最新阈值重检；向量磁盘顺序、SlotId、WAL和Undo格式不变。
-候选、页基址和Top-K工作区复用且计入预算，结果拥有独立的预算保留。
-小过滤子集、低探测比例的驻留ANN保留原批核，避免标量筛选抵消SIMD收益。
-论文机制裁切、负向实验和完整复测见[Round 11补充报告](docs/round11-paper-transfer.md)。
 
 CREATE VECTOR INDEX 在新分配的索引区内构建，N>=4096使用64桶，小表最多8桶。
 构建完成后，C++引擎确定性抽样无过滤查询和高频字符串等值过滤查询，直接比较

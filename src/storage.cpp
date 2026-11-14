@@ -165,7 +165,7 @@ size_t BufferPool::pin(const std::string& file,uint64_t page) {
     }
     if(alternative<frames.size())victim=alternative;
   }
-  flush(victim);if(frames[victim].valid){++lifetime_evictions;lookup.erase(frames[victim].file+":"+std::to_string(frames[victim].page));}auto p=arena+victim*PAGE;std::memset(p,0,PAGE);
+  flush(victim);if(frames[victim].valid)lookup.erase(frames[victim].file+":"+std::to_string(frames[victim].page));auto p=arena+victim*PAGE;std::memset(p,0,PAGE);
   auto n=page_read(descriptor(file),p,PAGE,static_cast<off_t>(page*PAGE));
   require(n==0||n==static_cast<ssize_t>(PAGE),"short/corrupt data page");
   ++physical_reads;
@@ -210,44 +210,7 @@ void BufferPool::invalidate_prefix(const std::string& prefix){
   for(auto it=descriptors.begin();it!=descriptors.end();)if(it->first==prefix||it->first.rfind(prefix+".",0)==0){::close(it->second);it=descriptors.erase(it);}else ++it;
 }
 void BufferPool::sync_all(){
-  for(auto& e:std::filesystem::directory_iterator(directory)){int fd=page_fd(e.path());try{require(retry_eintr([&]{return ::fsync(fd);})==0,"data file sync failed");}catch(...){::close(fd);throw;}::close(fd);}sync_directory(directory);
-}
-bool BufferPool::handoff_eligible(bool clean) const {
-  if(transaction_active||budget.limit<=8*1024*1024||lifetime_evictions)return false;
-  const size_t capacity=frame_capacity_bytes();
-  const size_t maximum=capacity/100*85+(capacity%100)*85/100;
-  uintmax_t total=0;
-  // The engine owns data/ exclusively. Check every directory entry, including
-  // metadata and files whose descriptors have already been closed. No reads,
-  // admission, or per-file size shortcut may manufacture residency here.
-  for(const auto& entry:std::filesystem::directory_iterator(directory)){
-    if(entry.symlink_status().type()!=std::filesystem::file_type::regular)return false;
-    auto size=entry.file_size();if(size%PAGE)return false;
-    const auto file=entry.path().filename().string();
-    if(!clean)for(const auto& f:frames)if(f.valid&&f.dirty&&f.file==file){
-      // Committed dirty tails need space too, even before their first flush.
-      if(f.page>=capacity/PAGE)return false;
-      size=std::max<uintmax_t>(size,(f.page+1)*PAGE);
-    }
-    if(size>maximum-total)return false;
-    total+=size;
-    for(uintmax_t page=0;page<size/PAGE;++page){
-      auto found=lookup.find(file+":"+std::to_string(page));if(found==lookup.end())return false;
-      const auto& f=frames[found->second];
-      if(!f.valid||f.file!=file||f.page!=page||f.uncommitted||f.pins||(clean&&f.dirty))return false;
-    }
-  }
-  return total>0;
-}
-bool BufferPool::handoff_clean_cache(){
-  // Caller has completed ALL data-file fsyncs and the directory sync. This
-  // boundary can reduce current duplicate cache, never erase a prior peak.
-  if(!handoff_eligible(true))return false;
-  for(const auto& entry:std::filesystem::directory_iterator(directory)){
-    int fd=::open(entry.path().c_str(),O_RDONLY|O_CLOEXEC);require(fd>=0,"open handoff data file failed");
-    ::posix_fadvise(fd,0,0,POSIX_FADV_DONTNEED);::close(fd);
-  }
-  ++quiescent_handoffs;return true;
+  for(auto& e:std::filesystem::directory_iterator(directory)){int fd=page_fd(e.path());try{require(retry_eintr([&]{return ::fsync(fd);})==0,"data file sync failed");::posix_fadvise(fd,0,0,POSIX_FADV_DONTNEED);}catch(...){::close(fd);throw;}::close(fd);}sync_directory(directory);
 }
 void BufferPool::flush_all() {for(size_t i=0;i<frames.size();++i) flush(i);}
 
@@ -497,15 +460,11 @@ void Storage::rollback_to(uint64_t target){require(active&&target<=undo_top,"inv
   std::string file;uint64_t page;Page bytes{};apply_delta(data,file,page,bytes,true);bytes=pool.get(file,page);apply_delta(data,file,page,bytes);write_redo(file,page,bytes);undo_top-=n+4;
 }}
 void Storage::rollback(){rollback_to(0);redo_buffer.clear();require(::ftruncate(wal,static_cast<off_t>(transaction_start))==0,"rollback WAL truncation failed");active=false;pool.committed();regions.clear();}
-bool Storage::quiescent_handoff(){
-  if(closed||active||!pool.handoff_eligible(false))return false;
-  pool.flush_all();pool.sync_all();return pool.handoff_clean_cache();
-}
 void Storage::checkpoint(const std::function<void(size_t)>& stage){
   if(closed)return;
   require(!active,"checkpoint inside transaction");
   int fresh=-1,nextfd=-1;
-  try{pool.flush_all();pool.sync_all();pool.handoff_clean_cache();if(stage)stage(1);
+  try{pool.flush_all();pool.sync_all();if(stage)stage(1);
   uint64_t next=generation+1;auto nextwal=wal_path(root,next);
   fresh=::open(nextwal.c_str(),O_RDWR|O_CREAT|O_TRUNC|O_CLOEXEC,0600);require(fresh>=0,"create checkpoint WAL failed");sync_file(fresh);++wal_syncs;
   auto nextshadow=root/("shadow."+std::to_string(next));std::filesystem::remove_all(nextshadow);std::filesystem::create_directories(nextshadow);
