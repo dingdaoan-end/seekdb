@@ -1,3 +1,4 @@
+#include "simd.hpp"
 #include "engine.hpp"
 #include <algorithm>
 #include <cmath>
@@ -243,7 +244,7 @@ Engine::TableReadCache* Engine::cache(const std::string& t,const Header& h,const
   // Charge fixed capacities, including dictionary strings and container metadata.
   // High cardinality columns stop after 128 distinct values or 16 KiB UTF-8.
   size_t bytes=4096+size_t(h.slots)*17+center_count*4+size_t(h.nlist+2)*4+vector_pages*sizeof(BufferPool::ResidentHandle)+
-    cols.size()*sizeof(TableReadCache::Dictionary)+varchar_count*(size_t(h.slots)*2+32768);
+    cols.size()*sizeof(TableReadCache::Dictionary)+varchar_count*(size_t(h.slots)*6+32768+129*sizeof(uint32_t));
   if(bytes>(storage.budget.limit-storage.budget.used)/2)return nullptr;
   auto c=std::make_unique<TableReadCache>();c->reservation=std::make_shared<Reservation>(storage.budget,bytes);
   c->vector_pages.resize(vector_pages);c->table=t;c->slots=h.slots;c->keys.resize(h.slots);c->flags.resize(h.slots);c->dictionaries.resize(cols.size());c->active_slots.reserve(h.slots);
@@ -265,6 +266,15 @@ Engine::TableReadCache* Engine::cache(const std::string& t,const Header& h,const
   for(size_t i=1;i<c->offsets.size();++i)c->offsets[i]+=c->offsets[i-1];
   c->postings.resize(c->offsets.back());auto next=c->offsets;
   for(SlotId slot=0;slot<h.slots;++slot)if(c->flags[slot]&1)c->postings[next[h.nlist?bucket(t,h,slot):0]++]=slot;
+  // Each dictionary range contains active slots in storage order. Flat ranges
+  // avoid per-value allocations and allow page-ordered scans after a cache miss.
+  for(auto& d:c->dictionaries)if(d.supported){
+    d.offsets.resize(d.values.size()+1);
+    for(auto slot:c->active_slots)++d.offsets[d.ids[slot]+1];
+    for(size_t i=1;i<d.offsets.size();++i)d.offsets[i]+=d.offsets[i-1];
+    d.postings.resize(c->active_slots.size());auto next=d.offsets;
+    for(auto slot:c->active_slots)d.postings[next[d.ids[slot]]++]=slot;
+  }
   c->centers.resize(center_count);
   for(uint32_t b=0;b<h.nlist;++b){auto dim=cols[h.ivector].width;auto p=center_view(index_base(t,h),b,dim);std::copy(p,p+dim,c->centers.begin()+size_t(b)*dim);}
   read_cache=std::move(c);return read_cache.get();
@@ -292,13 +302,28 @@ bool Engine::fast_topk(const Statement& s,const Header& h,const std::vector<Colu
   auto dim=cols[selected[distance]].width;const size_t vector_stride=stride(cols[selected[distance]]),count=PAGE/vector_stride;auto& query=queries[distance];bool safe=!has_extreme(query.data(),dim);
   bool ivf=ann&&h.nlist&&selected[distance]==h.ivector;route="exact";last_probes=0;
   if(ivf&&!nprobe&&(h.active_count<4096||stale(h)||h.calibration_skipped||!h.recommended_nprobe||h.recommended_nprobe>h.nlist/2)){ivf=false;route="exact_fallback";}
+  const TableReadCache::Dictionary* subset=nullptr;uint32_t subset_begin=0,subset_end=0;
+  if(predicates.size()==1&&filters.size()==1){
+    auto [column,id]=filters.front();auto& d=c->dictionaries[column];
+    if(id!=UINT16_MAX){subset_begin=d.offsets[id];subset_end=d.offsets[id+1];}
+    const auto probes=std::min(nprobe?nprobe:h.recommended_nprobe,h.nlist);
+    const auto threshold=std::max(uint64_t(64),h.nlist?uint64_t(probes)*h.active_count/(uint64_t(h.nlist)*4):0);
+    if(!ivf||subset_end-subset_begin<=threshold){
+      subset=&d;ivf=false;route=ann?"ann_filter_exact":"exact_filter";filters.clear();
+    }
+  }
   size_t workspace=size_t(h.slots)*4+c->vector_pages.size()*sizeof(const std::byte*)+size_t(h.nlist)*sizeof(std::pair<double,uint32_t>)+size_t(s.limit)*(sizeof(double)+sizeof(SlotId)+sizeof(Value)*2+sizeof(std::vector<Value>)+64)+4096;
   if(workspace>storage.budget.limit-storage.budget.used){read_cache.reset();return false;}
   auto reservation=std::make_shared<Reservation>(storage.budget,workspace);
   // Validate without loading: loading one missing page could evict any earlier
   // borrowed address. The all-resident scan below makes no pool calls at all.
   std::vector<const std::byte*> bases(c->vector_pages.size());bool all_resident=true;
-  for(size_t i=0;i<bases.size();++i){bases[i]=storage.pool.resident(c->vector_pages[i]);all_resident&=bases[i]!=nullptr;}
+  if(subset){
+    for(auto at=subset_begin;at<subset_end;++at){auto page=subset->postings[at]/count;
+      if(!bases[page])bases[page]=storage.pool.resident(c->vector_pages[page]);
+      if(!bases[page]){all_resident=false;break;}
+    }
+  }else for(size_t i=0;i<bases.size();++i){bases[i]=storage.pool.resident(c->vector_pages[i]);all_resident&=bases[i]!=nullptr;}
   std::vector<SlotId> candidates;
   std::vector<std::pair<double,uint32_t>> distances;
   if(ivf){route="ivf";last_probes=std::min(nprobe?nprobe:h.recommended_nprobe,h.nlist);distances.reserve(h.nlist);
@@ -321,31 +346,60 @@ bool Engine::fast_topk(const Statement& s,const Header& h,const std::vector<Colu
     return c->keys[a.slot]<c->keys[b.slot];
   };
   const std::byte* vector_page=nullptr;uint64_t current=UINT64_MAX;auto file=s.table+".v"+std::to_string(selected[distance]);
-  auto consume=[&]<bool Resident128>(SlotId slot) __attribute__((always_inline)) {bool yes=true;for(auto [i,id]:filters)if(c->dictionaries[i].ids[slot]!=id){yes=false;break;}if(!yes)return;
-    if(impossible_key||(key_filter&&c->keys[slot]!=*key_filter))return;
+  auto accepts=[&](SlotId slot) __attribute__((always_inline)) {
+    for(auto [i,id]:filters)if(c->dictionaries[i].ids[slot]!=id)return false;
+    return !impossible_key&&(!key_filter||c->keys[slot]==*key_filter);
+  };
+  auto finish=[&](SlotId slot,const float* p,double fast) __attribute__((always_inline)) {
+    if(heap.size()==s.limit){auto worst=heap.front().squared;
+      auto error=std::max(1e-5,4.0*dim*std::numeric_limits<float>::epsilon());
+      if(fast>worst+error*std::max({1.0,std::abs(fast),std::abs(worst)}))return;}
+    // Every potential winner is widened, preserving underflow and SQL PK ties.
+    Neighbor neighbor{l2_squared_exact(p,query.data(),dim),slot};
+    if(heap.size()<s.limit){heap.push_back(neighbor);std::push_heap(heap.begin(),heap.end(),less);}else if(less(neighbor,heap.front())){std::pop_heap(heap.begin(),heap.end(),less);heap.back()=neighbor;std::push_heap(heap.begin(),heap.end(),less);}
+  };
+  auto consume=[&]<bool Resident128>(SlotId slot) __attribute__((always_inline)) {
+    if(!accepts(slot))return;
     const float* p;
     if constexpr(Resident128)p=reinterpret_cast<const float*>(bases[slot>>5]+((slot&31U)<<9));
     else {auto page=slot/count;if(all_resident)vector_page=bases[page];else if(page!=current){
       auto& handle=c->vector_pages[page];vector_page=storage.pool.resident(handle);
       if(!vector_page){handle=storage.pool.handle(file,page);vector_page=storage.pool.resident(handle);}current=page;
     }
-    // No pool operations occur while consuming this page. Handles validate
-    // frame reuse on every page transition; no borrowed pointer crosses it.
+    // Borrowed pointers never survive a pool operation in the paged path.
     p=reinterpret_cast<const float*>(vector_page+(slot%count)*vector_stride);}
-    if(heap.size()==s.limit){auto fast=l2_squared_fast(p,query.data(),dim,safe&&!(c->flags[slot]&2));auto worst=heap.front().squared;
-      auto error=std::max(1e-5,4.0*dim*std::numeric_limits<float>::epsilon());
-      if(fast>worst+error*std::max({1.0,std::abs(fast),std::abs(worst)}))return;}
-    Neighbor neighbor{l2_squared_exact(p,query.data(),dim),slot};
-    if(heap.size()<s.limit){heap.push_back(neighbor);std::push_heap(heap.begin(),heap.end(),less);}else if(less(neighbor,heap.front())){std::pop_heap(heap.begin(),heap.end(),less);heap.back()=neighbor;std::push_heap(heap.begin(),heap.end(),less);}
+    auto fast=heap.size()==s.limit?l2_squared_fast(p,query.data(),dim,safe&&!(c->flags[slot]&2)):0;
+    finish(slot,p,fast);
   };
-  auto scan=[&]<bool Resident128,bool Prefetch>(auto first,auto last){for(auto it=first;it!=last;++it){
+  auto scan=[&]<bool Resident128,bool Prefetch>(auto first,auto last){
+    // Gather only accepted active slots. All addresses are validated before
+    // entering this path; batching never introduces a pool load or eviction.
+    if(all_resident){
+      SlotId slots[4];const float* vectors[4];size_t filled=0;
+      auto flush=[&]() __attribute__((always_inline)) {double fast[4];bool batch_safe=safe;
+        for(size_t j=0;j<4;++j)batch_safe&=!(c->flags[slots[j]]&2);
+        l2_sq_f32_batch4(query.data(),vectors,dim,fast,batch_safe);
+        for(size_t j=0;j<4;++j)finish(slots[j],vectors[j],fast[j]);
+        filled=0;
+      };
+      for(auto it=first;it!=last;++it){auto slot=*it;if(!accepts(slot))continue;
+        slots[filled]=slot;
+        if constexpr(Resident128)vectors[filled]=reinterpret_cast<const float*>(bases[slot>>5]+((slot&31U)<<9));
+        else vectors[filled]=reinterpret_cast<const float*>(bases[slot/count]+(slot%count)*vector_stride);
+        ++filled;
 #if defined(__GNUC__) || defined(__clang__)
-    if constexpr(Prefetch){if(it+1!=last){auto next=*(it+1);__builtin_prefetch(bases[next>>5]+((next&31U)<<9),0,1);}}
+        if constexpr(Prefetch){if(it+1!=last){auto next=*(it+1);
+          if constexpr(Resident128)__builtin_prefetch(bases[next>>5]+((next&31U)<<9),0,1);
+          else __builtin_prefetch(bases[next/count]+(next%count)*vector_stride,0,1);}}
 #endif
-    consume.template operator()<Resident128>(*it);
-  }};
+        if(filled==4)flush();
+      }
+      for(size_t j=0;j<filled;++j)consume.template operator()<Resident128>(slots[j]);
+    }else for(auto it=first;it!=last;++it)consume.template operator()<Resident128>(*it);
+  };
   auto run=[&]<bool Resident128,bool Prefetch>(){
-    if(ivf&&all_resident){for(size_t i=0;i<last_probes;++i){auto b=distances[i].second;scan.template operator()<Resident128,Prefetch>(c->postings.begin()+c->offsets[b],c->postings.begin()+c->offsets[b+1]);}}
+    if(subset)scan.template operator()<Resident128,Prefetch>(subset->postings.begin()+subset_begin,subset->postings.begin()+subset_end);
+    else if(ivf&&all_resident){for(size_t i=0;i<last_probes;++i){auto b=distances[i].second;scan.template operator()<Resident128,Prefetch>(c->postings.begin()+c->offsets[b],c->postings.begin()+c->offsets[b+1]);}}
     else if(ivf)scan.template operator()<Resident128,Prefetch>(candidates.begin(),candidates.end());
     else scan.template operator()<Resident128,Prefetch>(c->active_slots.begin(),c->active_slots.end());
   };

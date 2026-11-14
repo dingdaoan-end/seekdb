@@ -47,7 +47,7 @@ class Engine {
     std::shared_ptr<void> reservation;
     std::vector<int64_t> keys;
     std::vector<uint8_t> flags; // active and extreme
-    struct Dictionary {bool supported=false;std::vector<uint16_t> ids;std::vector<std::string> values;};
+    struct Dictionary {bool supported=false;std::vector<uint16_t> ids;std::vector<std::string> values;std::vector<SlotId> postings;std::vector<uint32_t> offsets;};
     std::vector<Dictionary> dictionaries;
     std::vector<float> centers;
     std::vector<SlotId> postings,active_slots;

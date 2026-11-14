@@ -60,6 +60,19 @@ extern "C" int posix_fadvise(int fd,off_t offset,off_t length,int advice) noexce
  auto result=::syscall(SYS_fadvise64,fd,offset,length,advice);return result<0?errno:static_cast<int>(result);
 }
 const std::filesystem::path base="/tmp/mvdb_storage_phase3";
+void multifile_cache_retention(){
+ for(size_t limit:{size_t(9227468),size_t(10485760)}){
+  auto dir=base/("multifile_"+std::to_string(limit));std::filesystem::create_directories(dir);
+  Page bytes{};
+  for(int file=0;file<4;++file){std::ofstream out(dir/("f"+std::to_string(file)),std::ios::binary);
+   for(int page=0;page<256;++page){bytes[0]=std::byte((file+page)%251);out.write(reinterpret_cast<const char*>(bytes.data()),PAGE);}}
+  MemoryBudget budget(limit);BufferPool pool(dir,budget);
+  reset_audit();audit_io=true;
+  for(int pass=0;pass<3;++pass)for(int page=0;page<256;++page)for(int file=0;file<4;++file){
+   auto bytes=pool.get("f"+std::to_string(file),page);assert(bytes[0]==std::byte((file+page)%251));}
+  audit_io=false;assert(cache_drops==0);assert(budget.peak<=limit);
+ }
+}
 template<class F> void child(F action,bool killed=false){auto c=fork();assert(c>=0);if(!c){action();_exit(0);}int status;assert(waitpid(c,&status,0)==c);assert(killed?WIFSIGNALED(status)&&WTERMSIG(status)==SIGKILL:WIFEXITED(status)&&WEXITSTATUS(status)==0);}
 void kill_now(){::kill(getpid(),SIGKILL);}
 // Returning to implicit direct I/O would make default reads fail this audit.
@@ -215,6 +228,14 @@ void resident_handles(){
  assert(large.pool.physical_reads==reads+480&&large.budget.peak<=large.budget.limit);
 }
 int main(int argc,char** argv){
+ multifile_cache_retention();
+ // Delta boundaries cross aligned and unaligned words and the page tail.
+ {auto d=base/"delta_boundaries";std::filesystem::remove_all(d);
+  child([&]{Storage s(d,65536);s.begin();Page p{};
+   for(int page=0;page<32;++page){for(size_t at:{size_t(0),size_t(7),size_t(8),size_t(15),size_t(16),PAGE-1})p[(at+page)%PAGE]=std::byte(page+1);s.write("edges",page,p);}
+   s.commit();s.begin();Page p2{};for(int page=0;page<32;++page)s.write("edges",page,p2);s.rollback();kill_now();},true);
+  Storage s(d,65536);Page expected{};for(int page=0;page<32;++page){for(size_t at:{size_t(0),size_t(7),size_t(8),size_t(15),size_t(16),PAGE-1})expected[(at+page)%PAGE]=std::byte(page+1);assert(s.read("edges",page)==expected);}
+ }
  ::unsetenv("MVDB_USE_ODIRECT");
  if(argc==2){std::filesystem::remove_all(base);std::string test=argv[1];
   if(test=="buffered")buffered_default();else if(test=="metadata")metadata_scan();else if(test=="sync")transaction_sync_boundary();else if(test=="interrupt")interrupted_io();else if(test=="append")invisible_append();else if(test=="resident")resident_handles();else if(test=="batch")batched_append();else return 2;return 0;}

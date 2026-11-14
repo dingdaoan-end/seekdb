@@ -2,7 +2,6 @@
 #include "cli_budget.hpp"
 #include "json_protocol.hpp"
 #include <csignal>
-#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -12,11 +11,7 @@
 #include <charconv>
 #include <cmath>
 #include <string>
-#include <type_traits>
 #include <poll.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <stdio_ext.h>
 #include <unistd.h>
 namespace {
 volatile std::sig_atomic_t stop_requested=0;
@@ -27,48 +22,18 @@ void install_signal_handlers(){
   action.sa_flags=0; // In particular, do not restart an idle stdin read.
   if(::sigaction(SIGTERM,&action,nullptr)<0||::sigaction(SIGINT,&action,nullptr)<0)throw std::runtime_error("cannot install termination signal handlers");
 }
-bool output_ok=true;
-size_t atomic_pipe_limit=0;
-void detect_atomic_pipe_output(){
-  struct stat status{};
-  if(::fstat(STDOUT_FILENO,&status)<0||!S_ISFIFO(status.st_mode))return;
-  int flags=::fcntl(STDOUT_FILENO,F_GETFL);
-  if(flags<0||(flags&O_NONBLOCK))return;
-  long bytes=::fpathconf(STDOUT_FILENO,_PC_PIPE_BUF);
-  if(bytes>0)atomic_pipe_limit=std::min<size_t>(4096,static_cast<size_t>(bytes));
-}
-void emit_buffer(std::string_view text){
-  if(!output_ok)return;
-  if(atomic_pipe_limit&&text.size()<=atomic_pipe_limit&&::__fpending(stdout)==0){
-    // With an empty 64 KiB stdio buffer, this record reaches the blocking
-    // pipe in one write <= PIPE_BUF. Linux either commits the entire record,
-    // or EINTR reports zero bytes. Retain the record and replay only that case.
-    for(;;){
-      errno=0;auto written=std::fwrite(text.data(),1,text.size(),stdout);int write_error=errno;
-      bool staging_error=std::ferror(stdout)!=0;
-      if(written!=text.size()||staging_error){
-        if(write_error==EINTR&&(written==0||written==text.size())){std::clearerr(stdout);::__fpurge(stdout);continue;}
-        output_ok=false;return;
-      }
-      errno=0;int flushed=std::fflush(stdout);int flush_error=errno;
-      if(flushed==0)return;
-      if(flush_error==EINTR){std::clearerr(stdout);::__fpurge(stdout);continue;}
-      output_ok=false;return;
-    }
-  }
-  // glibc may discard a buffered unwritten tail after an interrupted fflush.
-  // Defer our termination handlers until this complete record is flushed.
-  // A stalled reader can therefore delay shutdown until it drains the pipe,
-  // just as the old raw-write loop waited while retrying a partial record.
-  sigset_t blocked,previous;::sigemptyset(&blocked);::sigaddset(&blocked,SIGTERM);::sigaddset(&blocked,SIGINT);
-  if(::sigprocmask(SIG_BLOCK,&blocked,&previous)<0)throw std::runtime_error("cannot protect protocol output");
-  auto written=std::fwrite(text.data(),1,text.size(),stdout);
-  bool complete=written==text.size();
-  if(complete)complete=std::fflush(stdout)==0;
-  // An unexpected I/O failure is fatal to this transport. Do not retry fflush
-  // or append another JSON record to a stream whose progress is uncertain.
-  if(!complete)output_ok=false;
-  if(::sigprocmask(SIG_SETMASK,&previous,nullptr)<0)output_ok=false;
+void emit_line(const std::string& text){
+  // Retain partial-write progress when a signal interrupts a full stdout pipe.
+  // A stream insertion can otherwise set badbit after emitting half a record.
+  auto write_all=[](const char* data,size_t size){
+    while(size){auto count=::write(STDOUT_FILENO,data,size);
+      if(count<0&&errno==EINTR)continue;
+      if(count<=0){std::cout.setstate(std::ios::badbit);return false;}
+      data+=count;size-=static_cast<size_t>(count);
+    }return true;
+  };
+  if(write_all(text.data(),text.size()))write_all("\n",1);
+  std::cout<<std::flush;std::fflush(stdout);
 }
 // Read chunks rather than individual bytes. poll's bounded wait also covers a
 // signal arriving between the flag check and the blocking syscall. Keep any
@@ -105,70 +70,10 @@ uint64_t positive_bytes(const std::string& value){uint64_t bytes=0;auto[end,erro
 // half a JSON response. No temporary files or extra disk writes are required.
 class Response {
   std::string data;
-  static constexpr size_t limit=16*1024*1024;
 public:
-  Response(){data.reserve(16384);}
-  void clear(){
-    // Release exceptional large responses before later memory-limited work;
-    // ordinary responses retain the preallocated assembly buffer.
-    if(data.capacity()>256*1024){std::string fresh;fresh.reserve(16384);data.swap(fresh);}else data.clear();
-  }
-  std::string_view view() const {return data;}
-  Response& add(std::string_view text){if(text.size()>limit-data.size())throw std::runtime_error("response exceeds protocol size limit");data.append(text);return *this;}
-  Response& string(std::string_view text){
-    add("\"");size_t run=0;
-    constexpr char hex[]="0123456789abcdef";
-    for(size_t i=0;i<text.size();){unsigned char c=text[i];
-      if(c>=0x80){
-        unsigned count=0,code=0,minimum=0;
-        if(c>=0xc2&&c<=0xdf){count=1;code=c&31;minimum=0x80;}
-        else if(c>=0xe0&&c<=0xef){count=2;code=c&15;minimum=0x800;}
-        else if(c>=0xf0&&c<=0xf4){count=3;code=c&7;minimum=0x10000;}
-        else throw std::runtime_error("invalid JSON request");
-        if(text.size()-i<=count)throw std::runtime_error("invalid JSON request");
-        for(unsigned j=1;j<=count;++j){unsigned char next=text[i+j];if((next&0xc0)!=0x80)throw std::runtime_error("invalid JSON request");code=(code<<6)|(next&63);}
-        if(code<minimum||code>0x10ffff||(code>=0xd800&&code<=0xdfff))throw std::runtime_error("invalid JSON request");
-        i+=count+1;continue;
-      }
-      if(c=='\"'||c=='\\'||c<32){
-        add(text.substr(run,i-run));
-        if(c<32){char escaped[6]={'\\','u','0','0',hex[c>>4],hex[c&15]};add(std::string_view(escaped,6));}
-        else {char escaped[2]={'\\',char(c)};add(std::string_view(escaped,2));}
-        run=++i;
-      }else ++i;
-    }
-    add(text.substr(run));return add("\"");
-  }
-  template<class Number>Response& integer(Number value){
-    static_assert(std::is_integral_v<Number>);char buffer[64];auto result=std::to_chars(buffer,buffer+sizeof(buffer),value);
-    if(result.ec!=std::errc{})throw std::runtime_error("cannot serialize number");
-    return add(std::string_view(buffer,size_t(result.ptr-buffer)));
-  }
-  Response& number(double value){
-    if(!std::isfinite(value))throw std::runtime_error("non-finite result value");
-    char buffer[64];auto result=std::to_chars(buffer,buffer+sizeof(buffer),value,std::chars_format::general,17);
-    if(result.ec!=std::errc{})throw std::runtime_error("cannot serialize number");
-    return add(std::string_view(buffer,size_t(result.ptr-buffer)));
-  }
-  Response& value(const mvdb::Value& value){
-    if(auto n=std::get_if<int64_t>(&value))return integer(*n);
-    if(auto n=std::get_if<double>(&value))return number(*n);
-    if(auto text=std::get_if<std::string>(&value))return string(*text);
-    const auto& vector=std::get<std::vector<float>>(value);
-    for(float n:vector)if(!std::isfinite(n))throw std::runtime_error("non-finite vector result value");
-    add("[");bool first=true;for(float n:vector){if(!first)add(",");first=false;number(static_cast<double>(n));}return add("]");
-  }
-  Response& begin(std::string_view id,bool legacy,bool ok=true){
-    clear();if(legacy)add("{\"ok\":");else add("{\"id\":").add(id).add(",\"ok\":");
-    return add(ok?"true":"false");
-  }
-  Response& ready(){clear();return add("{\"type\":\"ready\"}");}
-  void emit(){
-    // The public cap applies to JSON bytes; its line delimiter is additional.
-    data.push_back('\n');
-    try{emit_buffer(data);}catch(...){data.pop_back();throw;}
-    data.pop_back();
-  }
+  void clear(){if(data.capacity()>256*1024)std::string{}.swap(data);else data.clear();}
+  Response& add(std::string_view text){if(text.size()>16*1024*1024-data.size())throw std::runtime_error("response exceeds protocol size limit");data+=text;return *this;}
+  void emit() const {emit_line(data);}
 };
 // cerr is unit-buffered: assemble telemetry before writing so each record uses
 // one stream write instead of one write per key, separator and numeric value.
@@ -183,26 +88,29 @@ public:
   void string(const char* name,const std::string& value){key(name);data+=mvdb::quote(value);}
   void emit(){data+="}\n";std::cerr.write(data.data(),static_cast<std::streamsize>(data.size()));}
 };
-void assemble_success(Response& response,const std::string& id,bool legacy,const mvdb::Result& result){
-  response.begin(id,legacy);
-  if(legacy||result.columns.empty())response.add(",\"affected_rows\":").integer(result.affected_rows);
-  if(legacy||!result.columns.empty()){
-    response.add(",\"columns\":[");bool first=true;for(const auto& name:result.columns){if(!first)response.add(",");first=false;response.string(name);}response.add("],\"rows\":[");first=true;
-    result.each([&](const auto& row){if(!first)response.add(",");first=false;response.add("[");bool cell=true;for(const auto& value:row){if(!cell)response.add(",");cell=false;response.value(value);}response.add("]");});response.add("]");
-  }
-  response.add("}");
+std::string value_json(const mvdb::Value& value){
+  if(auto number=std::get_if<double>(&value)){if(!std::isfinite(*number))throw std::runtime_error("non-finite result value");}
+  if(auto vector=std::get_if<std::vector<float>>(&value)){for(float number:*vector)if(!std::isfinite(number))throw std::runtime_error("non-finite vector result value");}
+  if(auto string=std::get_if<std::string>(&value)){mvdb::protocol::Parser(mvdb::quote(*string)).parse();}
+  return mvdb::json(value);
 }
-void success(Response& response,const std::string& id,bool legacy,const mvdb::Result& result){assemble_success(response,id,legacy,result);response.emit();}
+void success(Response& response,const std::string& id,bool legacy,const mvdb::Result& result){
+  response.clear();response.add(legacy?"{\"ok\":true":"{\"id\":"+id+",\"ok\":true");
+  if(legacy||result.columns.empty())response.add(",\"affected_rows\":"+std::to_string(result.affected_rows));
+  if(legacy||!result.columns.empty()){
+    response.add(",\"columns\":[");bool first=true;for(const auto& name:result.columns){if(!first)response.add(",");first=false;response.add(mvdb::quote(name));}response.add("],\"rows\":[");first=true;
+    result.each([&](const auto& row){if(!first)response.add(",");first=false;response.add("[");bool cell=true;for(const auto& value:row){if(!cell)response.add(",");cell=false;response.add(value_json(value));}response.add("]");});response.add("]");
+  }
+  response.add("}").emit();
+}
 std::string error_code(const std::string& message){if(message.find("duplicate primary key")!=std::string::npos)return "duplicate_key";if(message.find("dimension mismatch")!=std::string::npos)return "dimension_mismatch";if(message.find("unsupported SQL")!=std::string::npos)return "unsupported_sql";return "execution_error";}
 bool json_line(const std::string& line){auto start=line.find_first_not_of(" \t\r\n");if(start==std::string::npos)return true;char first=line[start];return first=='{'||first=='['||first=='"'||first=='-'||(first>='0'&&first<='9')||line.substr(start)=="null"||line.substr(start)=="true"||line.substr(start)=="false";}
 }
 int main(int argc,char** argv){
   // Pipes and PID 1 must receive the handshake and every response immediately.
-  static char output_buffer[64*1024];
-  if(std::setvbuf(stdout,output_buffer,_IOFBF,sizeof(output_buffer))!=0){std::cerr<<"cannot buffer stdout\n";return 1;}
+  std::setvbuf(stdout,nullptr,_IONBF,0);std::cout<<std::unitbuf;
   try{
     install_signal_handlers();
-    detect_atomic_pipe_output();
     const char* env_directory=std::getenv("VECTORDB_DATA_DIR");
     std::string directory=env_directory&&*env_directory?env_directory:"/data";auto detected=mvdb::default_cli_budget();uint64_t budget=detected.bytes;std::string budget_source=detected.source;bool positional=false;
     for(int i=1;i<argc;++i){std::string arg=argv[i];
@@ -214,9 +122,9 @@ int main(int argc,char** argv){
     auto progress=[](size_t count){auto env=std::getenv("MVDB_RECOVERY_PAUSE_AFTER");if(env&&count==std::stoull(env)){std::cerr<<"RECOVERY_PAUSED "<<count<<std::endl;::raise(SIGSTOP);}};
     mvdb::Engine engine(directory,budget,progress);
     std::cerr<<"distance_kernel="<<(mvdb::avx2_available()?"avx2":"scalar")<<'\n';
-    Response response;response.ready().emit();
-    Metrics metrics;std::string line;bool closed=false;int exit_status=output_ok?0:3;InputLines input;
-    while(output_ok&&input.next(line)){
+    emit_line("{\"type\":\"ready\"}");
+    Response response;Metrics metrics;std::string line;bool closed=false;int exit_status=0;InputLines input;
+    while(input.next(line)){
       auto before=engine.vector_page_reads();auto spill_before=engine.spill_bytes();
       bool legacy=!json_line(line),shutdown=false;std::string id="null",code="invalid_request";
       try{
@@ -228,8 +136,8 @@ int main(int argc,char** argv){
           auto op=request.fields.contains("op")?mvdb::protocol::required_string(request,"op"):"execute";
           if(op=="shutdown"||op=="close"){
             code="shutdown_error";engine.close();closed=true;shutdown=true;
-            response.begin(id,false).add("}").emit();
-          }else if(op=="ping")response.begin(id,false).add("}").emit();
+            emit_line("{\"id\":"+id+",\"ok\":true}");
+          }else if(op=="ping")emit_line("{\"id\":"+id+",\"ok\":true}");
           else if(op=="execute"){
             sql=std::move(mvdb::protocol::required_string(request,"sql"));std::string mode="exact";
             if(request.fields.contains("search_mode"))mode=mvdb::protocol::required_string(request,"search_mode");
@@ -239,9 +147,8 @@ int main(int argc,char** argv){
           }else {code="unsupported_op";throw std::runtime_error("unsupported operation");}
         }else {sql=line;code="";success(response,id,true,engine.execute(sql));}
       }catch(const std::exception& e){
-        response.begin(id,legacy,false).add(",\"error\":");
-        if(legacy)response.string(e.what()).add("}").emit();
-        else response.add("{\"code\":").string(code.empty()?error_code(e.what()):code).add(",\"message\":").string(e.what()).add("}}").emit();
+        if(legacy)emit_line("{\"ok\":false,\"error\":"+mvdb::quote(e.what())+"}");
+        else emit_line("{\"id\":"+id+",\"ok\":false,\"error\":{\"code\":"+mvdb::quote(code.empty()?error_code(e.what()):code)+",\"message\":"+mvdb::quote(e.what())+"}}");
       }
       metrics.begin("METRICS ");
       metrics.number("engine_budget_bytes",budget);
@@ -258,7 +165,7 @@ int main(int argc,char** argv){
       metrics.number("effective_nprobe",engine.effective_nprobe());
       metrics.string("ann_route",engine.last_route());
       metrics.emit();
-      if(!output_ok){exit_status=3;break;}
+      if(!std::cout){exit_status=3;break;}
       if(shutdown)break;
     }
     if(!closed)engine.close();

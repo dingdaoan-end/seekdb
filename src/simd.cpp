@@ -1,4 +1,5 @@
 #include "sql.hpp"
+#include "simd.hpp"
 #include <cmath>
 #include <immintrin.h>
 
@@ -30,6 +31,30 @@ __attribute__((target("avx2,fma"))) double simd_squared_fma(const float* a,const
   L2_BODY(_mm256_fmadd_ps(d,d,sums[j]))
 }
 #undef L2_BODY
+// Four candidates share each query load, with independent SIMD accumulators.
+#define BATCH4_BODY(ACCUMULATE) \
+  __m256 sums[4]={_mm256_setzero_ps(),_mm256_setzero_ps(),_mm256_setzero_ps(),_mm256_setzero_ps()}; \
+  __m256 other[4]={_mm256_setzero_ps(),_mm256_setzero_ps(),_mm256_setzero_ps(),_mm256_setzero_ps()}; \
+  size_t i=0; \
+  for(;i+16<=n;i+=16){ \
+    auto q=_mm256_loadu_ps(query+i); \
+    for(size_t j=0;j<4;++j){auto d=_mm256_sub_ps(q,_mm256_loadu_ps(vectors[j]+i));auto& sum=sums[j];sum=ACCUMULATE;} \
+    q=_mm256_loadu_ps(query+i+8); \
+    for(size_t j=0;j<4;++j){auto d=_mm256_sub_ps(q,_mm256_loadu_ps(vectors[j]+i+8));auto& sum=other[j];sum=ACCUMULATE;}} \
+  for(;i+8<=n;i+=8){auto q=_mm256_loadu_ps(query+i); \
+    for(size_t j=0;j<4;++j){auto d=_mm256_sub_ps(q,_mm256_loadu_ps(vectors[j]+i));auto& sum=sums[j];sum=ACCUMULATE;}} \
+  for(size_t j=0;j<4;++j){ \
+    auto merged=_mm256_add_ps(sums[j],other[j]); \
+    auto halves=_mm_add_ps(_mm256_castps256_ps128(merged),_mm256_extractf128_ps(merged,1)); \
+    halves=_mm_hadd_ps(halves,halves);halves=_mm_hadd_ps(halves,halves);output[j]=_mm_cvtss_f32(halves); \
+    for(size_t k=i;k<n;++k){double d=double(query[k])-vectors[j][k];output[j]+=d*d;} }
+__attribute__((target("avx2"))) void simd_batch4(const float* query,const float* const vectors[4],size_t n,double output[4]){
+  BATCH4_BODY(_mm256_add_ps(sum,_mm256_mul_ps(d,d)))
+}
+__attribute__((target("avx2,fma"))) void simd_batch4_fma(const float* query,const float* const vectors[4],size_t n,double output[4]){
+  BATCH4_BODY(_mm256_fmadd_ps(d,d,sum))
+}
+#undef BATCH4_BODY
 __attribute__((target("avx2"))) bool simd_extreme(const float* a,size_t n) {
   const auto sign=_mm256_set1_ps(-0.0f),limit=_mm256_set1_ps(1e16f);size_t i=0;
   for(;i+8<=n;i+=8){auto x=_mm256_andnot_ps(sign,_mm256_loadu_ps(a+i));
@@ -56,6 +81,22 @@ double l2_squared_fast(const float* a,const float* b,size_t n,bool safe){
   // Recompute tiny sums to avoid float square underflow (including FTZ mode).
   if(!std::isfinite(sum)||sum<=1e-20)return l2_squared_exact(a,b,n);
   return sum;
+}
+void l2_sq_f32_batch4(const float* query,const float* const vectors[4],size_t n,double output[4],bool safe){
+  if(!safe||n>4096||!avx2_available()){
+    for(size_t j=0;j<4;++j)output[j]=l2_squared_exact(query,vectors[j],n);
+    return;
+  }
+  if(fma_available())simd_batch4_fma(query,vectors,n,output);
+  else simd_batch4(query,vectors,n,output);
+  for(size_t j=0;j<4;++j)if(!std::isfinite(output[j])||output[j]<=1e-20)
+    output[j]=l2_squared_exact(query,vectors[j],n);
+}
+void l2_sq_f32_batch4(const float* query,const float* v0,const float* v1,const float* v2,const float* v3,size_t dim,float out[4]){
+  const float* vectors[4]={v0,v1,v2,v3};double wide[4];bool safe=!has_extreme(query,dim);
+  for(auto p:vectors)safe&=!has_extreme(p,dim);
+  l2_sq_f32_batch4(query,vectors,dim,wide,safe);
+  for(size_t j=0;j<4;++j)out[j]=static_cast<float>(wide[j]);
 }
 double l2_fast(const float* a,const float* b,size_t n,bool safe){return std::sqrt(l2_squared_fast(a,b,n,safe));}
 double l2(const float* a,const float* b,size_t n){return l2_fast(a,b,n,!has_extreme(a,n)&&!has_extreme(b,n));}
