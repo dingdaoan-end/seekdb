@@ -44,12 +44,15 @@ struct Cursor {
     if(pos==sql.size()){eof=true;return;}
     size_t first=pos;unsigned char c=sql[pos++];token={};
     if(c=='\''){
-      first=pos;bool closed=false;
-      while(pos<sql.size())if(sql[pos++]=='\''){
+      first=pos;
+      while(true){
+        // Search the bounded byte span in bulk; embedded NUL is literal data.
+        const auto quote=sql.find('\'',pos);
+        if(quote==std::string::npos)error("unterminated SQL string");
+        pos=quote+1;
         if(pos<sql.size()&&sql[pos]=='\''){token.escaped=true;++pos;}
-        else{closed=true;break;}
+        else break;
       }
-      if(!closed)error("unterminated SQL string");
       token.quoted=true;token.text=std::string_view(sql).substr(first,pos-first-1);return;
     }
     if(std::isalpha(c)||c=='_'){

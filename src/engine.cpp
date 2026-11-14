@@ -302,14 +302,6 @@ Engine::TableReadCache* Engine::cache(const std::string& t,const Header& h,const
   for(uint32_t b=0;b<h.nlist;++b){auto dim=cols[h.ivector].width;auto p=center_view(index_base(t,h),b,dim);std::copy(p,p+dim,c->centers.begin()+size_t(b)*dim);}
   read_cache=std::move(c);++cache_builds;return read_cache.get();
 }
-void Engine::prewarm_read_cache(const std::string& t) noexcept {
-  // Metadata/dictionaries/centers only. A failed optional warm-up must never
-  // turn a successful durable COMMIT into a reported statement failure.
-  auto before=storage.pool.vector_reads;
-  try{auto h=header(t);auto cols=schema(h);if(cache(t,h,cols))++cache_prewarms;}
-  catch(...){read_cache.reset();}
-  cache_prewarm_vector_reads+=storage.pool.vector_reads-before;
-}
 bool Engine::fast_topk(const Statement& s,const Header& h,const std::vector<Column>& cols,
  const std::vector<Expr>& expressions,const std::vector<size_t>& selected,
  const std::vector<std::vector<float>>& queries,const std::vector<std::pair<size_t,bool>>& order,
@@ -362,12 +354,10 @@ bool Engine::fast_topk(const Statement& s,const Header& h,const std::vector<Colu
     return c->keys[a.slot]<c->keys[b.slot];
   };
   const std::byte* vector_page=nullptr;uint64_t current=UINT64_MAX;auto file=s.table+".v"+std::to_string(selected[distance]);
-  auto consume=[&]<bool Resident128,bool Direct=false>(SlotId slot,const float* direct=nullptr) __attribute__((always_inline)) {
-    if constexpr(!Direct){bool yes=true;for(auto [i,id]:filters)if(c->dictionaries[i].ids[slot]!=id){yes=false;break;}if(!yes)return;
-      if(impossible_key||(key_filter&&c->keys[slot]!=*key_filter))return;}
+  auto consume=[&]<bool Resident128>(SlotId slot) __attribute__((always_inline)) {bool yes=true;for(auto [i,id]:filters)if(c->dictionaries[i].ids[slot]!=id){yes=false;break;}if(!yes)return;
+    if(impossible_key||(key_filter&&c->keys[slot]!=*key_filter))return;
     const float* p;
-    if constexpr(Direct)p=direct;
-    else if constexpr(Resident128)p=reinterpret_cast<const float*>(bases[slot>>5]+((slot&31U)<<9));
+    if constexpr(Resident128)p=reinterpret_cast<const float*>(bases[slot>>5]+((slot&31U)<<9));
     else {auto page=slot/count;if(all_resident)vector_page=bases[page];else if(page!=current){
       auto& handle=c->vector_pages[page];vector_page=storage.pool.resident(handle);
       if(!vector_page){handle=storage.pool.handle(file,page);vector_page=storage.pool.resident(handle);}current=page;
@@ -392,23 +382,9 @@ bool Engine::fast_topk(const Statement& s,const Header& h,const std::vector<Colu
     else if(ivf)scan.template operator()<Resident128,Prefetch>(candidates.begin(),candidates.end());
     else scan.template operator()<Resident128,Prefetch>(c->active_slots.begin(),c->active_slots.end());
   };
-  // active_slots is already sorted and contains only live slots. Its endpoints
-  // prove a complete page without a second bitmap or 32 validity tests.
-  if(all_resident&&dim==128&&!ivf&&predicates.empty()){
-    auto it=c->active_slots.begin(),end=c->active_slots.end();
-    while(it!=end){auto slot=*it;
-      if(!(slot&31U)&&end-it>=32&&it[31]==slot+31){
-        auto p=reinterpret_cast<const float*>(bases[slot>>5]);
-        for(SlotId j=0;j<32;++j,p+=128){
-#if defined(__GNUC__) || defined(__clang__)
-          if(j+1<32)__builtin_prefetch(p+128,0,1);
-#endif
-          consume.template operator()<true,true>(slot+j,p);
-        }it+=32;
-      }else{consume.template operator()<true>(*it);++it;}
-    }
-  }
-  else if(all_resident&&dim==128){if(ivf)run.template operator()<true,true>();else run.template operator()<true,false>();}
+  // The common 128D resident path uses fixed shifts/masks. Exact scans already
+  // visit slots in storage order; prefetching every next slot adds no value.
+  if(all_resident&&dim==128){if(ivf)run.template operator()<true,true>();else run.template operator()<true,false>();}
   else run.template operator()<false,false>();
   std::sort(heap.begin(),heap.end(),less);result.memory_rows=std::make_shared<std::vector<std::vector<Value>>>();result.memory_rows->reserve(heap.size());
   for(auto& n:heap){std::vector<Value> values(2);values[distance]=std::sqrt(n.squared);values[1-distance]=c->keys[n.slot];result.memory_rows->push_back(std::move(values));}
@@ -429,18 +405,91 @@ Result Engine::execute(const std::string& sql){
   if(sql.size()*4+512>storage.budget.limit-storage.budget.used)read_cache.reset();
   Reservation input(storage.budget,sql.size()*4+512);auto s=parse(sql);
   if(s.kind!=Statement::Select&&s.kind!=Statement::Set)read_cache.reset();
-  if(s.kind==Statement::Begin){storage.begin();pending_index_prewarm.clear();return {};}
-  if(s.kind==Statement::Commit){storage.commit();auto table=std::move(pending_index_prewarm);pending_index_prewarm.clear();if(!table.empty())prewarm_read_cache(table);return {};}
-  if(s.kind==Statement::Rollback){storage.rollback();pending_index_prewarm.clear();return {};}
+  if(s.kind==Statement::Begin){storage.begin();return {};}
+  if(s.kind==Statement::Commit){storage.commit();return {};}
+  if(s.kind==Statement::Rollback){storage.rollback();return {};}
   if(s.kind==Statement::Set){if(s.setting=="search_mode"){require(s.value=="exact"||s.value=="ann","invalid local search mode");ann=s.value=="ann";}else if(s.setting=="nprobe"){auto value=convert({s.value,false},{"",Type::Bigint});auto n=std::get<int64_t>(value);require(n>=0&&n<=64,"nprobe must be 0..64");nprobe=static_cast<uint32_t>(n);}else throw std::runtime_error("unknown local setting");return {};}
   bool writes=s.kind!=Statement::Select;bool automatic=writes&&!storage.in_transaction();if(automatic)storage.begin();auto point=storage.savepoint();
-  try{auto result=execute_inner(s);if(automatic)storage.commit();
-    if(s.kind==Statement::CreateIndex){if(automatic)prewarm_read_cache(s.table);else pending_index_prewarm=s.table;}
-    return result;}
+  try{auto result=execute_inner(s);if(automatic)storage.commit();return result;}
   catch(...){if(writes){storage.rollback_to(point);if(automatic)storage.rollback();}throw;}
   }catch(...){read_cache.reset();throw;}
 }
 Result Engine::insert_stream(const std::string& sql){
+  return insert_is_ascending(sql)?insert_sequential(sql):insert_ordered(sql);
+}
+bool Engine::insert_is_ascending(const std::string& sql){
+  // Read-only preflight: never write a speculative prefix. Retain schema and
+  // one previous key, not batch keys or borrowed literal views. A disorder
+  // stops this scan early; the ordered helper validates the remaining SQL.
+  struct Disorder {};
+  std::vector<Column> cols;size_t position=0,pkcol=0;int64_t previous=0;bool have_previous=false;
+  try{
+    parse_insert_rows(sql,[&](const Statement& s){cols=schema(header(s.table));pkcol=primary(cols);position=pkcol;
+      if(!s.insert_columns.empty()){
+        require(s.insert_columns.size()==cols.size(),"all columns must have values");
+        uint64_t seen=0;
+        for(size_t i=0;i<s.insert_columns.size();++i){auto c=column(cols,s.insert_columns[i]);
+          require(!(seen&(uint64_t(1)<<c)),"duplicate INSERT column");seen|=uint64_t(1)<<c;if(c==pkcol)position=i;
+        }
+      }
+    },[&](const std::vector<LiteralView>& tuple){
+      require(tuple.size()==cols.size(),"INSERT width mismatch");
+      const auto key=std::get<int64_t>(convert(tuple[position],cols[pkcol]));
+      if(have_previous&&key<=previous)throw Disorder{};
+      previous=key;have_previous=true;
+    },64);
+  }catch(const Disorder&){return false;}
+  return true;
+}
+Result Engine::insert_sequential(const std::string& sql){
+  // Owned page images remain valid while PK/index writes replace pool frames.
+  // Only new, header-invisible extents use append; bitmap bytes use normal undo.
+  struct Pending {std::string file;uint64_t page=0;Page bytes{};size_t first=PAGE,last=0;bool append=true;};
+  const size_t unit=sizeof(Pending)+128;
+  size_t capacity=std::min<size_t>(8,(storage.budget.limit-storage.budget.used)/2/unit);
+  Reservation pages_memory(storage.budget,capacity*unit);
+  std::vector<Pending> pages;pages.reserve(capacity);
+  auto flush=[&](Pending& p){if(p.append)storage.append_bytes(p.file,p.page,p.first,p.bytes.data()+p.first,p.last-p.first);else storage.write(p.file,p.page,p.bytes);};
+  auto edit=[&](const std::string& file,uint64_t page,size_t offset,const void* data,size_t length,bool append){
+    size_t i=0;for(;i<pages.size();++i)if(pages[i].file==file&&pages[i].page==page)break;
+    if(i==pages.size()){
+      if(pages.size()==capacity){flush(pages.front());pages.erase(pages.begin());}
+      Pending p;p.file=file;p.page=page;p.bytes=storage.read(file,page);p.append=append;pages.push_back(std::move(p));i=pages.size()-1;
+    }
+    auto& p=pages[i];std::memcpy(p.bytes.data()+offset,data,length);p.first=std::min(p.first,offset);p.last=std::max(p.last,offset+length);
+  };
+  auto set_valid=[&](const std::string& file,SlotId slot){auto number=slot/(PAGE*8);size_t bit=slot%(PAGE*8);std::byte byte{};
+    bool found=false;for(auto& p:pages)if(p.file==file&&p.page==number){byte=p.bytes[bit/8];found=true;break;}
+    if(!found)byte=storage.read(file,number)[bit/8];
+    byte|=std::byte(1U<<(bit%8));edit(file,number,bit/8,&byte,1,false);
+  };
+  Header h;std::string table;std::vector<Column> cols;std::vector<size_t> order;size_t pkcol=0;Result result;
+  parse_insert_rows(sql,[&](const Statement& s){table=s.table;h=header(table);cols=schema(h);pkcol=primary(cols);
+    if(s.insert_columns.empty()){for(size_t i=0;i<cols.size();++i)order.push_back(i);}else for(auto& name:s.insert_columns)order.push_back(column(cols,name));
+    require(order.size()==cols.size(),"all columns must have values");auto sorted=order;std::sort(sorted.begin(),sorted.end());require(std::adjacent_find(sorted.begin(),sorted.end())==sorted.end(),"duplicate INSERT column");
+  },[&](const std::vector<LiteralView>& tuple){
+    require(tuple.size()==cols.size(),"INSERT width mismatch");
+    size_t bytes=512+cols.size()*(sizeof(Value)+sizeof(LiteralView));for(size_t i=0;i<tuple.size();++i){auto& col=cols[order[i]];bytes+=col.type==Type::Vector?size_t(col.width)*4+tuple[i].text.size():(col.type==Type::Varchar?tuple[i].text.size()*4:0);}
+    Reservation row_memory(storage.budget,bytes);
+    std::vector<Value> values(cols.size());for(size_t j=0;j<tuple.size();++j)values[order[j]]=convert(tuple[j],cols[order[j]]);
+    if(!capacity){write_row(table,h.slots,std::move(values),cols,true);h=header(table);++result.affected_rows;return;}
+    require(h.slots<UINT32_MAX,"SlotId exhausted");SlotId slot=h.slots;auto key=std::get<int64_t>(values[pkcol]);PrimaryIndex pk(storage,table+".pk");require(!pk.find(key),"duplicate primary key");
+    Meta m;m.active=1;m.key=key;
+    if(h.nlist){m.bucket=assign(table,h,std::get<std::vector<float>>(values[h.ivector]));auto base=index_base(table,h);if(h.index_region[0])edit(base+".buckets",slot/(PAGE/4),(slot%(PAGE/4))*4,&m.bucket,4,true);posting(base,m.bucket,slot,true);}
+    for(size_t i=0;i<cols.size();++i){
+      if(cols[i].type==Type::Vector){auto& v=std::get<std::vector<float>>(values[i]);m.reserved|=has_extreme(v.data(),v.size())?1:0;auto count=PAGE/stride(cols[i]);edit(table+".v"+std::to_string(i),slot/count,(slot%count)*stride(cols[i]),v.data(),v.size()*4,true);values[i]=std::vector<float>{};}
+      else if(!cols[i].primary){auto hash=scalar_hash(values[i]);edit(table+".s"+std::to_string(i),slot/(PAGE/8),(slot%(PAGE/8))*8,&hash,8,true);}
+    }
+    auto packed=pack_values(values);require(packed.size()<storage.budget.limit/4,"row exceeds workspace budget");m.offset=h.blob_end;m.length=static_cast<uint32_t>(packed.size());
+    for(size_t at=0;at<packed.size();){auto offset=h.blob_end+at;auto n=std::min<size_t>(packed.size()-at,PAGE-offset%PAGE);edit(table+".blob",offset/PAGE,offset%PAGE,packed.data()+at,n,true);at+=n;}
+    h.blob_end+=packed.size();edit(table+".rows",slot/(PAGE/sizeof(Meta)),(slot%(PAGE/sizeof(Meta)))*sizeof(Meta),&m,sizeof(m),true);set_valid(table+".valid",slot);
+    pk.insert(key,slot);++h.slots;++h.active_count;if(h.nlist&&h.mutations_since_calibration<UINT64_MAX)++h.mutations_since_calibration;++result.affected_rows;
+  },64);
+  for(auto& p:pages)flush(p);
+  if(capacity)storage.store(table+".header",0,h);
+  return result;
+}
+Result Engine::insert_ordered(const std::string& sql){
   // Owned page images remain valid while PK/index writes replace pool frames.
   // Only new, header-invisible extents use append; bitmap bytes use normal undo.
   struct Pending {std::string file;uint64_t page=0;Page bytes{};size_t first=PAGE,last=0;bool append=true;};
@@ -542,6 +591,27 @@ Result Engine::execute_inner(const Statement& s){
   if(s.kind==Statement::CreateIndex){create_index(s,cols);return result;}
   std::vector<std::pair<size_t,Value>> predicates;for(auto& c:s.conditions){auto i=column(cols,c.column);auto type=cols[i];if(type.type==Type::Varchar)type.width=UINT32_MAX;predicates.emplace_back(i,convert({c.literal,c.quoted},type));}
   auto matches=[&](const std::vector<Value>& values){for(size_t j=0;j<predicates.size();++j){auto& [i,v]=predicates[j];auto n=compare(values[i],v);auto op=s.conditions[j].op;bool yes=(op=="="?n==0:op=="!="||op=="<>"?n!=0:op=="<"?n<0:op==">"?n>0:op=="<="?n<=0:n>=0);if(!yes)return false;}return true;};
+  // Only converted primary-key equalities establish a singleton candidate set.
+  // Keep all predicates for exact verification, including contradictory ANDs.
+  std::optional<int64_t> point_key;bool conflicting_key=false;
+  for(size_t j=0;j<predicates.size();++j)if(predicates[j].first==keycol&&s.conditions[j].op=="="){
+    auto key=std::get<int64_t>(predicates[j].second);
+    if(point_key&&*point_key!=key)conflicting_key=true;
+    else point_key=key;
+  }
+  auto point_slot=[&]()->std::optional<SlotId>{
+    if(conflicting_key)return {};
+    ++point_lookups;
+    auto slot=PrimaryIndex(storage,s.table+".pk").find(*point_key);
+    if(!slot||*slot>=h.slots)return {};
+    ++bitmap_blocks;
+    auto valid=storage.pool.view(s.table+".valid",*slot/(PAGE*8));
+    if(!(std::to_integer<uint8_t>(valid[(*slot%(PAGE*8))/8])&(uint8_t(1)<<(*slot%8))))return {};
+    ++candidate_slots;
+    auto m=meta(s.table,*slot);
+    if(!m.active||m.key!=*point_key)return {};
+    return slot;
+  };
   std::vector<std::pair<size_t,uint64_t>> equality_sketches;
   for(size_t j=0;j<predicates.size();++j)if(s.conditions[j].op=="="&&predicates[j].first!=keycol&&cols[predicates[j].first].type!=Type::Vector)equality_sketches.emplace_back(predicates[j].first,scalar_hash(predicates[j].second));
   auto signature_filter=[&](uint64_t start,std::array<uint64_t,64>& candidates){
@@ -562,11 +632,20 @@ Result Engine::execute_inner(const Statement& s){
     require(order.size()==cols.size(),"all columns must have values");auto sorted=order;std::sort(sorted.begin(),sorted.end());require(std::adjacent_find(sorted.begin(),sorted.end())==sorted.end(),"duplicate INSERT column");
     for(auto& tuple:s.rows){require(tuple.size()==cols.size(),"INSERT width mismatch");std::vector<Value> values(cols.size());for(size_t j=0;j<tuple.size();++j)values[order[j]]=convert(tuple[j],cols[order[j]]);auto slot=header(s.table).slots;write_row(s.table,slot,std::move(values),cols,true);++result.affected_rows;}return result;}
   if(s.kind==Statement::Update||s.kind==Statement::Delete){std::vector<std::pair<size_t,Value>> changes;for(auto& [name,v]:s.assignments){auto i=column(cols,name);changes.emplace_back(i,convert(v,cols[i]));}
+    if(point_key){
+      if(auto slot=point_slot()){
+        auto m=meta(s.table,*slot);auto values=row(s.table,*slot,m,cols,s.kind==Statement::Update);
+        if(matches(values)){for(auto& [i,v]:changes)values[i]=v;
+          write_row(s.table,*slot,std::move(values),cols,s.kind==Statement::Update);++result.affected_rows;}
+      }
+      return result;
+    }
     for(uint64_t start=0;start<h.slots;start+=4096){std::array<uint64_t,64> candidates{};
+      ++bitmap_blocks;
       auto valid=storage.pool.view(s.table+".valid",start/(PAGE*8));std::memcpy(candidates.data(),valid+(start%(PAGE*8))/8,sizeof(candidates));
       signature_filter(start,candidates);auto end=std::min<uint64_t>(4096,h.slots-start);
       each_set_bit(candidates,0,end,[&](size_t at){
-        auto slot=static_cast<SlotId>(start+at);auto m=meta(s.table,slot);if(!m.active)return;
+        ++candidate_slots;auto slot=static_cast<SlotId>(start+at);auto m=meta(s.table,slot);if(!m.active)return;
         auto values=row(s.table,slot,m,cols,s.kind==Statement::Update);if(!matches(values))return;
         for(auto& [i,v]:changes)values[i]=v;
         write_row(s.table,slot,std::move(values),cols,s.kind==Statement::Update);++result.affected_rows;
@@ -578,6 +657,27 @@ Result Engine::execute_inner(const Statement& s){
   for(auto& e:expressions){auto i=column(cols,e.column);selected.push_back(i);result.columns.push_back(e.alias);if(e.distance){require(cols[i].type==Type::Vector,"distance requires VECTOR");queries.push_back(std::get<std::vector<float>>(convert({e.query,true},cols[i])));}else queries.emplace_back();}
   std::vector<std::pair<size_t,bool>> order;
   for(auto& [name,desc]:s.order){size_t i=0;for(;i<expressions.size();++i)if(expressions[i].alias==name)break;if(i<expressions.size())order.emplace_back(i,desc);else order.emplace_back(expressions.size()+column(cols,name),desc);}
+  if(point_key){
+    read_cache.reset();last_probes=0;route="primary_point";
+    result.memory_rows=std::make_shared<std::vector<std::vector<Value>>>();
+    if(s.limit==0)return result;
+    bool need_vectors=false;
+    for(size_t i=0;i<expressions.size();++i)need_vectors|=expressions[i].distance||cols[selected[i]].type==Type::Vector;
+    if(auto slot=point_slot()){
+      auto m=meta(s.table,*slot);auto values=row(s.table,*slot,m,cols,need_vectors);
+      if(matches(values)){
+        std::vector<Value> output;
+        for(size_t i=0;i<expressions.size();++i){auto c=selected[i];
+          if(expressions[i].distance){auto& v=std::get<std::vector<float>>(values[c]);output.emplace_back(l2_exact(v.data(),queries[i].data(),v.size()));}
+          else output.push_back(values[c]);
+        }
+        size_t retained=sizeof(std::vector<Value>)+output.size()*sizeof(Value)+pack_values(output).size()+256;
+        result.memory_reservation=std::make_shared<Reservation>(storage.budget,retained);
+        result.memory_rows->push_back(std::move(output));
+      }
+    }
+    return result;
+  }
   if(fast_topk(s,h,cols,expressions,selected,queries,order,predicates,result))return result;
   read_cache.reset();
   const size_t projected=expressions.size(),pkpos=projected+cols.size();
@@ -598,8 +698,6 @@ Result Engine::execute_inner(const Statement& s){
   last_probes=0;route="exact";
   if(use_ivf&&!nprobe&&(h.active_count<4096||stale(h)||h.calibration_skipped||!h.recommended_nprobe||h.recommended_nprobe>h.nlist/2)){use_ivf=false;route="exact_fallback";}
   if(use_ivf){route="ivf";last_probes=std::min(nprobe?nprobe:h.recommended_nprobe,h.nlist);std::vector<std::pair<double,uint32_t>> distances;for(uint32_t b=0;b<h.nlist;++b){auto p=center_view(index_base(s.table,h),b,queries[distance_expr].size());distances.emplace_back(l2(queries[distance_expr].data(),p,queries[distance_expr].size()),b);}std::sort(distances.begin(),distances.end());for(size_t i=0;i<std::min<size_t>(last_probes,distances.size());++i)buckets.push_back(distances[i].second);}
-  std::optional<SlotId> exact_slot;bool pk_filter=false;
-  for(size_t j=0;j<s.conditions.size();++j)if(predicates[j].first==keycol&&s.conditions[j].op=="="){pk_filter=true;exact_slot=PrimaryIndex(storage,s.table+".pk").find(std::get<int64_t>(predicates[j].second));}
   if(s.limit==0)return result;
   std::vector<bool> query_safe;for(auto& q:queries)query_safe.push_back(!has_extreme(q.data(),q.size()));
   size_t preferred=cols.size();
@@ -617,6 +715,7 @@ Result Engine::execute_inner(const Statement& s){
     if(use_ivf){for(auto b:buckets){auto f=index_base(s.table,h)+".ivf"+std::to_string(b);auto page=storage.read(f,0);uint32_t count;std::memcpy(&count,page.data(),4);for(uint32_t i=0;i<count;++i){uint64_t offset=16+uint64_t(i)*4;if(offset%PAGE==0)page=storage.read(f,offset/PAGE);uint32_t slot;std::memcpy(&slot,page.data()+offset%PAGE,4);if(slot>=start&&slot<start+4096)candidates[(slot-start)/64]|=uint64_t(1)<<((slot-start)%64);}}}
     else candidates.fill(UINT64_MAX);
     std::array<uint64_t,64> visible{};
+    ++bitmap_blocks;
     auto valid=storage.pool.view(s.table+".valid",start/(PAGE*8));
     std::memcpy(visible.data(),valid+(start%(PAGE*8))/8,sizeof(visible));
     for(size_t word=0;word<64;++word)candidates[word]&=visible[word];
@@ -624,7 +723,7 @@ Result Engine::execute_inner(const Statement& s){
     // Finish the bitmap intersection before touching vector payload pages.
     auto end=std::min<uint64_t>(4096,h.slots-start);
     each_set_bit(candidates,0,end,[&](size_t at){auto slot=static_cast<SlotId>(start+at);auto mask=uint64_t(1)<<(at%64);auto& word=candidates[at/64];
-      bool yes=!(pk_filter&&(!exact_slot||slot!=*exact_slot));
+      ++candidate_slots;bool yes=true;
       if(yes&&!predicates.empty()){auto m=meta(s.table,slot);yes=m.active&&matches(row(s.table,slot,m,cols,false));}if(!yes)word&=~mask;
     });
     each_set_bit(candidates,0,end,[&](size_t at){auto slot=static_cast<SlotId>(start+at);

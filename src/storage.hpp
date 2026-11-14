@@ -72,6 +72,7 @@ public:
   void committed();
   void invalidate_prefix(const std::string&);
   void sync_all();
+  uint64_t page_accesses=0; // Logical pin requests, including cache hits; diagnostic only.
   uint64_t physical_reads=0,vector_reads=0,data_page_write_bytes=0;
   BufferPool(std::filesystem::path, MemoryBudget&);
   ~BufferPool();

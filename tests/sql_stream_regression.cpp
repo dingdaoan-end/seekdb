@@ -203,7 +203,32 @@ void vector_differential(const std::string& component){
     if(expected!=actual){std::fprintf(stderr,"vector bits differ: %s expected=%08x actual=%08x\n",component.c_str(),expected,actual);std::abort();}}
 }
 }
+void quoted_span_regressions(){
+  // Catch NUL-terminated searches, lost doubled quotes and comment handling
+  // inside an opaque literal; exercise the cursor immediately after closing.
+  std::string vector="[";for(size_t d=0;d<128;++d){if(d)vector+=',';vector+="-123.456789";}vector+=']';
+  differential("insert into t values (1,'"+vector+"'),(2,'"+vector+"'); -- tail\r\n");
+  for(size_t boundary:{size_t(16),size_t(16384),size_t(65536)})for(int offset=-1;offset<=1;++offset){
+    std::string raw(static_cast<size_t>(static_cast<long long>(boundary)+offset),'x');
+    raw+="''";raw+="\xe4\xb8\xad\xe6\x96\x87/* -- ;\r\n";raw.push_back('\0');raw+="after NUL''end";
+    const std::string sql="insert into t values (7,'"+raw+"'),(8,'plain') -- tail\r\n;;;";
+    differential(sql);size_t rows=0;
+    mvdb::parse_insert_rows(sql,[](const auto&){},[&](const auto& row){
+      assert(row.size()==2);const auto& literal=row[1];assert(literal.quoted);
+      if(rows++==0){assert(literal.escaped);assert(literal.text==raw);
+        assert(literal.text.data()==sql.data()+sql.find('\'')+1);}
+      else{assert(!literal.escaped);assert(literal.text=="plain");}
+    });assert(rows==2);
+    const std::string prefix="insert into t values (1,'"+raw;
+    for(const auto& suffix:std::vector<std::string>{"","''"}){
+      differential(prefix+suffix);
+      try{mvdb::parse(prefix+suffix);assert(false);}catch(const std::runtime_error& e){assert(std::string(e.what())=="unterminated SQL string");}
+    }
+    for(const auto& suffix:std::vector<std::string>{"@"," select * from t","/*"})differential(sql+suffix);
+  }
+}
 void sql_stream_regressions(){
+  quoted_span_regressions();
   // Truncating a 64-byte fallback buffer would admit the malformed suffixes,
   // lose exponents, or change rounding around the float midpoint at 1 + 2^-24.
   for(const std::string& component:std::vector<std::string>{
@@ -316,6 +341,29 @@ void short_fallback_allocations(){
   std::printf("128 common decimal components: %zu allocations (one output vector allowed)\n",allocation_count);
   assert(allocation_count==1);assert(std::get<std::vector<float>>(common)[0]==-12.123456f);
 }
+void lex_benchmark(){
+  // Each sample parses 100 batches x 100 rows x 128 quoted components.
+  // The vector stays opaque; primary mode additionally converts only id.
+  std::string sql="insert into t (id,v) values ";
+  for(size_t r=0;r<100;++r){if(r)sql+=',';sql+='(';sql+=std::to_string(r);sql+=",'[";
+    for(size_t d=0;d<128;++d){if(d)sql+=',';if((r+d)%3==0)sql+='-';
+      sql+=std::to_string((r*131+d*17)%1000)+"."+std::to_string(100000+(r*19+d*13)%900000);}
+    sql+="]')";
+  }
+  const mvdb::Column id{"id",mvdb::Type::Bigint,0,true};size_t checksum=0;
+  for(int trial=0;trial<8;++trial)for(bool primary:{false,true}){
+    const auto start=std::chrono::steady_clock::now();const auto cpu_start=std::clock();
+    allocation_count=0;count_allocations=true;
+    for(size_t batch=0;batch<100;++batch)mvdb::parse_insert_rows(sql,[](const auto&){},[&](const auto& row){
+      checksum+=row[1].text.size();if(primary)checksum+=static_cast<size_t>(std::get<int64_t>(mvdb::convert(row[0],id)));
+    });
+    count_allocations=false;
+    const auto us=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-start).count();
+    const auto cpu_us=static_cast<long long>((std::clock()-cpu_start)*1000000.0/CLOCKS_PER_SEC);
+    std::printf("trial=%d mode=%s batches=100 rows=100 dimensions=128 sql_bytes=%zu elapsed_us=%lld cpu_us=%lld allocations=%zu checksum=%zu\n",
+      trial,primary?"parse-primary-only":"parse-opaque",sql.size(),static_cast<long long>(us),cpu_us,allocation_count,checksum);
+  }
+}
 void conversion_benchmark(){
   // Exactly 100 batches x 100 rows x 128 dimensions = 1,280,000 components.
   std::vector<std::string> rows;for(size_t r=0;r<100;++r){std::string text="[";
@@ -338,6 +386,7 @@ void conversion_benchmark(){
 }
 }
 int main(int argc,char** argv){
+  if(argc==2&&std::string_view(argv[1])=="--lex-benchmark"){lex_benchmark();return 0;}
   if(argc==2&&std::string_view(argv[1])=="--benchmark"){conversion_benchmark();return 0;}
   sql_stream_regressions();short_fallback_allocations();std::puts("SQL vector differential and allocation regressions passed");
 }

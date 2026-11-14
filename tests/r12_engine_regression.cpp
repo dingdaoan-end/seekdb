@@ -52,8 +52,61 @@ void borrowed_insert_boundary(const std::filesystem::path& path,size_t rows,bool
 }
 void r12_engine_regressions(){
  const std::filesystem::path root="/tmp/mvdb_r12_engine";std::filesystem::remove_all(root);
+ // Detect order before any writes: late disorder must not duplicate wide
+ // payload writes by speculatively inserting and undoing a sorted prefix.
+ {std::array<uint64_t,2> writes{};
+  for(int disorder=0;disorder<2;++disorder){mvdb::Engine e(root/("preflight_writes"+std::to_string(disorder)),1<<20);
+   e.execute("CREATE TABLE t(id BIGINT PRIMARY KEY,s VARCHAR(4096),v VECTOR(2))");auto before=e.data_page_write_bytes();
+   for(int batch=0;batch<8;++batch){std::string q="INSERT INTO t VALUES ";
+    for(int i=0;i<100;++i){int ordinal=disorder&&i>=98?197-i:i;if(i)q+=",";q+="("+std::to_string(batch*100+ordinal)+",'"+std::string(3000,'x')+"','[1,2]')";}
+    assert(e.execute(q).affected_rows==100);
+   }
+   writes[disorder]=e.data_page_write_bytes()-before;
+  }
+  assert(writes[1]==writes[0]);
+ }
+ // Strictly ascending input must use the original sequential writer without
+ // batch keys/views, including full-width keys and a column permutation.
+ {mvdb::Engine e(root/"ascending",1<<20);e.execute("CREATE TABLE t(id BIGINT PRIMARY KEY,s VARCHAR(16))");
+  auto ordered=e.ordered_pk_batch_count(),borrowed=e.borrowed_insert_batch_count();
+  std::string q="INSERT INTO t(s,id) VALUES ";
+  for(int i=0;i<100;++i){if(i)q+=",";q+="('x',"+std::to_string(-100+i)+")";}
+  assert(e.execute(q).affected_rows==100);
+  e.execute("INSERT INTO t VALUES(-9223372036854775808,'min'),(9007199254740993,'large'),(9223372036854775807,'max')");
+  assert(e.ordered_pk_batch_count()==ordered&&e.borrowed_insert_batch_count()==borrowed);
+  assert(e.active_rows("t")==103);
+ }
+ // A late inversion would flush more than eight pages if written speculatively.
+ // Preflight must preserve input slots and the row preceding the statement in an
+ // outer transaction; a subsequent duplicate and syntax error undo just SQL.
+ {mvdb::Engine e(root/"late_inversion",1<<20);e.execute("CREATE TABLE t(id BIGINT PRIMARY KEY,s VARCHAR(4096))");
+  e.execute("BEGIN");e.execute("INSERT INTO t VALUES(10000,'prior')");
+  std::string q="INSERT INTO t VALUES ";
+  for(int i=0;i<100;++i){if(i)q+=",";q+="("+std::to_string(i==99?-1:i)+",'"+std::string(3000,'x')+"')";}
+  assert(e.execute(q).affected_rows==100);assert(e.active_rows("t")==101);
+  auto before=e.ordered_pk_batch_count();
+  q="INSERT INTO t VALUES ";
+  for(int i=0;i<100;++i){if(i)q+=",";q+="("+std::to_string(i==99?199:200+i)+",'"+std::string(3000,'y')+"')";}
+  for(const auto& bad:{q+",(200,'duplicate')",q+",(400,'late') garbage"}){
+   bool failed=false;try{e.execute(bad);}catch(const std::exception&){failed=true;}assert(failed&&e.active_rows("t")==101);
+  }
+  assert(e.ordered_pk_batch_count()==before);
+  // Reuse every failed-statement key: no failed PK entry may survive.
+  assert(e.execute(q).affected_rows==100&&e.active_rows("t")==201);
+  e.execute("COMMIT");e.close();
+  std::ifstream f(root/"late_inversion/data/t.rows",std::ios::binary);assert(f);
+  for(int i=0;i<201;++i){int64_t key=0;f.read(reinterpret_cast<char*>(&key),8);f.seekg(24,std::ios::cur);assert(f&&key==(i==0?10000:i<100?i-1:i==100?-1:i<200?i+99:199));}
+  mvdb::Engine reopened(root/"late_inversion",1<<20);
+  assert(reopened.active_rows("t")==201);
+  assert(ids(reopened,"SELECT id FROM t WHERE id=199 LIMIT 1")==std::vector<int64_t>{199});
+ }
  {mvdb::Engine e(root/"wide",262144);e.execute("CREATE TABLE t(id BIGINT PRIMARY KEY,s VARCHAR(100000))");
   assert(e.execute("INSERT INTO t VALUES(1,'"+std::string(14500,'x')+"')").affected_rows==1);
+ }
+ {mvdb::Engine e(root/"tiny",65536);e.execute("CREATE TABLE t(id BIGINT PRIMARY KEY,s VARCHAR(16))");
+  e.execute("INSERT INTO t VALUES(-3,'a'),(-2,'b'),(-1,'c')");
+  e.execute("INSERT INTO t VALUES(3,'d'),(2,'e'),(1,'f')");
+  assert(ids(e,"SELECT id FROM t ORDER BY id LIMIT 10")==std::vector<int64_t>({-3,-2,-1,1,2,3}));
  }
  borrowed_insert_boundary(root/"borrowed_128_4",128,false);
  borrowed_insert_boundary(root/"borrowed_129_4",129,false);

@@ -160,6 +160,7 @@ void BufferPool::flush(size_t i) {
   }
 }
 size_t BufferPool::pin(const std::string& file,uint64_t page) {
+  ++page_accesses;
   auto key=file+":"+std::to_string(page);auto found=lookup.find(key);
   if(found!=lookup.end()){frames[found->second].age=++clock;return found->second;}
   // Give frequently reused primary/header pages a bounded protected share.
