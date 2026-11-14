@@ -1,5 +1,6 @@
 #include "storage.hpp"
 #include <algorithm>
+#include <bit>
 #include <cerrno>
 #include <cstdlib>
 #include <fcntl.h>
@@ -10,6 +11,28 @@
 #include <zlib.h>
 
 namespace mvdb {
+size_t detail::bitmap_next(const std::byte* bytes,size_t begin,size_t end,bool want_set){
+  if(begin>=end)return end;
+  size_t base=begin-begin%64;
+  for(;;){
+    const size_t valid=std::min<size_t>(64,end-base);
+    const size_t count=(valid+7)/8;
+    uint64_t word=0;
+    if constexpr(std::endian::native==std::endian::little){
+      if(count==sizeof(word))std::memcpy(&word,bytes+base/8,sizeof(word));
+      else std::memcpy(&word,bytes+base/8,count);
+    }
+    else
+      for(size_t i=0;i<count;++i)word|=uint64_t(std::to_integer<unsigned>(bytes[base/8+i]))<<(8*i);
+    if(!want_set)word=~word;
+    word&=~uint64_t(0)<<(begin-base);
+    if(valid<64)word&=(uint64_t(1)<<valid)-1;
+    // countr_zero is reached only for a nonzero word on every platform.
+    if(word)return base+std::countr_zero(word);
+    if(end-base<=64)return end;
+    base+=64;begin=base;
+  }
+}
 namespace {
 void require(bool yes,const char* message) { if(!yes) throw std::runtime_error(message); }
 template<class F> auto retry_eintr(F operation){
@@ -112,6 +135,8 @@ std::optional<LogRecord> read_record(int fd,uint64_t pos) {
   return LogRecord{bytes[0],bytes.substr(1),pos+8+n};
 }
 }
+
+std::string detail::page_delta(const std::string& file,uint64_t page,const Page& old,const Page& next){return delta(file,page,old,next);}
 
 void MemoryBudget::acquire(size_t n) {require(n<=limit-used,"memory budget exceeded");used+=n;peak=std::max(peak,used);}
 BufferPool::BufferPool(std::filesystem::path path,MemoryBudget& b):directory(std::move(path)),budget(b) {

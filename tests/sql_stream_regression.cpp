@@ -7,6 +7,27 @@
 #include <limits>
 #include <stdexcept>
 #include <cassert>
+#include <bit>
+#include <cstdio>
+#include <chrono>
+#include <ctime>
+#include <cstdlib>
+#ifdef MVDB_SQL_STREAM_STANDALONE
+#include <new>
+namespace {
+bool count_allocations=false;size_t allocation_count=0;
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
+void release_allocation(void* p){std::free(p);}
+}
+void* operator new(size_t n){if(count_allocations)++allocation_count;if(auto p=std::malloc(n?n:1))return p;throw std::bad_alloc();}
+void* operator new[](size_t n){return ::operator new(n);}
+void operator delete(void* p) noexcept {release_allocation(p);}
+void operator delete[](void* p) noexcept {release_allocation(p);}
+void operator delete(void* p,size_t) noexcept {release_allocation(p);}
+void operator delete[](void* p,size_t) noexcept {release_allocation(p);}
+#endif
 // Frozen baseline 9c8798a lexer/parser and conversion oracle.
 namespace reference {
 using namespace mvdb;
@@ -169,8 +190,57 @@ void differential(const std::string& sql){
     assert(stream_ok==old_ok);if(old_ok)assert(shape(old)==shape(streamed));
   }
 }
+// Compare acceptance and float storage bits, including negative zero. The
+// frozen R9 oracle deliberately rounds decimal -> double -> float, not strtof.
+void vector_differential(const std::string& component){
+  const std::string text="["+component+"]";mvdb::Column col{"v",mvdb::Type::Vector,1,false};
+  bool a=false,b=false;mvdb::Value x,y;
+  try{x=reference::convert(mvdb::Literal{text,true},col);a=true;}catch(const std::runtime_error&){}
+  try{y=mvdb::convert(mvdb::LiteralView{text,true,false},col);b=true;}catch(const std::runtime_error&){}
+  if(a!=b){std::fprintf(stderr,"vector acceptance differs: %s\n",component.c_str());std::abort();}
+  if(a){const auto expected=std::bit_cast<uint32_t>(std::get<std::vector<float>>(x)[0]);
+    const auto actual=std::bit_cast<uint32_t>(std::get<std::vector<float>>(y)[0]);
+    if(expected!=actual){std::fprintf(stderr,"vector bits differ: %s expected=%08x actual=%08x\n",component.c_str(),expected,actual);std::abort();}}
+}
 }
 void sql_stream_regressions(){
+  // Truncating a 64-byte fallback buffer would admit the malformed suffixes,
+  // lose exponents, or change rounding around the float midpoint at 1 + 2^-24.
+  for(const std::string& component:std::vector<std::string>{
+      "0","-0","+.5","-.0","1.","0000000001.000000000","0x1.8p+2","-0x0p0",
+      "1.000000059604644775390625000000000000000000000000000000000000000001",
+      "1.000000059604644775390624999999999999999999999999999999999999999999",
+      "1.401298464324817070923729583289916131280261941876515771757068283e-45",
+      "-7.006492321624085354618647916449580656401309709382578858785341419e-46",
+      "3.40282346638528859811704183484516925440e38","3.4028235e38",
+      "1e309","-1e-999","NaN","-nan(payload)","+inf","infinity","+-1","--1",
+      "1e+","0x1p-","1.2.3","0x"+std::string(100,'0')+"1p-1",
+      "0."+std::string(80,'0')+"1e81","1"+std::string(100,'0')+"e-100",
+      "1."+std::string(100,'0')+"oops","-0x1."+std::string(100,'0')+"p-9999"})vector_differential(component);
+  for(size_t length:{size_t(63),size_t(64),size_t(65)}){
+    vector_differential("0x1."+std::string(length-6,'0')+"p0");
+    vector_differential("0x1."+std::string(length-6,'0')+"p0oops");
+  }
+  const mvdb::Column singleton{"v",mvdb::Type::Vector,1,false};
+  const auto midpoint=mvdb::convert(mvdb::LiteralView{
+    "[1.000000059604644775390625000000000000000000000000000000000000000001]",true,false},singleton);
+  assert(std::bit_cast<uint32_t>(std::get<std::vector<float>>(midpoint)[0])==0x3f800000u);
+  // The borrowed span need not have a terminator; bytes after it are invisible.
+  const std::string bounded="[0x1.8p0]invalid";
+  const auto bounded_value=mvdb::convert(mvdb::LiteralView{std::string_view(bounded).substr(0,9),true,false},singleton);
+  assert(std::get<std::vector<float>>(bounded_value)[0]==1.5f);
+  uint32_t conversion_seed=0x1234abcd;
+  for(size_t i=0;i<2400;++i){
+    conversion_seed=conversion_seed*1664525u+1013904223u;
+    std::string token=std::to_string(conversion_seed%1000000000u);
+    if(i%2)token.insert(token.size()/2,".");
+    if(i%3==0)token="-"+token;else if(i%3==1)token="+"+token;
+    if(i%4==0)token+="e"+std::to_string(static_cast<int>(conversion_seed%801)-400);
+    if(i%5==0)token+=" ";
+    if(i%7==0)token+="garbage";
+    if(i%11==0)token="0x"+token+"p-4";
+    vector_differential(token);
+  }
   const std::vector<std::string> cases={
     "SELECT id, L2_DISTANCE(v,'[1e-2, +2,0x1p2]') AS d FROM T WHERE id >= -2 AND label='O''Brien' ORDER BY d ASC, id DESC LIMIT +3;;--end",
     "select * from t /*comment*/;", "select l2_distance(v,'[1,2]') from t order by l2_distance limit 0",
@@ -227,3 +297,48 @@ void sql_stream_regressions(){
     assert(a==b);if(a)assert(x==y);
   }
 }
+
+#ifdef MVDB_SQL_STREAM_STANDALONE
+namespace {
+void short_fallback_allocations(){
+  std::string text="[";for(size_t i=0;i<128;++i){if(i)text+=',';text+="0x1.000000000000000000000000001p0";}text+=']';
+  const mvdb::Column col{"v",mvdb::Type::Vector,128,false};
+  mvdb::convert(mvdb::LiteralView{text,true,false},col); // Initialize numeric locale.
+  allocation_count=0;count_allocations=true;
+  auto value=mvdb::convert(mvdb::LiteralView{text,true,false},col);
+  count_allocations=false;
+  std::printf("128 short fallback components: %zu allocations (one output vector allowed)\n",allocation_count);std::fflush(stdout);
+  assert(allocation_count==1);assert(std::get<std::vector<float>>(value).size()==128);
+  std::string decimal="[";for(size_t i=0;i<128;++i){if(i)decimal+=',';decimal+="-12.123456";}decimal+=']';
+  allocation_count=0;count_allocations=true;
+  auto common=mvdb::convert(mvdb::LiteralView{decimal,true,false},col);
+  count_allocations=false;
+  std::printf("128 common decimal components: %zu allocations (one output vector allowed)\n",allocation_count);
+  assert(allocation_count==1);assert(std::get<std::vector<float>>(common)[0]==-12.123456f);
+}
+void conversion_benchmark(){
+  // Exactly 100 batches x 100 rows x 128 dimensions = 1,280,000 components.
+  std::vector<std::string> rows;for(size_t r=0;r<100;++r){std::string text="[";
+    for(size_t d=0;d<128;++d){if(d)text+=',';text+=((r+d)%3==0?"-":"");
+      text+=std::to_string((r*131+d*17)%1000)+"."+std::to_string(100000+(r*19+d*13)%900000);}
+    text+=']';rows.push_back(std::move(text));}
+  const mvdb::Column col{"v",mvdb::Type::Vector,128,false};double checksum=0;
+  // Alternating ordering reduces warm-up/order bias; report every sample.
+  for(int trial=0;trial<6;++trial){for(int order=0;order<2;++order){const bool oracle=(trial%2==order);
+    size_t allocations=0;const auto start=std::chrono::steady_clock::now();const auto cpu_start=std::clock();
+    allocation_count=0;count_allocations=true;
+    for(size_t batch=0;batch<100;++batch)for(const auto& text:rows){
+      auto result=oracle?reference::convert(mvdb::Literal{text,true},col):mvdb::convert(mvdb::LiteralView{text,true,false},col);
+      checksum+=std::get<std::vector<float>>(result)[batch%128];}
+    count_allocations=false;allocations=allocation_count;
+    const auto us=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-start).count();
+    const auto cpu_us=static_cast<long long>((std::clock()-cpu_start)*1000000.0/CLOCKS_PER_SEC);
+    std::printf("trial=%d converter=%s components=1280000 elapsed_us=%lld cpu_us=%lld allocations=%zu checksum=%.17g\n",trial,oracle?"frozen-R9":"current",static_cast<long long>(us),cpu_us,allocations,checksum);
+  }}
+}
+}
+int main(int argc,char** argv){
+  if(argc==2&&std::string_view(argv[1])=="--benchmark"){conversion_benchmark();return 0;}
+  sql_stream_regressions();short_fallback_allocations();std::puts("SQL vector differential and allocation regressions passed");
+}
+#endif

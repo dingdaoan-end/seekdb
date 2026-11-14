@@ -10,7 +10,9 @@
 using namespace mvdb;
 static std::vector<int64_t> ids(Engine& e,const std::string& q){std::vector<int64_t> out;e.execute(q).each([&](const auto& r){out.push_back(std::get<int64_t>(r[0]));});return out;}
 static std::string query(const std::string& vector,const std::string& filter="") {return "SELECT id,L2_distance(v,'"+vector+"') AS d FROM t "+filter+" ORDER BY d,id LIMIT 10;";}
+void r12_index_regressions();
 int main(){
+ r12_index_regressions();
  // Keep both strict boundaries: 25,000 active rows still calibrate regardless
  // of payload, and a larger table skips only above half its configured budget.
  assert(!detail::skip_ivf_calibration_for_payload(25000,12800000,1048576));

@@ -6,8 +6,12 @@
 #include <filesystem>
 #include <iostream>
 void sql_stream_regressions();
+void r12_engine_regressions();
+void r12_query_regressions();
 int main(){
   sql_stream_regressions();
+  r12_engine_regressions();
+  r12_query_regressions();
   const std::filesystem::path root="/tmp/mvdb_core_phase2";
   std::filesystem::remove_all(root);
   mvdb::Result result;

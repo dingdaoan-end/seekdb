@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #include <cstdarg>
 #include <cerrno>
+#include <sys/mman.h>
 using namespace mvdb;
 // Deterministically emulate filesystems rejecting O_DIRECT at open or first
 // I/O. The kernel handles all operations outside each narrowly scoped test.
@@ -214,11 +215,120 @@ void resident_handles(){
  for(int repeat=0;repeat<2;repeat++)for(int i=0;i<480;i++)large.read("v",i);
  assert(large.pool.physical_reads==reads+480&&large.budget.peak<=large.budget.limit);
 }
+// Exhaustive small intervals plus randomized, deliberately unaligned buffers.
+// The inaccessible next page catches even a one-byte read beyond ceil(end/8).
+void bitmap_words(){
+ size_t cases=0;std::mt19937_64 random(0xb17b17);
+ auto check=[&](const std::byte* bytes,size_t begin,size_t end,bool set){
+  size_t expected=begin;while(expected<end&&bool((std::to_integer<unsigned>(bytes[expected/8])>>(expected%8))&1)!=set)++expected;
+  assert(detail::bitmap_next(bytes,begin,end,set)==expected);++cases;
+ };
+ assert(detail::bitmap_next(nullptr,0,0,true)==0);
+ for(unsigned pattern=0;pattern<256;++pattern){std::array<std::byte,17> bytes;bytes.fill(std::byte(pattern));
+  for(size_t begin=0;begin<=128;++begin)for(size_t end=begin;end<=128;++end)for(bool set:{false,true})check(bytes.data()+1,begin,end,set);
+ }
+ for(size_t alignment=0;alignment<8;++alignment){std::array<std::byte,265> bytes;
+  for(int trial=0;trial<4096;++trial){for(auto& b:bytes)b=std::byte(random());size_t end=random()%2049,begin=random()%(end+1);
+   for(bool set:{false,true})check(bytes.data()+alignment,begin,end,set);
+  }
+ }
+ auto page_size=static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+ auto mapping=static_cast<std::byte*>(::mmap(nullptr,2*page_size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0));assert(mapping!=MAP_FAILED);
+ assert(::mprotect(mapping+page_size,page_size,PROT_NONE)==0);
+ for(size_t bits=1;bits<=1024;++bits){auto bytes=mapping+page_size-(bits+7)/8;
+  for(bool fill:{false,true}){std::memset(bytes,fill?255:0,(bits+7)/8);
+   for(bool set:{false,true})for(size_t begin:{size_t(0),bits/2,bits-1,bits})check(bytes,begin,bits,set);
+  }
+ }
+ assert(::munmap(mapping,2*page_size)==0);std::cout<<"bitmap oracle cases="<<cases<<"\n";
+}
+
+
+// Independent bytewise R9 encoder: retain short equal gaps exactly, including
+// eight-byte gaps and the final byte. Test the actual production encoder seam.
+std::string bytewise_delta(const std::string& file,uint64_t page,const Page& old,const Page& next){
+ std::string out;
+ auto append=[&](auto value){out.append(reinterpret_cast<const char*>(&value),sizeof(value));};
+ append(static_cast<uint8_t>(file.size()));out+=file;append(page);
+ size_t i=0;while(i<PAGE){while(i<PAGE&&old[i]==next[i])++i;if(i==PAGE)break;
+  size_t start=i++,end=i;while(i<PAGE){if(old[i]!=next[i])end=i+1;if(i>=end+8)break;++i;}
+  append(static_cast<uint16_t>(start));append(static_cast<uint16_t>(end-start));
+  out.append(reinterpret_cast<const char*>(next.data()+start),end-start);i=end;
+ }return out;
+}
+void decode_test_delta(const std::string& encoded,Page& page){
+ size_t pos=1+std::to_integer<unsigned>(std::byte(encoded[0]))+sizeof(uint64_t);
+ while(pos<encoded.size()){
+  uint16_t offset,n;assert(pos+4<=encoded.size());std::memcpy(&offset,encoded.data()+pos,2);std::memcpy(&n,encoded.data()+pos+2,2);pos+=4;
+  assert(n&&offset+n<=PAGE&&pos+n<=encoded.size());std::memcpy(page.data()+offset,encoded.data()+pos,n);pos+=n;
+ }
+ assert(pos==encoded.size());
+}
+void delta_oracle(){
+ uint64_t cases=0,encoded_bytes=0;
+ auto check=[&](const Page& a,const Page& b){
+  const std::string name="delta.file.v1";constexpr uint64_t page=0x1020304050607080ULL;
+  auto next=detail::page_delta(name,page,a,b),forward=bytewise_delta(name,page,a,b);
+  assert(next==forward);encoded_bytes+=next.size();
+  auto reverse=detail::page_delta(name,page,b,a);assert(reverse==bytewise_delta(name,page,b,a));
+  Page actual=a;decode_test_delta(next,actual);assert(actual==b);
+  decode_test_delta(reverse,actual);assert(actual==a);++cases;
+ };
+ struct OffsetPage{std::byte prefix;Page page;};
+  std::mt19937_64 random(0x5afed311);
+  alignas(64) std::array<OffsetPage,8> old_slots{},new_slots{};unsigned alignments=0;
+  for(size_t alignment=0;alignment<8;++alignment){
+    auto& old=old_slots[alignment].page;auto& next=new_slots[alignment].page;
+    alignments|=1U<<(reinterpret_cast<uintptr_t>(old.data())%8);
+    for(auto& byte:old)byte=std::byte(random()&255);
+    next=old;check(old,next);
+    for(size_t offset=alignment;offset<PAGE;offset+=8){next=old;next[offset]^=std::byte{0xff};check(old,next);}
+    for(size_t gap=1;gap<=24;++gap)for(size_t offset=alignment;offset<PAGE;offset+=128){
+      next=old;next[offset]^=std::byte{1};if(offset+gap<PAGE)next[offset+gap]^=std::byte{2};check(old,next);
+    }
+    for(size_t width:{size_t(1),size_t(7),size_t(8),size_t(9),size_t(15),size_t(16),size_t(17),size_t(63),size_t(64),size_t(65),size_t(4095),size_t(4096),size_t(4097),PAGE}){
+      next=old;for(size_t i=PAGE-width;i<PAGE;++i)next[i]^=std::byte{0xaa};check(old,next);
+    }
+  }
+  assert(alignments==255);Page old{},next{};
+  for(int iteration=0;iteration<4096;++iteration){
+    for(auto& byte:old)byte=std::byte(random()&255);
+    next=old;
+    switch(iteration%6){
+      case 0:break;
+      case 1:next[random()%PAGE]^=std::byte{1};break;
+      case 2:for(int i=0;i<23;++i)next[random()%PAGE]=std::byte(random()&255);break;
+      case 3:{size_t first=random()%PAGE,n=std::min<size_t>(1+random()%2048,PAGE-first);for(size_t i=first;i<first+n;++i)next[i]^=std::byte{0x5a};break;}
+      case 4:for(size_t i=0;i<PAGE;i+=1+random()%15)next[i]=std::byte(random()&255);break;
+      case 5:for(auto& byte:next)byte=std::byte(random()&255);break;
+    }check(old,next);
+  }
+
+ assert(cases==45176);
+ std::cout<<"delta oracle cases="<<cases<<" forward_bytes="<<encoded_bytes<<" pointer_alignments=8 redo_undo=exact\n";
+}
+
+void primary_split_rollback(){
+ auto d=base/"primary_split_rollback";
+ {Storage s(d,65536);PrimaryIndex index(s,"primary");s.begin();
+  // Fill a single leaf, then roll back the insertion that creates a new root.
+  for(int i=999;i>=0;--i)index.insert(i,SlotId(i+1));
+  s.commit();s.begin();auto mark=s.savepoint();
+  index.insert(1000,1001);assert(index.find(1000)==1001);s.rollback_to(mark);
+  assert(!index.find(1000));for(int i=0;i<1000;++i)assert(index.find(i)==SlotId(i+1));
+  // Keep physical slot identifiers in input order despite sorted insertion.
+  for(int i=1000;i<2500;++i)index.insert(i,SlotId(9000-i));
+  s.commit();assert(s.budget.peak<=s.budget.limit);
+ }
+ {Storage s(d,65536);PrimaryIndex index(s,"primary");for(int i=0;i<2500;++i)assert(index.find(i)==SlotId(i<1000?i+1:9000-i));}
+ std::cout<<"primary split rollback and ordered slot mapping passed\n";
+}
+
 int main(int argc,char** argv){
  ::unsetenv("MVDB_USE_ODIRECT");
  if(argc==2){std::filesystem::remove_all(base);std::string test=argv[1];
-  if(test=="buffered")buffered_default();else if(test=="metadata")metadata_scan();else if(test=="sync")transaction_sync_boundary();else if(test=="interrupt")interrupted_io();else if(test=="append")invisible_append();else if(test=="resident")resident_handles();else if(test=="batch")batched_append();else return 2;return 0;}
- std::filesystem::remove_all(base);buffered_default();metadata_scan();transaction_sync_boundary();interrupted_io();invisible_append();batched_append();resident_handles();
+  if(test=="delta")delta_oracle();else if(test=="primary")primary_split_rollback();else if(test=="bitmap")bitmap_words();else if(test=="buffered")buffered_default();else if(test=="metadata")metadata_scan();else if(test=="sync")transaction_sync_boundary();else if(test=="interrupt")interrupted_io();else if(test=="append")invisible_append();else if(test=="resident")resident_handles();else if(test=="batch")batched_append();else return 2;return 0;}
+ std::filesystem::remove_all(base);delta_oracle();primary_split_rollback();bitmap_words();buffered_default();metadata_scan();transaction_sync_boundary();interrupted_io();invisible_append();batched_append();resident_handles();
  for(int mode=1;mode<=3;mode++){
   ::setenv("MVDB_USE_ODIRECT","1",1);
   auto fallback=base/("direct_fallback"+std::to_string(mode));reject_direct=mode;direct_rejections=0;

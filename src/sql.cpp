@@ -74,6 +74,23 @@ int64_t integer(std::string_view s) {
   if(ec!=std::errc{}||end!=s.data()+s.size())error("invalid or overflowing BIGINT");
   return n;
 }
+// Short plain decimals need no general-purpose conversion. Both the integer
+// (at most nine digits) and 10^fraction are exactly representable as doubles,
+// so this division rounds once to double, just like the R9 converter. Keep
+// the subsequent float cast: parsing directly to float changes midpoint cases.
+bool short_decimal(const char* first,const char* last,double& value,const char*& end){
+  const char* p=first;const bool negative=p!=last&&*p=='-';if(negative)++p;
+  uint32_t mantissa=0;unsigned digits=0,fraction=0;bool dot=false;
+  while(p!=last){const unsigned digit=static_cast<unsigned char>(*p)-'0';
+    if(digit<10){if(digits==9)return false;mantissa=mantissa*10+digit;++digits;if(dot)++fraction;++p;}
+    else if(*p=='.'&&!dot){dot=true;++p;}else break;
+  }
+  // Only finish at an actual separator. Exponents, hex and malformed tokens
+  // retain the original parser and its exact admission/overflow behavior.
+  if(!digits||(p!=last&&*p!=','&&*p!=']'&&!std::isspace(static_cast<unsigned char>(*p))))return false;
+  static constexpr double powers[]={1,10,100,1000,10000,100000,1000000,10000000,100000000,1000000000};
+  value=static_cast<double>(mantissa)/powers[fraction];if(negative)value=-value;end=p;return true;
+}
 struct Parser {
   Cursor cursor;
   explicit Parser(const std::string& s):cursor(s){}
@@ -171,23 +188,31 @@ Value convert(const LiteralView& v,const Column& col) {
     const char* first=v.text.data()+p;const char* last=v.text.data()+v.text.size();
     const char* number=first;if(number!=last&&*number=='+')++number;
     if(number==last||(number!=first&&(*number=='-'||*number=='+')))error("invalid VECTOR component");
-    double x=0;auto parsed=std::from_chars(number,last,x,std::chars_format::general);
-    const char* end=parsed.ptr;
-    const char* magnitude=number;if(magnitude!=last&&*magnitude=='-')++magnitude;
-    const bool hex=last-magnitude>=2&&magnitude[0]=='0'&&(magnitude[1]=='x'||magnitude[1]=='X');
-    if(hex||parsed.ec==std::errc::result_out_of_range){
-      // Preserve strtod's hexadecimal and underflow-to-zero admission, using
-      // an explicit locale only on these uncommon paths. Decimal parsing is
-      // allocation-free and independent of the process locale.
-      static locale_t c_locale=[] {auto locale=newlocale(LC_NUMERIC_MASK,"C",nullptr);if(!locale)error("cannot create numeric locale");return locale;}();
-      // strtod requires a terminator. Bound its scratch copy to this numeric
-      // component, so many hex/underflow values remain linear in input size
-      // and a whitespace tail is never copied once per component.
-      const char* component_end=first;
-      while(component_end!=last&&*component_end!=','&&*component_end!=']'&&
-            !std::isspace(static_cast<unsigned char>(*component_end)))++component_end;
-      std::string bounded(first,component_end);char* fallback_end=nullptr;x=strtod_l(bounded.c_str(),&fallback_end,c_locale);end=first+(fallback_end-bounded.data());
-    }else if(parsed.ec!=std::errc{})error("invalid VECTOR component");
+    double x=0;const char* end=number;
+    if(!short_decimal(number,last,x,end)){
+      auto parsed=std::from_chars(number,last,x,std::chars_format::general);end=parsed.ptr;
+      const char* magnitude=number;if(magnitude!=last&&*magnitude=='-')++magnitude;
+      const bool hex=last-magnitude>=2&&magnitude[0]=='0'&&(magnitude[1]=='x'||magnitude[1]=='X');
+      if(hex||parsed.ec==std::errc::result_out_of_range){
+        // Preserve strtod's hexadecimal and underflow-to-zero admission, using
+        // an explicit locale only on these uncommon paths. Decimal parsing is
+        // allocation-free and independent of the process locale.
+        static locale_t c_locale=[] {auto locale=newlocale(LC_NUMERIC_MASK,"C",nullptr);if(!locale)error("cannot create numeric locale");return locale;}();
+        // strtod requires a terminator. Bound its scratch copy to this numeric
+        // component, so many hex/underflow values remain linear in input size
+        // and a whitespace tail is never copied once per component.
+        const char* component_end=first;
+        while(component_end!=last&&*component_end!=','&&*component_end!=']'&&
+              !std::isspace(static_cast<unsigned char>(*component_end)))++component_end;
+        char scratch[64];std::string long_component;const char* bounded=nullptr;
+        const auto length=static_cast<size_t>(component_end-first);
+        if(length<sizeof(scratch)){std::memcpy(scratch,first,length);scratch[length]='\0';bounded=scratch;}
+        else{long_component.assign(first,length);bounded=long_component.c_str();}
+        // Never truncate: a late exponent or invalid suffix can change either
+        // the value or admission. Only the uncommon long component allocates.
+        char* fallback_end=nullptr;x=strtod_l(bounded,&fallback_end,c_locale);end=first+(fallback_end-bounded);
+      }else if(parsed.ec!=std::errc{})error("invalid VECTOR component");
+    }
     if(end==first||!std::isfinite(x)||std::abs(x)>std::numeric_limits<float>::max())error("nonfinite or overflowing VECTOR component");
     if(out.size()>=col.width)error("VECTOR dimension mismatch");
     p=static_cast<size_t>(end-v.text.data());out.push_back(static_cast<float>(x));ws();

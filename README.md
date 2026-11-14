@@ -137,8 +137,13 @@ work/build/benchmark_cpu DATA_COPY QUERY_SQL_LINES ann 10485760
 
 ## 当前内核与历史实验
 
-当前存储、索引、SQL和SIMD恢复至R9（a4c5bf5），仅移植Safe版的uint64_t相等区间
-扫描；差量日志输出字节不变。R10/R11的字典倒排子集、batch4、分块剪枝、半径排序、
+当前以R9（a4c5bf5）存储格式及025c429协议层为底座，保留Safe版uint64_t相等区间
+扫描；差量日志输出字节不变。Round12增加短十进制解析、有界主键批排序与借用字面量视图、
+满页连续扫描和提交后的元数据预热、DML签名初筛、预算可选的空簇重播种及字级位图枚举。
+所有行仍按输入顺序分配SlotId；512个字面量视图仅借用当前SQL，不复制向量，超限回退流式路径。
+预热不读取向量payload，失败不影响已经成功的提交；COSINE/IP继续明确拒绝，不启用历史墓碑槽位复用。
+完整回归、三轮T/B/M与保留的负结果见[Round12报告](docs/round12-orthogonal.md)。
+R10/R11的字典倒排子集、batch4、分块剪枝、半径排序、
 紧凑.cidx桶页及新增的静止边界缓存交接均已撤回。R9原有Checkpoint同步及缓存提示保持原样。
 
 此前[Safe验证](docs/round10-safe.md)、[Round 11实验](docs/round11-validation.md)和
@@ -175,8 +180,8 @@ ann且未手动覆盖NPROBE时使用持久化推荐值。建索引时记录
 显式 `SET NPROBE = n` 保留手工控制，`SET NPROBE = 0` 恢复自动模式。
 这是本地适配器的设置语法，不作为正式评测封包声明。
 
-IVF先生成候选SlotId位图，与有效位图和普通列过滤摘要求交，再按SlotId物理顺序
-读取payload。正常值用float32 SIMD筛除明显落后项，潜在Top-K赢家使用float64
+完整驻留时IVF沿用R9内存桶访问路径；缺页时生成候选SlotId位图，与有效位图和普通列
+过滤摘要求交，再按SlotId物理顺序读取payload。正常值用float32 SIMD筛除明显落后项，潜在Top-K赢家使用float64
 复算，避免极近距离舍入成错误并列；极端有限值也回退安全距离核。
 
 ## 事务与恢复

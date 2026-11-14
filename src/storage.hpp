@@ -16,6 +16,14 @@ namespace mvdb {
 constexpr size_t PAGE = 16384;
 using Page = std::array<std::byte, PAGE>;
 using SlotId = uint32_t;
+namespace detail {
+// LSB-first bytes, bit interval [begin,end). Return end when no matching bit
+// exists. The buffer need only contain ceil(end/8) bytes; empty ranges may
+// use nullptr. Neither alignment nor readable padding is required.
+size_t bitmap_next(const std::byte* bytes,size_t begin,size_t end,bool want_set=true);
+// Internal oracle seam; delegates to the same encoder used for WAL and undo.
+std::string page_delta(const std::string& file,uint64_t page,const Page& old,const Page& next);
+}
 struct MemoryBudget {
   size_t limit, used = 0, peak=0;
   std::shared_ptr<char> lifetime=std::make_shared<char>();

@@ -13,7 +13,7 @@ struct Column {std::string name;Type type;uint32_t width=0;bool primary=false;};
 struct Expr {std::string column,alias;bool distance=false;std::string query;};
 struct Condition {std::string column,op;std::string literal;bool quoted=false;};
 struct Literal {std::string text;bool quoted=false;};
-// Borrowed for the duration of a streaming row callback. Doubled SQL quotes
+// Borrowed while the original SQL string stays alive and unchanged. Doubled quotes
 // are decoded by convert() only on the uncommon escaped-literal path.
 struct LiteralView {
   std::string_view text;bool quoted,escaped;
