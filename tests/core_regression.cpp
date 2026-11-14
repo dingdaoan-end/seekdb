@@ -6,8 +6,10 @@
 #include <filesystem>
 #include <iostream>
 void sql_stream_regressions();
+void radial_cache_regressions();
 int main(){
   sql_stream_regressions();
+  radial_cache_regressions();
   const std::filesystem::path root="/tmp/mvdb_core_phase2";
   std::filesystem::remove_all(root);
   mvdb::Result result;

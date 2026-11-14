@@ -29,6 +29,7 @@ int main(int argc,char** argv){
     double execute_seconds=std::chrono::duration<double>(Clock::now()-start).count()/5;
     auto reads=engine.vector_page_reads()-pages;
     const auto& pruning=engine.pruning_counters();
+    const auto& radial=engine.radial_counters();
     const double trials=pruning.trials?double(pruning.trials):1;
     std::cout<<"{\"queries\":"<<queries.size()<<",\"mode\":"<<mvdb::quote(argv[3])
       <<",\"parse_seconds\":"<<parse_seconds<<",\"engine_seconds\":"<<execute_seconds
@@ -36,6 +37,8 @@ int main(int argc,char** argv){
       <<",\"last_query_pruning_policy\":"<<mvdb::quote(engine.last_pruning_policy())
       <<",\"pruning_trials\":"<<pruning.trials<<",\"pruned32\":"<<pruning.pruned32<<",\"pruned64\":"<<pruning.pruned64
       <<",\"pruned32_rate\":"<<pruning.pruned32/trials<<",\"pruned64_rate\":"<<pruning.pruned64/trials
+      <<",\"radial_tested\":"<<radial.tested<<",\"radial_rejected\":"<<radial.rejected
+      <<",\"radial_late_rejected\":"<<radial.late_rejected<<",\"radial_pages_skipped\":"<<radial.pages_skipped
       <<",\"checksum\":"<<checksum<<"}\n";
     engine.close();
   }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}

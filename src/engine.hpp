@@ -20,9 +20,11 @@ struct Result {
   std::shared_ptr<void> memory_reservation;
   void each(const std::function<void(const std::vector<Value>&)>&) const;
 };
+struct RadialCounters {uint64_t tested=0,rejected=0,late_rejected=0,pages_skipped=0;};
 class Engine {
   Storage storage;
   L2PruneCounters pruning;
+  RadialCounters radial;
   uint64_t dense_groups=0;
   std::string pruning_policy="none";
   bool ann=false;
@@ -47,7 +49,7 @@ class Engine {
   // One bounded cache: payload vectors remain exclusively in BufferPool.
   struct TableReadCache {
     std::string table;
-    uint32_t slots=0;
+    uint32_t slots=0,vector_column=UINT32_MAX;
     std::shared_ptr<void> reservation;
     std::vector<int64_t> keys;
     std::vector<uint8_t> flags; // active and extreme
@@ -57,6 +59,23 @@ class Engine {
     std::vector<SlotId> postings,active_slots;
     std::vector<uint32_t> offsets;
     std::vector<BufferPool::ResidentHandle> vector_pages;
+    // Optional scalar geometry only; vector payloads stay in BufferPool.
+    std::shared_ptr<void> radial_reservation;
+    std::vector<SlotId> radial_slots;
+    std::vector<float> radii;
+    struct Neighbor {double squared;SlotId slot;};
+    struct Bounded {double lower;SlotId slot;};
+    struct Scratch {
+      std::shared_ptr<void> reservation;
+      std::vector<const std::byte*> bases;
+      std::vector<SlotId> candidates;
+      std::vector<std::pair<double,uint32_t>> distances;
+      std::vector<double> norms;
+      std::vector<Neighbor> heap;
+      std::vector<Bounded> bounded;
+      std::vector<uint8_t> page_state;
+    };
+    std::unique_ptr<Scratch> scratch;
   };
   std::unique_ptr<TableReadCache> read_cache;
   TableReadCache* cache(const std::string&,const Header&,const std::vector<Column>&);
@@ -106,7 +125,8 @@ public:
   const std::string& last_pruning_policy() const{return pruning_policy;}
   uint64_t dense_page_groups() const{return dense_groups;}
   const L2PruneCounters& pruning_counters() const{return pruning;}
-  void reset_pruning_counters(){pruning={};}
+  const RadialCounters& radial_counters() const{return radial;}
+  void reset_pruning_counters(){pruning={};radial={};}
   uint64_t vector_page_reads() const {return storage.pool.vector_reads;}
   size_t budget_peak() const {return storage.budget.peak;}
   uint64_t spill_bytes() const;
