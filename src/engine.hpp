@@ -27,6 +27,7 @@ class Engine {
   std::string route="none";
   uint64_t ordered_pk_batches=0,signature_rejections=0,empty_cluster_reseeds=0;
   uint64_t borrowed_insert_batches=0;
+  uint64_t bounded_attempts=0,bounded_pruned32=0,bounded_pruned64=0;
   // Cumulative executor work: PK probes, 4096-slot validity blocks,
   // and visible candidates surviving scalar signatures (before exact predicates).
   uint64_t point_lookups=0,bitmap_blocks=0,candidate_slots=0;
@@ -102,6 +103,9 @@ public:
   uint64_t point_lookup_count() const{return point_lookups;}
   uint64_t candidate_bitmap_blocks() const{return bitmap_blocks;}
   uint64_t candidate_slots_examined() const{return candidate_slots;}
+  uint64_t bounded_distance_attempts() const{return bounded_attempts;}
+  uint64_t bounded_distance_pruned32() const{return bounded_pruned32;}
+  uint64_t bounded_distance_pruned64() const{return bounded_pruned64;}
   uint64_t page_access_count() const{return storage.pool.page_accesses;}
   uint64_t buffer_page_load_count() const{return storage.pool.physical_reads;}
   uint64_t signature_rejected_rows() const{return signature_rejections;}

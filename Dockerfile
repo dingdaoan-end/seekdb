@@ -9,7 +9,7 @@ FROM build-deps AS build
 COPY CMakeLists.txt ./
 COPY src/ ./src/
 COPY tests/ ./tests/
-COPY tools/benchmark_cpu.cpp ./tools/benchmark_cpu.cpp
+COPY tools/benchmark_cpu.cpp tools/progressive_benchmark.cpp ./tools/
 COPY mysqltest/ ./mysqltest/
 RUN cmake -S . -B /build -DCMAKE_BUILD_TYPE=Release \
     && cmake --build /build --target mvdb_local -j2

@@ -1,5 +1,6 @@
 #include "engine.hpp"
 #include <chrono>
+#include <ctime>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -22,14 +23,24 @@ int main(int argc,char** argv){
     mvdb::Engine engine(argv[1],budget);engine.execute(std::string("SET SEARCH_MODE = ")+argv[3]+";");
     // A full pass establishes the same deterministic in-process warmup.
     for(auto& sql:queries)engine.execute(sql).each([&](const auto& row){checksum+=static_cast<uint64_t>(std::get<int64_t>(row[0]));});
-    auto pages=engine.vector_page_reads();start=Clock::now();
+    auto pages=engine.vector_page_reads();
+    auto attempts=engine.bounded_distance_attempts(),pruned32=engine.bounded_distance_pruned32(),pruned64=engine.bounded_distance_pruned64();
+    start=Clock::now();auto cpu_start=std::clock();
     for(unsigned r=0;r<5;++r)for(auto& sql:queries)
       engine.execute(sql).each([&](const auto& row){checksum+=static_cast<uint64_t>(std::get<int64_t>(row[0]));});
     double execute_seconds=std::chrono::duration<double>(Clock::now()-start).count()/5;
+    double process_cpu_seconds=double(std::clock()-cpu_start)/CLOCKS_PER_SEC/5;
     auto reads=engine.vector_page_reads()-pages;
+    auto bounded_attempts=engine.bounded_distance_attempts()-attempts;
+    auto bounded_pruned32=engine.bounded_distance_pruned32()-pruned32,bounded_pruned64=engine.bounded_distance_pruned64()-pruned64;
     std::cout<<"{\"queries\":"<<queries.size()<<",\"mode\":"<<mvdb::quote(argv[3])
-      <<",\"parse_seconds\":"<<parse_seconds<<",\"engine_seconds\":"<<execute_seconds
+      <<",\"parse_seconds\":"<<parse_seconds<<",\"engine_seconds\":"<<execute_seconds<<",\"process_cpu_seconds\":"<<process_cpu_seconds
       <<",\"vector_page_loads_measured\":"<<reads<<",\"budget_bytes\":"<<budget
+      <<",\"bounded_attempts\":"<<bounded_attempts
+      <<",\"bounded_pruned32\":"<<bounded_pruned32
+      <<",\"bounded_pruned64\":"<<bounded_pruned64
+      <<",\"bounded_attempts_per_pass\":"<<bounded_attempts/5.0
+      <<",\"bounded_prune_rate\":"<<(bounded_attempts?double(bounded_pruned32+bounded_pruned64)/bounded_attempts:0)
       <<",\"checksum\":"<<checksum<<"}\n";
     engine.close();
   }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}

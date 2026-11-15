@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <fcntl.h>
 #include <limits>
 #include <bit>
@@ -354,7 +355,31 @@ bool Engine::fast_topk(const Statement& s,const Header& h,const std::vector<Colu
     return c->keys[a.slot]<c->keys[b.slot];
   };
   const std::byte* vector_page=nullptr;uint64_t current=UINT64_MAX;auto file=s.table+".v"+std::to_string(selected[distance]);
-  auto consume=[&]<bool Resident128>(SlotId slot) __attribute__((always_inline)) {bool yes=true;for(auto [i,id]:filters)if(c->dictionaries[i].ids[slot]!=id){yes=false;break;}if(!yes)return;
+  // Reuse the existing calibrated IVF cost gate before inspecting centers.
+  // Unfiltered scans with separated existing IVF centers benefit from prefix
+  // pruning. Filtered scans retain the old path: center routing can cost more
+  // than it saves when scalar predicates leave only a few candidates.
+  // This is only a CPU cost choice: all discarded rows still require the same
+  // deterministic partial-sum certificate. No statistics or index data change.
+  size_t bounded_prefix=0;bool bounded_override=false;
+  if(const char* override=std::getenv("MVDB_PROGRESSIVE")){
+    if(std::strcmp(override,"off")==0)bounded_override=true;
+    else if(std::strcmp(override,"32")==0){bounded_override=true;bounded_prefix=32;}
+    else if(std::strcmp(override,"64")==0){bounded_override=true;bounded_prefix=64;}
+  }
+  if(!bounded_override&&predicates.empty()&&all_resident&&dim==128&&safe&&h.nlist&&selected[distance]==h.ivector
+     &&h.active_count>=4096&&!stale(h)&&!h.calibration_skipped&&h.recommended_nprobe&&h.recommended_nprobe<=h.nlist/2){
+    double nearest=INFINITY,farthest=0;
+    if(ivf){nearest=distances.front().first;farthest=distances.back().first;}
+    else for(uint32_t b=0;b<h.nlist;++b){
+      auto center=c->centers.data()+size_t(b)*dim;
+      auto d=l2_squared_fast(query.data(),center,dim,!has_extreme(center,dim));
+      nearest=std::min(nearest,d);farthest=std::max(farthest,d);
+    }
+    if(std::isfinite(nearest)&&std::isfinite(farthest)&&farthest>4*nearest)bounded_prefix=32;
+  }
+  double bounded_cutoff=INFINITY;
+  auto consume=[&]<bool Resident128,bool Progressive>(SlotId slot) __attribute__((always_inline)) {bool yes=true;for(auto [i,id]:filters)if(c->dictionaries[i].ids[slot]!=id){yes=false;break;}if(!yes)return;
     if(impossible_key||(key_filter&&c->keys[slot]!=*key_filter))return;
     const float* p;
     if constexpr(Resident128)p=reinterpret_cast<const float*>(bases[slot>>5]+((slot&31U)<<9));
@@ -365,27 +390,38 @@ bool Engine::fast_topk(const Statement& s,const Header& h,const std::vector<Colu
     // No pool operations occur while consuming this page. Handles validate
     // frame reuse on every page transition; no borrowed pointer crosses it.
     p=reinterpret_cast<const float*>(vector_page+(slot%count)*vector_stride);}
-    if(heap.size()==s.limit){auto fast=l2_squared_fast(p,query.data(),dim,safe&&!(c->flags[slot]&2));auto worst=heap.front().squared;
+    if(heap.size()==s.limit){auto worst=heap.front().squared;double fast;
+      if constexpr(Progressive){
+        if(safe&&!(c->flags[slot]&2)){
+          ++bounded_attempts;
+          auto bounded=l2_squared_bounded_128(p,query.data(),bounded_cutoff,true,bounded_prefix);
+          if(bounded.pruned){if(bounded_prefix==32)++bounded_pruned32;else ++bounded_pruned64;return;}
+          fast=bounded.squared;
+        }else fast=l2_squared_fast(p,query.data(),dim,false);
+      }else fast=l2_squared_fast(p,query.data(),dim,safe&&!(c->flags[slot]&2));
       auto error=std::max(1e-5,4.0*dim*std::numeric_limits<float>::epsilon());
       if(fast>worst+error*std::max({1.0,std::abs(fast),std::abs(worst)}))return;}
     Neighbor neighbor{l2_squared_exact(p,query.data(),dim),slot};
     if(heap.size()<s.limit){heap.push_back(neighbor);std::push_heap(heap.begin(),heap.end(),less);}else if(less(neighbor,heap.front())){std::pop_heap(heap.begin(),heap.end(),less);heap.back()=neighbor;std::push_heap(heap.begin(),heap.end(),less);}
+    if constexpr(Progressive)bounded_cutoff=l2_bounded_cutoff(heap.front().squared);
   };
-  auto scan=[&]<bool Resident128,bool Prefetch>(auto first,auto last){for(auto it=first;it!=last;++it){
+  auto scan=[&]<bool Resident128,bool Prefetch,bool Progressive>(auto first,auto last){for(auto it=first;it!=last;++it){
 #if defined(__GNUC__) || defined(__clang__)
     if constexpr(Prefetch){if(it+1!=last){auto next=*(it+1);__builtin_prefetch(bases[next>>5]+((next&31U)<<9),0,1);}}
 #endif
-    consume.template operator()<Resident128>(*it);
+    consume.template operator()<Resident128,Progressive>(*it);
   }};
-  auto run=[&]<bool Resident128,bool Prefetch>(){
-    if(ivf&&all_resident){for(size_t i=0;i<last_probes;++i){auto b=distances[i].second;scan.template operator()<Resident128,Prefetch>(c->postings.begin()+c->offsets[b],c->postings.begin()+c->offsets[b+1]);}}
-    else if(ivf)scan.template operator()<Resident128,Prefetch>(candidates.begin(),candidates.end());
-    else scan.template operator()<Resident128,Prefetch>(c->active_slots.begin(),c->active_slots.end());
+  auto run=[&]<bool Resident128,bool Prefetch,bool Progressive>(){
+    if(ivf&&all_resident){for(size_t i=0;i<last_probes;++i){auto b=distances[i].second;scan.template operator()<Resident128,Prefetch,Progressive>(c->postings.begin()+c->offsets[b],c->postings.begin()+c->offsets[b+1]);}}
+    else if(ivf)scan.template operator()<Resident128,Prefetch,Progressive>(candidates.begin(),candidates.end());
+    else scan.template operator()<Resident128,Prefetch,Progressive>(c->active_slots.begin(),c->active_slots.end());
   };
   // The common 128D resident path uses fixed shifts/masks. Exact scans already
   // visit slots in storage order; prefetching every next slot adds no value.
-  if(all_resident&&dim==128){if(ivf)run.template operator()<true,true>();else run.template operator()<true,false>();}
-  else run.template operator()<false,false>();
+  if(all_resident&&dim==128){
+    if(bounded_prefix&&safe){if(ivf)run.template operator()<true,true,true>();else run.template operator()<true,false,true>();}
+    else {if(ivf)run.template operator()<true,true,false>();else run.template operator()<true,false,false>();}
+  }else run.template operator()<false,false,false>();
   std::sort(heap.begin(),heap.end(),less);result.memory_rows=std::make_shared<std::vector<std::vector<Value>>>();result.memory_rows->reserve(heap.size());
   for(auto& n:heap){std::vector<Value> values(2);values[distance]=std::sqrt(n.squared);values[1-distance]=c->keys[n.slot];result.memory_rows->push_back(std::move(values));}
   std::vector<SlotId>().swap(candidates);std::vector<Neighbor>().swap(heap);std::vector<const std::byte*>().swap(bases);std::vector<std::pair<double,uint32_t>>().swap(distances);
