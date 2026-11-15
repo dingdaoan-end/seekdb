@@ -99,6 +99,84 @@ public:
     return false;
   }
 };
+// Conservative zero-copy path for official flat, unescaped JSONL requests.
+// Any unfamiliar shape (including escaped strings) goes through Parser so its
+// validation, duplicate-key rejection, diagnostics and raw identifier stay intact.
+struct FlatRequest {
+  std::string_view id,sql,op="execute",search_mode="exact";
+  unsigned seen=0;
+  bool parse(std::string_view source){
+    size_t pos=0;
+    auto ws=[&]{while(pos<source.size()&&(source[pos]==' '||source[pos]=='\t'||source[pos]=='\r'||source[pos]=='\n'))++pos;};
+    auto eat=[&](char c){if(pos<source.size()&&source[pos]==c){++pos;return true;}return false;};
+    auto string=[&](std::string_view& out){
+      if(!eat('"'))return false;
+      size_t start=pos;
+      while(pos<source.size()){
+        unsigned char c=source[pos++];
+        if(c=='"'){out=source.substr(start,pos-start-1);return true;}
+        if(c=='\\'||c<32)return false;
+        if(c<0x80)continue;
+        unsigned count=0,code=0,minimum=0;
+        if(c>=0xc2&&c<=0xdf){count=1;code=c&31;minimum=0x80;}
+        else if(c>=0xe0&&c<=0xef){count=2;code=c&15;minimum=0x800;}
+        else if(c>=0xf0&&c<=0xf4){count=3;code=c&7;minimum=0x10000;}
+        else return false;
+        if(source.size()-pos<count)return false;
+        for(unsigned i=0;i<count;++i){unsigned char next=source[pos++];if((next&0xc0)!=0x80)return false;code=(code<<6)|(next&63);}
+        if(code<minimum||code>0x10ffff||(code>=0xd800&&code<=0xdfff))return false;
+      }
+      return false;
+    };
+    auto digit=[&]{return pos<source.size()&&source[pos]>='0'&&source[pos]<='9';};
+    ws();if(!eat('{'))return false;ws();
+    for(;;){
+      std::string_view key,value;
+      if(!string(key))return false;
+      unsigned bit=key=="id"?1:key=="sql"?2:key=="op"?4:key=="search_mode"?8:0;
+      if(!bit||(seen&bit))return false;
+      seen|=bit;ws();if(!eat(':'))return false;ws();
+      size_t start=pos;
+      if(pos<source.size()&&source[pos]=='"'){if(!string(value))return false;}
+      else if(bit==1){
+        bool literal=false;
+        for(std::string_view word:{"null","true","false"})if(source.substr(pos,word.size())==word){pos+=word.size();literal=true;break;}
+        if(!literal){
+          eat('-');
+          if(eat('0')){if(digit())return false;}
+          else {if(!digit())return false;while(digit())++pos;}
+          if(eat('.')){if(!digit())return false;while(digit())++pos;}
+          if(eat('e')||eat('E')){if(!eat('+'))eat('-');if(!digit())return false;while(digit())++pos;}
+        }
+      }else return false;
+      if(bit==1)id=source.substr(start,pos-start);
+      else if(bit==2)sql=value;
+      else if(bit==4)op=value;
+      else search_mode=value;
+      ws();if(eat('}'))break;if(!eat(','))return false;ws();
+    }
+    ws();return pos==source.size()&&(seen&1);
+  }
+};
+struct RequestInput {
+  FlatRequest flat;
+  mvdb::protocol::Json fallback;
+  bool fast=false;
+  void parse(std::string_view source){
+    flat=FlatRequest{};fast=flat.parse(source);
+    if(!fast){fallback=mvdb::protocol::Parser(source,true).parse();if(fallback.kind!='{')throw std::runtime_error("request must be a JSON object");}
+  }
+  std::string_view id(){
+    if(fast)return flat.id;
+    auto ident=fallback.fields.find("id");if(ident==fallback.fields.end())throw std::runtime_error("request requires id");return ident->second.raw;
+  }
+  std::string_view operation(){return fast?flat.op:fallback.fields.contains("op")?mvdb::protocol::required_string(fallback,"op"):std::string_view("execute");}
+  std::string_view sql(){
+    if(fast){if(!(flat.seen&2))throw std::runtime_error("request requires string field: sql");return flat.sql;}
+    return mvdb::protocol::required_string(fallback,"sql");
+  }
+  std::string_view mode(){return fast?flat.search_mode:fallback.fields.contains("search_mode")?mvdb::protocol::required_string(fallback,"search_mode"):std::string_view("exact");}
+};
 uint64_t proc_value(const char* path,const std::string& key){std::ifstream file(path);std::string line;while(std::getline(file,line))if(line.starts_with(key+":")){std::istringstream value(line.substr(key.size()+1));uint64_t number=0;value>>number;return number;}return 0;}
 uint64_t positive_bytes(const std::string& value){uint64_t bytes=0;auto[end,error]=std::from_chars(value.data(),value.data()+value.size(),bytes);if(error!=std::errc{}||end!=value.data()+value.size()||bytes==0)throw std::runtime_error("memory budget must be a positive integer byte count");return bytes;}
 // Buffer up to the public transport limit so a serialization failure never emits
@@ -183,7 +261,7 @@ public:
   void string(const char* name,const std::string& value){key(name);data+=mvdb::quote(value);}
   void emit(){data+="}\n";std::cerr.write(data.data(),static_cast<std::streamsize>(data.size()));}
 };
-void assemble_success(Response& response,const std::string& id,bool legacy,const mvdb::Result& result){
+void assemble_success(Response& response,std::string_view id,bool legacy,const mvdb::Result& result){
   response.begin(id,legacy);
   if(legacy||result.columns.empty())response.add(",\"affected_rows\":").integer(result.affected_rows);
   if(legacy||!result.columns.empty()){
@@ -192,7 +270,7 @@ void assemble_success(Response& response,const std::string& id,bool legacy,const
   }
   response.add("}");
 }
-void success(Response& response,const std::string& id,bool legacy,const mvdb::Result& result){assemble_success(response,id,legacy,result);response.emit();}
+void success(Response& response,std::string_view id,bool legacy,const mvdb::Result& result){assemble_success(response,id,legacy,result);response.emit();}
 std::string error_code(const std::string& message){if(message.find("duplicate primary key")!=std::string::npos)return "duplicate_key";if(message.find("dimension mismatch")!=std::string::npos)return "dimension_mismatch";if(message.find("unsupported SQL")!=std::string::npos)return "unsupported_sql";return "execution_error";}
 bool json_line(const std::string& line){auto start=line.find_first_not_of(" \t\r\n");if(start==std::string::npos)return true;char first=line[start];return first=='{'||first=='['||first=='"'||first=='-'||(first>='0'&&first<='9')||line.substr(start)=="null"||line.substr(start)=="true"||line.substr(start)=="false";}
 }
@@ -218,24 +296,24 @@ int main(int argc,char** argv){
     Metrics metrics;std::string line;bool closed=false;int exit_status=output_ok?0:3;InputLines input;
     while(output_ok&&input.next(line)){
       auto before=engine.vector_page_reads();auto spill_before=engine.spill_bytes();
-      bool legacy=!json_line(line),shutdown=false;std::string id="null",code="invalid_request";
+      bool legacy=!json_line(line),shutdown=false;std::string_view id="null";std::string code="invalid_request";RequestInput request;
       try{
         std::string sql;
         if(!legacy){
-          auto request=mvdb::protocol::Parser(line,true).parse();
-          if(request.kind!='{')throw std::runtime_error("request must be a JSON object");
-          auto ident=request.fields.find("id");if(ident==request.fields.end())throw std::runtime_error("request requires id");id=ident->second.raw;
-          auto op=request.fields.contains("op")?mvdb::protocol::required_string(request,"op"):"execute";
+          request.parse(line);id=request.id();
+          auto op=request.operation();
           if(op=="shutdown"||op=="close"){
             code="shutdown_error";engine.close();closed=true;shutdown=true;
             response.begin(id,false).add("}").emit();
           }else if(op=="ping")response.begin(id,false).add("}").emit();
           else if(op=="execute"){
-            sql=std::move(mvdb::protocol::required_string(request,"sql"));std::string mode="exact";
-            if(request.fields.contains("search_mode"))mode=mvdb::protocol::required_string(request,"search_mode");
+            // Materialize only at the existing string-based engine boundary.
+            if(request.fast)sql=request.sql();
+            else sql=std::move(mvdb::protocol::required_string(request.fallback,"sql"));
+            auto mode=request.mode();
             if(mode=="approx")mode="ann";
             if(mode!="exact"&&mode!="ann")throw std::runtime_error("search_mode must be exact, ann, or approx");
-            code="";engine.execute("SET SEARCH_MODE = "+mode+";");success(response,id,false,engine.execute(sql));
+            code="";engine.execute(mode=="ann"?"SET SEARCH_MODE = ann;":"SET SEARCH_MODE = exact;");success(response,id,false,engine.execute(sql));
           }else {code="unsupported_op";throw std::runtime_error("unsupported operation");}
         }else {sql=line;code="";success(response,id,true,engine.execute(sql));}
       }catch(const std::exception& e){

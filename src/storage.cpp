@@ -232,7 +232,10 @@ void BufferPool::append_extent_bytes(const std::string& f,uint64_t p,size_t offs
 }
 void BufferPool::committed(){transaction_active=false;for(auto& f:frames)f.uncommitted=false;}
 void BufferPool::invalidate_prefix(const std::string& prefix){
-  for(auto& f:frames)if(f.valid&&(f.file==prefix||f.file.rfind(prefix+".",0)==0)){require(!f.pins,"discard pinned region");lookup.erase(f.file+":"+std::to_string(f.page));f.valid=f.dirty=false;++f.version;}
+  // Reject the entire discard before changing any frame: a later pinned page
+  // must not leave earlier dirty pages silently lost on a failed operation.
+  for(const auto& f:frames)if(f.valid&&(f.file==prefix||f.file.rfind(prefix+".",0)==0))require(!f.pins,"discard pinned region");
+  for(auto& f:frames)if(f.valid&&(f.file==prefix||f.file.rfind(prefix+".",0)==0)){lookup.erase(f.file+":"+std::to_string(f.page));f.valid=f.dirty=false;++f.version;}
   for(auto it=descriptors.begin();it!=descriptors.end();)if(it->first==prefix||it->first.rfind(prefix+".",0)==0){::close(it->second);it=descriptors.erase(it);}else ++it;
 }
 void BufferPool::sync_all(){

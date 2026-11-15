@@ -591,6 +591,49 @@ Result Engine::execute_inner(const Statement& s){
   if(s.kind==Statement::CreateIndex){create_index(s,cols);return result;}
   std::vector<std::pair<size_t,Value>> predicates;for(auto& c:s.conditions){auto i=column(cols,c.column);auto type=cols[i];if(type.type==Type::Varchar)type.width=UINT32_MAX;predicates.emplace_back(i,convert({c.literal,c.quoted},type));}
   auto matches=[&](const std::vector<Value>& values){for(size_t j=0;j<predicates.size();++j){auto& [i,v]=predicates[j];auto n=compare(values[i],v);auto op=s.conditions[j].op;bool yes=(op=="="?n==0:op=="!="||op=="<>"?n!=0:op=="<"?n<0:op==">"?n>0:op=="<="?n<=0:n>=0);if(!yes)return false;}return true;};
+  // A decoded row has already paid for every VARCHAR. For scalar ANDs,
+  // test fixed-width fields first, reading only packed headers while skipping
+  // variable payloads. Zero/single predicates and unsupported VECTOR compares
+  // retain the original evaluation path and its source-order error behavior.
+  std::vector<size_t> cheap_predicates;
+  if(predicates.size()>1&&std::all_of(predicates.begin(),predicates.end(),[&](const auto& p){return cols[p.first].type!=Type::Vector;})){
+    for(size_t j=0;j<predicates.size();++j)if(predicates[j].first==keycol)cheap_predicates.push_back(j);
+    for(size_t i=0;i<cols.size();++i)if(i!=keycol&&cols[i].type==Type::Bigint)
+      for(size_t j=0;j<predicates.size();++j)if(predicates[j].first==i)cheap_predicates.push_back(j);
+  }
+  auto cheap_matches=[&](const Meta& m){
+    if(cheap_predicates.empty())return true;
+    auto accepts=[&](size_t j,int64_t value){
+      auto expected=std::get<int64_t>(predicates[j].second);int n=(value>expected)-(value<expected);const auto& op=s.conditions[j].op;
+      return op=="="?n==0:op=="!="||op=="<>"?n!=0:op=="<"?n<0:op==">"?n>0:op=="<="?n<=0:n>=0;
+    };
+    size_t next_column=0,pos=0;uint64_t page_id=UINT64_MAX;const std::byte* page=nullptr;
+    // Pool views are consumed immediately and never survive another pool call.
+    auto read=[&](void* out,size_t bytes){
+      require(pos<=m.length&&bytes<=m.length-pos,"invalid stored row");
+      auto dst=static_cast<char*>(out);
+      while(bytes){auto offset=m.offset+pos;
+        if(offset/PAGE!=page_id){page_id=offset/PAGE;page=storage.pool.view(s.table+".blob",page_id);}
+        auto n=std::min<size_t>(bytes,PAGE-offset%PAGE);std::memcpy(dst,page+offset%PAGE,n);dst+=n;pos+=n;bytes-=n;
+      }
+    };
+    auto skip=[&](size_t bytes){require(pos<=m.length&&bytes<=m.length-pos,"invalid stored row");pos+=bytes;};
+    int64_t numeric=0;bool opened=false;
+    for(auto j:cheap_predicates){auto c=predicates[j].first;
+      if(c==keycol){if(!accepts(j,m.key))return false;continue;}
+      if(!opened){uint32_t count;read(&count,4);require(count==cols.size(),"corrupt row width");opened=true;}
+      while(next_column<=c){uint8_t tag;read(&tag,1);
+        if(tag==0){read(&numeric,8);}
+        else if(tag==1){skip(8);}
+        else if(tag==2||tag==3){uint32_t count;read(&count,4);require(tag==2||count<=(m.length-pos)/4,"corrupt vector");skip(size_t(count)*(tag==3?4:1));}
+        else require(false,"corrupt value tag");
+        if(next_column==c)require(tag==0,"incompatible comparison types");
+        ++next_column;
+      }
+      if(!accepts(j,numeric))return false;
+    }
+    return true;
+  };
   // Only converted primary-key equalities establish a singleton candidate set.
   // Keep all predicates for exact verification, including contradictory ANDs.
   std::optional<int64_t> point_key;bool conflicting_key=false;
@@ -634,7 +677,7 @@ Result Engine::execute_inner(const Statement& s){
   if(s.kind==Statement::Update||s.kind==Statement::Delete){std::vector<std::pair<size_t,Value>> changes;for(auto& [name,v]:s.assignments){auto i=column(cols,name);changes.emplace_back(i,convert(v,cols[i]));}
     if(point_key){
       if(auto slot=point_slot()){
-        auto m=meta(s.table,*slot);auto values=row(s.table,*slot,m,cols,s.kind==Statement::Update);
+        auto m=meta(s.table,*slot);if(!cheap_matches(m))return result;auto values=row(s.table,*slot,m,cols,s.kind==Statement::Update);
         if(matches(values)){for(auto& [i,v]:changes)values[i]=v;
           write_row(s.table,*slot,std::move(values),cols,s.kind==Statement::Update);++result.affected_rows;}
       }
@@ -646,6 +689,7 @@ Result Engine::execute_inner(const Statement& s){
       signature_filter(start,candidates);auto end=std::min<uint64_t>(4096,h.slots-start);
       each_set_bit(candidates,0,end,[&](size_t at){
         ++candidate_slots;auto slot=static_cast<SlotId>(start+at);auto m=meta(s.table,slot);if(!m.active)return;
+        if(!cheap_matches(m))return;
         auto values=row(s.table,slot,m,cols,s.kind==Statement::Update);if(!matches(values))return;
         for(auto& [i,v]:changes)values[i]=v;
         write_row(s.table,slot,std::move(values),cols,s.kind==Statement::Update);++result.affected_rows;
@@ -664,7 +708,7 @@ Result Engine::execute_inner(const Statement& s){
     bool need_vectors=false;
     for(size_t i=0;i<expressions.size();++i)need_vectors|=expressions[i].distance||cols[selected[i]].type==Type::Vector;
     if(auto slot=point_slot()){
-      auto m=meta(s.table,*slot);auto values=row(s.table,*slot,m,cols,need_vectors);
+      auto m=meta(s.table,*slot);if(!cheap_matches(m))return result;auto values=row(s.table,*slot,m,cols,need_vectors);
       if(matches(values)){
         std::vector<Value> output;
         for(size_t i=0;i<expressions.size();++i){auto c=selected[i];
@@ -724,7 +768,7 @@ Result Engine::execute_inner(const Statement& s){
     auto end=std::min<uint64_t>(4096,h.slots-start);
     each_set_bit(candidates,0,end,[&](size_t at){auto slot=static_cast<SlotId>(start+at);auto mask=uint64_t(1)<<(at%64);auto& word=candidates[at/64];
       ++candidate_slots;bool yes=true;
-      if(yes&&!predicates.empty()){auto m=meta(s.table,slot);yes=m.active&&matches(row(s.table,slot,m,cols,false));}if(!yes)word&=~mask;
+      if(yes&&!predicates.empty()){auto m=meta(s.table,slot);yes=m.active&&cheap_matches(m)&&matches(row(s.table,slot,m,cols,false));}if(!yes)word&=~mask;
     });
     each_set_bit(candidates,0,end,[&](size_t at){auto slot=static_cast<SlotId>(start+at);
       auto m=meta(s.table,slot);
