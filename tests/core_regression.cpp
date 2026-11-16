@@ -9,7 +9,46 @@ void sql_stream_regressions();
 void r12_engine_regressions();
 void r12_query_regressions();
 void r12_point_regressions();
+static void reusable_select_regressions(){
+  mvdb::ResultColumns names={"a","b"};names.reserve(8);names.push_back("c");
+  auto copy=names;auto moved=std::move(names);assert(names.empty());assert(copy.size()==3&&moved[2]=="c");
+  moved.clear();moved.push_back("z");assert(moved.size()==1&&moved.back()=="z");
+  copy={"x","y"};assert(copy.size()==2&&copy[0]=="x");
+  auto two=mvdb::ResultColumns{"first","second"};auto two_copy=two;auto two_move=std::move(two);assert(two.empty()&&two_copy[1]==two_move[1]);
+  moved=two_copy;assert(moved.size()==2&&moved[0]=="first"&&moved[1]=="second");
+  two_copy.push_back(two_copy[0]);assert(two_copy.size()==3&&two_copy[2]=="first");
+  const auto path=std::filesystem::temp_directory_path()/"mvdb_reusable_select_regression";
+  std::filesystem::remove_all(path);
+  for(size_t budget:{size_t(65536),size_t(8*1024*1024)}){
+    std::filesystem::remove_all(path);mvdb::Engine e(path,budget);
+    e.execute("CREATE TABLE t(id BIGINT PRIMARY KEY,category VARCHAR(300),v VECTOR(2))");
+    e.execute("INSERT INTO t VALUES (1,'cat-a','[0,0]'),(2,'cat-b','[2,0]'),(3,'cat-a','[4,0]'),(4,'it''s','[6,0]')");
+    auto query=[](std::string vector,std::string category){return "SELECT id,L2_DISTANCE(v,'"+vector+"') AS d FROM t WHERE category='"+category+"' ORDER BY d,id LIMIT 2";};
+    auto rows=[](const mvdb::Result& r){std::vector<std::vector<mvdb::Value>> out;r.each([&](const auto& row){out.push_back(row);});return out;};
+    auto saved=e.execute(query("[0,0]","cat-a"));auto saved_rows=rows(saved);assert(saved_rows.size()==2&&std::get<int64_t>(saved_rows[0][0])==1);
+    auto changed=rows(e.execute(query("[4,0]","cat-a")));assert(std::get<int64_t>(changed[0][0])==3&&std::get<double>(changed[0][1])==0);
+    auto filtered=rows(e.execute(query("[4,0]","cat-b")));assert(filtered.size()==1&&std::get<int64_t>(filtered[0][0])==2);
+    assert(rows(e.execute(query("[4,0]","absent"))).empty());
+    e.set_search_mode(true);assert(rows(e.execute(query("[0,0]","cat-a")))==saved_rows);
+    e.set_search_mode(false);assert(rows(e.execute(query("[0,0]","cat-a")))==saved_rows);
+    if(budget>65536)assert(e.reused_select_query_count()>=3);
+    auto commented=rows(e.execute("/*lead*/ select ID,l2_distance(V,'[0,0]') as D from T where CATEGORY='cat-a' order by D,ID limit 2; -- tail"));assert(commented==saved_rows);
+    auto escaped=rows(e.execute(query("[6,0]","it''s")));assert(escaped.size()==1&&std::get<int64_t>(escaped[0][0])==4);
+    auto reversed=rows(e.execute("SELECT L2_DISTANCE(v,'[2,0]') AS d,id FROM t ORDER BY d,id LIMIT 2"));assert(std::get<int64_t>(reversed[0][1])==2);
+    const std::string alias(63,'a');auto long_label=e.execute("SELECT id,L2_DISTANCE(v,'[0,0]') AS "+alias+" FROM t ORDER BY "+alias+",id LIMIT 2");assert(long_label.columns[1]==alias);
+    auto generic=e.execute("SELECT id,category,v FROM t ORDER BY id LIMIT 3");assert(generic.columns.size()==3&&generic.columns[2]=="v"&&rows(generic).size()==3);
+    e.execute(query("[0,0]","cat-a"));
+    bool rejected=false;try{e.execute(query("[0,0]","cat-a")+" SELECT id FROM t");}catch(const std::exception&){rejected=true;}assert(rejected);
+    rejected=false;try{e.execute(query("[0]","cat-a"));}catch(const std::exception&){rejected=true;}assert(rejected);
+    e.execute("BEGIN");e.execute("UPDATE t SET category='cat-b' WHERE id=1");assert(rows(e.execute(query("[0,0]","cat-a"))).size()==1);e.execute("ROLLBACK");assert(rows(e.execute(query("[0,0]","cat-a"))).size()==2);
+    e.execute("DELETE FROM t WHERE id=1");assert(rows(e.execute(query("[0,0]","cat-a"))).size()==1);
+    e.execute("INSERT INTO t VALUES (5,'cat-a','[0,0]')");auto inserted=rows(e.execute(query("[0,0]","cat-a")));assert(std::get<int64_t>(inserted[0][0])==5);
+    e.close();assert(saved.columns[0]=="id"&&saved.columns[1]=="d"&&rows(saved)==saved_rows);
+  }
+  std::filesystem::remove_all(path);
+}
 int main(){
+  reusable_select_regressions();
   sql_stream_regressions();
   r12_engine_regressions();
   r12_query_regressions();

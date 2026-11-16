@@ -12,7 +12,7 @@
 namespace mvdb {
 namespace {
 uint64_t total_spill_bytes=0;
-void require(bool yes,const std::string& s){if(!yes)throw std::runtime_error(s);}
+void require(bool yes,std::string_view s){if(!yes)throw std::runtime_error(std::string(s));}
 struct Reservation {MemoryBudget& b;size_t n;std::weak_ptr<char> lifetime;Reservation(MemoryBudget& budget,size_t bytes):b(budget),n(bytes),lifetime(budget.lifetime){b.acquire(n);}~Reservation(){if(!lifetime.expired())b.release(n);}};
 size_t column(const std::vector<Column>& cols,const std::string& name){for(size_t i=0;i<cols.size();++i)if(cols[i].name==name)return i;throw std::runtime_error("unknown column: "+name);}
 size_t primary(const std::vector<Column>& cols){for(size_t i=0;i<cols.size();++i)if(cols[i].primary)return i;throw std::runtime_error("missing primary key");}
@@ -75,8 +75,8 @@ public:
 }
 void Result::each(const std::function<void(const std::vector<Value>&)>& callback) const {if(numeric_count){std::vector<Value> row(2);for(size_t i=0;i<numeric_count;++i){row[numeric_distance_column]=numeric_rows[i].distance;row[1-numeric_distance_column]=numeric_rows[i].key;callback(row);}return;}if(memory_rows){for(auto& r:*memory_rows)callback(r);return;}if(!rows)return;std::rewind(rows.get());std::vector<Value> r;while(spill_read(rows.get(),r))callback(r);discard_cache(rows.get());}
 uint64_t Engine::spill_bytes() const{return total_spill_bytes;}
-Engine::Header Engine::header(const std::string& t){auto h=storage.load<Header>(t+".header",0);require(h.magic==0x4d564442,"table does not exist: "+t);return h;}
-std::vector<Column> Engine::schema(const Header& h){require(h.schema_size<sizeof(h.schema),"corrupt schema");return parse(std::string(h.schema,h.schema_size)).columns;}
+Engine::Header Engine::header(const std::string& t){auto h=storage.load<Header>(t+".header",0);if(h.magic!=0x4d564442)throw std::runtime_error("table does not exist: "+t);return h;}
+std::vector<Column> Engine::schema(const Header& h){require(h.schema_size<sizeof(h.schema),"corrupt schema");return parse(std::string_view(h.schema,h.schema_size)).columns;}
 Engine::Meta Engine::meta(const std::string& t,SlotId s){auto p=storage.pool.view(t+".rows",s/(PAGE/sizeof(Meta)));Meta m;std::memcpy(&m,p+(s%(PAGE/sizeof(Meta)))*sizeof(Meta),sizeof(m));return m;}
 void Engine::put_meta(const std::string& t,SlotId s,const Meta& m){auto id=s/(PAGE/sizeof(Meta));auto p=storage.read(t+".rows",id);std::memcpy(p.data()+(s%(PAGE/sizeof(Meta)))*sizeof(Meta),&m,sizeof(m));storage.write(t+".rows",id,p);}
 std::string Engine::read_blob(const std::string& t,uint64_t offset,uint32_t n){std::string out;out.reserve(n);while(n){auto page=storage.pool.view(t+".blob",offset/PAGE);auto count=std::min<uint64_t>(n,PAGE-offset%PAGE);out.append(reinterpret_cast<const char*>(page+offset%PAGE),count);offset+=count;n-=count;}return out;}
@@ -320,8 +320,13 @@ Engine::TableReadCache* Engine::cache(const std::string& t,const Header& h,const
   // High cardinality columns stop after 128 distinct values or 16 KiB UTF-8.
   size_t bytes=4096+size_t(h.slots)*17+center_count*4+size_t(h.nlist+2)*4+vector_pages*sizeof(BufferPool::ResidentHandle)+
     cols.size()*sizeof(TableReadCache::Dictionary)+varchar_count*(size_t(h.slots)*6+32768+129*sizeof(uint32_t));
+  // Small budgets keep the original transient workspace admission. Retaining
+  // a full reusable heap there could displace an otherwise admissible cache.
+  const bool reuse=storage.budget.limit>=4*1024*1024;
+  if(reuse)bytes+=size_t(h.slots)*sizeof(SlotId)+vector_pages*sizeof(const std::byte*)+size_t(h.nlist)*sizeof(std::pair<double,uint32_t>)+4096*sizeof(TableReadCache::Neighbor)+64*sizeof(std::pair<size_t,uint16_t>);
   if(bytes>(storage.budget.limit-storage.budget.used)/2)return nullptr;
   auto c=std::make_unique<TableReadCache>();c->reservation=std::make_shared<Reservation>(storage.budget,bytes);
+  if(reuse){c->filters.reserve(64);c->bases.resize(vector_pages);c->candidates.reserve(h.slots);c->distances.reserve(h.nlist);c->heap.reserve(4096);}
   c->vector_pages.resize(vector_pages);c->table=t;c->slots=h.slots;c->keys.resize(h.slots);c->flags.resize(h.slots);c->dictionaries.resize(cols.size());c->active_slots.reserve(h.slots);
   for(size_t i=0;i<cols.size();++i)if(cols[i].type==Type::Varchar){auto& d=c->dictionaries[i];d.supported=true;d.ids.resize(h.slots);d.values.reserve(128);}
   std::vector<size_t> string_bytes(cols.size());
@@ -374,8 +379,11 @@ bool Engine::fast_topk(const Statement& s,const Header& h,const std::vector<Colu
     if(descending||!primary_order)return false;
   }
   for(size_t j=0;j<predicates.size();++j)if(s.conditions[j].op!="="||(predicates[j].first!=pk&&cols[predicates[j].first].type!=Type::Varchar))return false;
+  if(predicates.size()>64)return false;
   auto c=cache(s.table,h,cols);if(!c)return false;
-  std::vector<std::pair<size_t,uint16_t>> filters;
+  const bool reuse=c->heap.capacity()!=0;
+  std::vector<std::pair<size_t,uint16_t>> local_filters;
+  auto& filters=reuse?c->filters:local_filters;filters.clear();
   std::optional<int64_t> key_filter;bool impossible_key=false;
   for(auto& [i,v]:predicates)if(i==pk){auto key=std::get<int64_t>(v);impossible_key|=key_filter&&*key_filter!=key;key_filter=key;}
   for(auto& [i,v]:predicates)if(i!=pk){auto& d=c->dictionaries[i];if(!d.supported){read_cache.reset();return false;}auto it=std::find(d.values.begin(),d.values.end(),std::get<std::string>(v));if(it==d.values.end()){filters.emplace_back(i,UINT16_MAX);continue;}filters.emplace_back(i,static_cast<uint16_t>(it-d.values.begin()));}
@@ -392,15 +400,19 @@ bool Engine::fast_topk(const Statement& s,const Header& h,const std::vector<Colu
   bool ivf=ann&&h.nlist&&selected[distance]==h.ivector;route="exact";last_probes=0;
   if(ivf&&!nprobe&&(h.active_count<4096||stale(h)||h.calibration_skipped||!h.recommended_nprobe||h.recommended_nprobe>h.nlist/2)){ivf=false;route="exact_fallback";}
   if(ivf&&!filters.empty()&&matching_bound<=32){ivf=false;route="exact_fallback";}
-  size_t workspace=size_t(h.slots)*4+c->vector_pages.size()*sizeof(const std::byte*)+size_t(h.nlist)*sizeof(std::pair<double,uint32_t>)+size_t(s.limit)*(sizeof(double)+sizeof(SlotId)+sizeof(Value)*2+sizeof(std::vector<Value>)+64)+4096;
+  size_t workspace=size_t(s.limit)*(sizeof(Value)*2+sizeof(std::vector<Value>)+64)+4096;
+  if(!reuse)workspace+=size_t(h.slots)*4+c->vector_pages.size()*sizeof(const std::byte*)+size_t(h.nlist)*sizeof(std::pair<double,uint32_t>)+size_t(s.limit)*sizeof(TableReadCache::Neighbor);
   if(workspace>storage.budget.limit-storage.budget.used){read_cache.reset();return false;}
-  auto reservation=std::make_shared<Reservation>(storage.budget,workspace);
+  std::optional<Reservation> reservation;reservation.emplace(storage.budget,workspace);
   // Validate without loading: loading one missing page could evict any earlier
   // borrowed address. The all-resident scan below makes no pool calls at all.
-  std::vector<const std::byte*> bases(c->vector_pages.size());bool all_resident=true;
+  std::vector<const std::byte*> local_bases;
+  auto& bases=reuse?c->bases:local_bases;bases.resize(c->vector_pages.size());bool all_resident=true;
   for(size_t i=0;i<bases.size();++i){bases[i]=storage.pool.resident(c->vector_pages[i]);all_resident&=bases[i]!=nullptr;}
-  std::vector<SlotId> candidates;
-  std::vector<std::pair<double,uint32_t>> distances;
+  std::vector<SlotId> local_candidates;
+  std::vector<std::pair<double,uint32_t>> local_distances;
+  auto& candidates=reuse?c->candidates:local_candidates;candidates.clear();
+  auto& distances=reuse?c->distances:local_distances;distances.clear();
   if(ivf){route="ivf";last_probes=std::min(nprobe?nprobe:h.recommended_nprobe,h.nlist);distances.reserve(h.nlist);
     for(uint32_t b=0;b<h.nlist;++b)distances.emplace_back(l2_squared_fast(query.data(),c->centers.data()+size_t(b)*dim,dim,safe&&!has_extreme(c->centers.data()+size_t(b)*dim,dim)),b);
     std::sort(distances.begin(),distances.end());
@@ -409,7 +421,7 @@ bool Engine::fast_topk(const Statement& s,const Header& h,const std::vector<Colu
     if(!all_resident){all_resident=true;for(size_t i=0;i<last_probes&&all_resident;++i){auto b=distances[i].second;for(auto at=c->offsets[b];at<c->offsets[b+1];++at)if(!bases[c->postings[at]/count]){all_resident=false;break;}}}
     if(!all_resident){candidates.reserve(h.slots);for(size_t i=0;i<last_probes;++i){auto b=distances[i].second;candidates.insert(candidates.end(),c->postings.begin()+c->offsets[b],c->postings.begin()+c->offsets[b+1]);}std::sort(candidates.begin(),candidates.end());}
   }
-  struct Neighbor{double squared;SlotId slot;};std::vector<Neighbor> heap;heap.reserve(s.limit);
+  using Neighbor=TableReadCache::Neighbor;std::vector<Neighbor> local_heap;auto& heap=reuse?c->heap:local_heap;heap.clear();heap.reserve(s.limit);
   auto less=[&](const Neighbor& a,const Neighbor& b){
     if(a.squared!=b.squared){
       // Preserve SQL's displayed double-distance tie order even when two
@@ -540,21 +552,64 @@ bool Engine::fast_topk(const Statement& s,const Header& h,const std::vector<Colu
     for(auto& n:heap){std::vector<Value> values(2);values[distance]=std::sqrt(n.squared);values[1-distance]=c->keys[n.slot];result.memory_rows->push_back(std::move(values));}
     retained+=result.memory_rows->capacity()*(sizeof(std::vector<Value>)+2*sizeof(Value));
   }
-  std::vector<SlotId>().swap(candidates);std::vector<Neighbor>().swap(heap);std::vector<const std::byte*>().swap(bases);std::vector<std::pair<double,uint32_t>>().swap(distances);
-  storage.budget.release(reservation->n-retained);reservation->n=retained;
-  result.memory_reservation=std::move(reservation);return true;
+  if(!reuse){std::vector<SlotId>().swap(local_candidates);std::vector<Neighbor>().swap(local_heap);std::vector<const std::byte*>().swap(local_bases);std::vector<std::pair<double,uint32_t>>().swap(local_distances);}
+  reservation.reset();
+  if(result.memory_rows)result.memory_reservation=std::make_shared<Reservation>(storage.budget,retained);
+  return true;
+}
+bool Engine::prepare_select(std::string_view sql,Statement& s){
+  if(storage.budget.limit<4*1024*1024)return false;
+  if(s.kind!=Statement::Select||sql.size()>16384||s.limit==0||s.limit>10||s.expressions.size()!=2||s.conditions.size()>8||s.order.empty()||s.order.size()>2)return false;
+  size_t distance=2;for(size_t i=0;i<2;++i)if(s.expressions[i].distance){if(distance!=2)return false;distance=i;}
+  if(distance==2||s.expressions[1-distance].column=="*")return false;
+  // Escaped literals retain the complete parser/converter route.
+  Statement probe=s;if(!reuse_select(sql,sql,probe))return false;
+  auto h=header(s.table);auto cols=schema(h);auto pk=primary(cols);
+  auto vector_col=column(cols,s.expressions[distance].column);
+  if(cols[vector_col].type!=Type::Vector||column(cols,s.expressions[1-distance].column)!=pk)return false;
+  for(auto& condition:s.conditions){auto i=column(cols,condition.column);if(condition.op!="="||!condition.quoted||cols[i].type!=Type::Varchar)return false;}
+  std::vector<std::pair<size_t,bool>> order;
+  for(auto& [name,desc]:s.order){size_t i=0;for(;i<2;++i)if(s.expressions[i].alias==name)break;order.emplace_back(i<2?i:2+column(cols,name),desc);}
+  if(order[0]!=std::pair<size_t,bool>{distance,false})return false;
+  if(order.size()==2&&(order[1].second||(order[1].first!=1-distance&&order[1].first!=2+pk)))return false;
+  const size_t bytes=98304+size_t(cols[vector_col].width)*8;
+  if(bytes>(storage.budget.limit-storage.budget.used)/8)return false;
+  auto w=std::make_unique<SelectWorkspace>();w->reservation=std::make_shared<Reservation>(storage.budget,bytes);
+  w->statement=s;w->pattern=sql;w->header=h;w->columns=std::move(cols);w->order=std::move(order);
+  w->selected.resize(2);w->selected[distance]=vector_col;w->selected[1-distance]=pk;w->queries.resize(2);
+  w->query_value=std::vector<float>();std::get<std::vector<float>>(w->query_value).reserve(w->columns[vector_col].width);
+  for(auto& c:s.conditions)w->predicates.emplace_back(column(w->columns,c.column),std::string());
+  select_workspace=std::move(w);return true;
+}
+bool Engine::execute_select_workspace(Result& result){
+  auto& w=*select_workspace;auto& s=w.statement;
+  last_lists=w.header.nlist;last_recommended=w.header.recommended_nprobe;
+  for(size_t i=0;i<2;++i){auto& e=s.expressions[i];result.columns.push_back(e.alias);
+    if(e.distance){auto& v=std::get<std::vector<float>>(w.query_value);v.swap(w.queries[i]);
+      convert_into(LiteralView{e.query,true,false},w.columns[w.selected[i]],w.query_value);v.swap(w.queries[i]);}
+  }
+  for(size_t j=0;j<w.predicates.size();++j){auto& c=s.conditions[j];auto type=w.columns[w.predicates[j].first];type.width=UINT32_MAX;
+    convert_into(LiteralView{c.literal,c.quoted,false},type,w.predicates[j].second);}
+  return fast_topk(s,w.header,w.columns,s.expressions,w.selected,w.queries,w.order,w.predicates,result);
 }
 Result Engine::execute(std::string_view sql){
   try {
   last_probes=last_lists=last_recommended=0;route="none";
   if(is_insert(sql)){
-    read_cache.reset();prepared_vectors.reset();prepared_table.clear();Reservation input(storage.budget,sql.size()+512);
+    select_workspace.reset();read_cache.reset();prepared_vectors.reset();prepared_table.clear();Reservation input(storage.budget,sql.size()+512);
     bool automatic=!storage.in_transaction();if(automatic)storage.begin();auto point=storage.savepoint();
     try{auto result=insert_stream(sql);if(automatic)storage.commit();return result;}
     catch(...){storage.rollback_to(point);if(automatic)storage.rollback();throw;}
   }
-  if(sql.size()*4+512>storage.budget.limit-storage.budget.used){read_cache.reset();prepared_vectors.reset();prepared_table.clear();}
-  Reservation input(storage.budget,sql.size()*4+512);auto s=parse(sql);
+  if(sql.size()*4+512>storage.budget.limit-storage.budget.used){select_workspace.reset();read_cache.reset();prepared_vectors.reset();prepared_table.clear();}
+  Reservation input(storage.budget,sql.size()*4+512);
+  if(select_workspace&&sql.size()<=16384&&reuse_select(select_workspace->pattern,sql,select_workspace->statement)){
+    ++reused_select_queries;
+    Result result;if(execute_select_workspace(result))return result;
+    return execute_inner(select_workspace->statement);
+  }
+  select_workspace.reset();auto s=parse(sql);
+  if(prepare_select(sql,s)){Result result;if(execute_select_workspace(result))return result;select_workspace.reset();}
   // Full projections/sorts cannot use the bounded resident TopK path. Do not
   // let its preparation lease reserve frames across an unrelated scan.
   if(s.kind==Statement::Select&&(s.limit>4096||s.expressions.size()!=2||s.order.empty())){read_cache.reset();prepared_vectors.reset();prepared_table.clear();}
@@ -567,7 +622,7 @@ Result Engine::execute(std::string_view sql){
   preparation_cache_allowed=automatic&&s.kind==Statement::CreateIndex;
   try{auto result=execute_inner(s);if(automatic)storage.commit();preparation_cache_allowed=false;return result;}
   catch(...){preparation_cache_allowed=false;if(writes){storage.rollback_to(point);if(automatic)storage.rollback();}throw;}
-  }catch(...){read_cache.reset();prepared_vectors.reset();prepared_table.clear();throw;}
+  }catch(...){select_workspace.reset();read_cache.reset();prepared_vectors.reset();prepared_table.clear();throw;}
 }
 Result Engine::insert_stream(std::string_view sql){
   return insert_is_ascending(sql)?insert_sequential(sql):insert_ordered(sql);
@@ -620,6 +675,7 @@ Result Engine::insert_sequential(std::string_view sql){
   };
   Header h;std::string table;std::vector<Column> cols;std::vector<size_t> order;size_t pkcol=0;Result result;
   std::vector<Value> values;std::optional<Reservation> scratch_memory;size_t scratch_bytes=0;
+  std::string packed;std::optional<Reservation> packed_memory;
   parse_insert_rows(sql,[&](const Statement& s){table=s.table;h=header(table);cols=schema(h);pkcol=primary(cols);
     if(s.insert_columns.empty()){for(size_t i=0;i<cols.size();++i)order.push_back(i);}else for(auto& name:s.insert_columns)order.push_back(column(cols,name));
     require(order.size()==cols.size(),"all columns must have values");auto sorted=order;std::sort(sorted.begin(),sorted.end());require(std::adjacent_find(sorted.begin(),sorted.end())==sorted.end(),"duplicate INSERT column");
@@ -628,6 +684,8 @@ Result Engine::insert_sequential(std::string_view sql){
   },[&](const std::vector<LiteralView>& tuple){
     require(tuple.size()==cols.size(),"INSERT width mismatch");
     size_t bytes=512+cols.size()*(sizeof(Value)+sizeof(LiteralView));for(size_t i=0;i<tuple.size();++i){auto& col=cols[order[i]];bytes+=col.type==Type::Vector?size_t(col.width)*4+tuple[i].text.size():(col.type==Type::Varchar?tuple[i].text.size()*4:0);}
+    // Optional retained output must never prevent admission of a wider row.
+    if(packed_memory&&bytes-scratch_bytes+2*PAGE>storage.budget.limit-storage.budget.used){std::string().swap(packed);packed_memory.reset();}
     Reservation row_memory(storage.budget,bytes-scratch_bytes);
     if(values.size()!=cols.size())values.resize(cols.size());
     for(size_t j=0;j<tuple.size();++j)convert_into(tuple[j],cols[order[j]],values[order[j]]);
@@ -639,11 +697,16 @@ Result Engine::insert_sequential(std::string_view sql){
       if(cols[i].type==Type::Vector){auto& v=std::get<std::vector<float>>(values[i]);m.reserved|=has_extreme(v.data(),v.size())?1:0;auto count=PAGE/stride(cols[i]);edit(table+".v"+std::to_string(i),slot/count,(slot%count)*stride(cols[i]),v.data(),v.size()*4,true);v.clear();}
       else if(!cols[i].primary){auto hash=scalar_hash(values[i]);edit(table+".s"+std::to_string(i),slot/(PAGE/8),(slot%(PAGE/8))*8,&hash,8,true);}
     }
-    auto packed=pack_values(values);require(packed.size()<storage.budget.limit/4,"row exceeds workspace budget");m.offset=h.blob_end;m.length=static_cast<uint32_t>(packed.size());
+    size_t packed_size=4;for(auto& value:values)packed_size+=std::holds_alternative<std::string>(value)?5+std::get<std::string>(value).size():(std::holds_alternative<std::vector<float>>(value)?5:9);
+    // Growth uses the current row reservation, as the original temporary did.
+    // Only a capacity that survives this row receives a separate reservation.
+    if(packed_size>packed.capacity()){std::string().swap(packed);packed_memory.reset();}
+    pack_values_into(values,packed);require(packed.size()<storage.budget.limit/4,"row exceeds workspace budget");m.offset=h.blob_end;m.length=static_cast<uint32_t>(packed.size());
     for(size_t at=0;at<packed.size();){auto offset=h.blob_end+at;auto n=std::min<size_t>(packed.size()-at,PAGE-offset%PAGE);edit(table+".blob",offset/PAGE,offset%PAGE,packed.data()+at,n,true);at+=n;}
     h.blob_end+=packed.size();edit(table+".rows",slot/(PAGE/sizeof(Meta)),(slot%(PAGE/sizeof(Meta)))*sizeof(Meta),&m,sizeof(m),true);set_valid(table+".valid",slot);
     pk.insert(key,slot);++h.slots;++h.active_count;if(h.nlist&&h.mutations_since_calibration<UINT64_MAX)++h.mutations_since_calibration;++result.affected_rows;
     for(size_t i=0;i<cols.size();++i)if(cols[i].type!=Type::Vector)values[i]=int64_t{};
+    if(!packed_memory){if(storage.budget.limit>=4*1024*1024&&packed.capacity()+1+2*PAGE<=storage.budget.limit-storage.budget.used)packed_memory.emplace(storage.budget,packed.capacity()+1);else std::string().swap(packed);}
   },64);
   for(auto& p:pages)flush(p);
   if(capacity)storage.store(table+".header",0,h);
@@ -717,10 +780,13 @@ Result Engine::insert_ordered(std::string_view sql){
   }
   if(!literals_complete){std::vector<LiteralView>().swap(literals);literal_memory.reset();}
   std::vector<Value> values;std::optional<Reservation> scratch_memory;size_t scratch_bytes=0;
+  std::string packed;std::optional<Reservation> packed_memory;
   auto insert_tuple=[&](std::span<const LiteralView> tuple){
     require(tuple.size()==cols.size(),"INSERT width mismatch");
     size_t bytes=512+cols.size()*(sizeof(Value)+sizeof(LiteralView));for(size_t i=0;i<tuple.size();++i){auto& col=cols[order[i]];bytes+=col.type==Type::Vector?size_t(col.width)*4+tuple[i].text.size():(col.type==Type::Varchar?tuple[i].text.size()*4:0);}
     if(capacity&&!scratch_memory){scratch_bytes=cols.size()*sizeof(Value);for(auto& c:cols)if(c.type==Type::Vector)scratch_bytes+=size_t(c.width)*4;scratch_memory.emplace(storage.budget,scratch_bytes);}
+    // Optional retained output must never prevent admission of a wider row.
+    if(packed_memory&&bytes-scratch_bytes+2*PAGE>storage.budget.limit-storage.budget.used){std::string().swap(packed);packed_memory.reset();}
     Reservation row_memory(storage.budget,bytes-scratch_bytes);
     if(values.size()!=cols.size())values.resize(cols.size());
     for(size_t j=0;j<tuple.size();++j)convert_into(tuple[j],cols[order[j]],values[order[j]]);
@@ -732,12 +798,17 @@ Result Engine::insert_ordered(std::string_view sql){
       if(cols[i].type==Type::Vector){auto& v=std::get<std::vector<float>>(values[i]);m.reserved|=has_extreme(v.data(),v.size())?1:0;auto count=PAGE/stride(cols[i]);edit(table+".v"+std::to_string(i),slot/count,(slot%count)*stride(cols[i]),v.data(),v.size()*4,true);v.clear();}
       else if(!cols[i].primary){auto hash=scalar_hash(values[i]);edit(table+".s"+std::to_string(i),slot/(PAGE/8),(slot%(PAGE/8))*8,&hash,8,true);}
     }
-    auto packed=pack_values(values);require(packed.size()<storage.budget.limit/4,"row exceeds workspace budget");m.offset=h.blob_end;m.length=static_cast<uint32_t>(packed.size());
+    size_t packed_size=4;for(auto& value:values)packed_size+=std::holds_alternative<std::string>(value)?5+std::get<std::string>(value).size():(std::holds_alternative<std::vector<float>>(value)?5:9);
+    // Growth uses the current row reservation, as the original temporary did.
+    // Only a capacity that survives this row receives a separate reservation.
+    if(packed_size>packed.capacity()){std::string().swap(packed);packed_memory.reset();}
+    pack_values_into(values,packed);require(packed.size()<storage.budget.limit/4,"row exceeds workspace budget");m.offset=h.blob_end;m.length=static_cast<uint32_t>(packed.size());
     for(size_t at=0;at<packed.size();){auto offset=h.blob_end+at;auto n=std::min<size_t>(packed.size()-at,PAGE-offset%PAGE);edit(table+".blob",offset/PAGE,offset%PAGE,packed.data()+at,n,true);at+=n;}
     h.blob_end+=packed.size();edit(table+".rows",slot/(PAGE/sizeof(Meta)),(slot%(PAGE/sizeof(Meta)))*sizeof(Meta),&m,sizeof(m),true);set_valid(table+".valid",slot);
     if(!ordered_batch)pk.insert(key,slot);
     ++h.slots;++h.active_count;if(h.nlist&&h.mutations_since_calibration<UINT64_MAX)++h.mutations_since_calibration;++result.affected_rows;
     for(size_t i=0;i<cols.size();++i)if(cols[i].type!=Type::Vector)values[i]=int64_t{};
+    if(!packed_memory){if(storage.budget.limit>=4*1024*1024&&packed.capacity()+1+2*PAGE<=storage.budget.limit-storage.budget.used)packed_memory.emplace(storage.budget,packed.capacity()+1);else std::string().swap(packed);}
   };
   if(literals_complete){++borrowed_insert_batches;for(size_t row=0;row<key_count;++row)insert_tuple(std::span<const LiteralView>(literals.data()+row*cols.size(),cols.size()));}
   else parse_insert_rows(sql,setup,[&](const std::vector<LiteralView>& tuple){insert_tuple(tuple);},64);

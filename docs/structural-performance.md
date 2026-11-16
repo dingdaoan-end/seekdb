@@ -1,3 +1,5 @@
+> 本次最新结果在文末“本轮：热TopK零分配与行编码缓冲复用”；前文为历史轮次，不能混用测量窗口。
+
 > 最新结果在文末“本轮继续”部分；前半部保留上一轮实测，不能混用两轮时间窗口。
 
 # 结构性性能迭代：最终实测与恢复边界
@@ -637,3 +639,317 @@ Decision: retain no production change. The full guard is a no-op on the target h
 - r472: `sha256:265ce5d83e60c9c74db7b452d7be7e2296b6c4444516f3e532c95f2819bb9f86`
 - prior: `sha256:a5e9ce0787b2fecc48b53ef1f19cbbd5b8b4cfa5ca56b5678ec8e4334bc9aedd`
 - new: `sha256:321e3bedcd15269ba40429ef27acc06a34e25758986e9dc83eae76a8b528edc0`
+
+# 本轮：热TopK零分配与行编码缓冲复用
+
+
+固定参考4722cb8，上版95788b923，新版。三轮108独立容器，计量及顺序同前述；本轮所有数字新跑，不混入历史样本。仅备用仓库推送。
+
+
+## 分配归因与代码边界
+
+
+# Allocation profile: baseline 95788b923
+
+All source compiled from `zero/base` (git archive of 95788b923), Release `-O3 -DNDEBUG`, with debug information added solely for return-address attribution. No production files changed. `operator new`/`new[]` samples use fixed static buffers, with recursion guarded during `backtrace`. Query setup, request JSON encoding, warmup (all 500 queries), decoding samples, and output occur outside the measured interval. The interval matches the previous allocation harness: RequestInput parse, borrowed-SQL Engine execute, response assembly, and result destruction. This is allocation profiling, not a timing result.
+
+| Dataset | Requests | Allocations | Allocations/request | Allocated bytes |
+|---|---:|---:|---:|---:|
+| Clustered unfiltered | 500 | 14,000 | 28 | 4,605,250 |
+| Clustered filtered | 500 | 16,000 | 32 | 4,698,843 |
+| Uniform unfiltered | 500 | 14,000 | 28 | 4,766,551 |
+| Uniform filtered | 500 | 16,000 | 32 | 4,858,404 |
+
+Each allocation count and byte total exactly reproduces the earlier harness's optimized results. Request JSON parsing and response assembly allocate zero in the warmed measured requests. All allocations are stage 2 (Engine execution).
+
+| Allocation callsite/type | Unfiltered/request | Filtered/request | Baseline location |
+|---|---:|---:|---|
+| Statement expressions vector, capacities 1/2 (104/208 B) | 2 | 2 | sql.cpp:193 |
+| Statement query literal string | 1 | 1 | sql.cpp:26/190 |
+| Statement order vector, capacities 1/2 (40/80 B) | 2 | 2 | sql.cpp:195 |
+| Statement conditions vector (104 B) | 0 | 1 | sql.cpp:195 |
+| Eager successful header error-message string (31 B) | 1 | 1 | engine.cpp:78 |
+| Schema SQL string copy (104 B) | 1 | 1 | engine.cpp:79 |
+| Schema columns vector, capacities 1/2/4 (48/96/192 B) | 3 | 3 | sql.cpp:177 |
+| Converted predicate vector (48 B) | 0 | 1 | engine.cpp:755 |
+| Equality sketches vector (16 B) | 0 | 1 | engine.cpp:781 |
+| Eager successful execution-kind message (23 B) | 1 | 1 | engine.cpp:818 |
+| Execution expressions vector, capacities 1/2 (104/208 B) | 2 | 2 | engine.cpp:819 |
+| Execution expression query string copy | 1 | 1 | engine.cpp:819 |
+| Selected columns vector, capacities 1/2 (8/16 B) | 2 | 2 | engine.cpp:821 |
+| Result column labels vector, capacities 1/2 (32/64 B) | 2 | 2 | engine.cpp:821 |
+| Query vectors container, capacities 1/2 (24/48 B) | 2 | 2 | engine.cpp:821 |
+| Eager successful distance-type message (25 B) | 1 | 1 | engine.cpp:821 |
+| Temporary Literal query string copy | 1 | 1 | engine.cpp:821 |
+| Converted float query buffer (512 B) | 1 | 1 | sql.cpp:237 |
+| Execution order vector, capacities 1/2 (16/32 B) | 2 | 2 | engine.cpp:823 |
+| TopK dictionary filter vector (16 B) | 0 | 1 | engine.cpp:379 |
+| Shared Reservation/control block (48 B) | 1 | 1 | engine.cpp:397 |
+| Resident vector-page base pointer array (2504 B) | 1 | 1 | engine.cpp:400 |
+| Neighbor heap (160 B) | 1 | 1 | engine.cpp:412 |
+| **Total** | **28** | **32** | |
+
+Grouped: SQL parsing 5/6, header/schema 5/5, execution preparation 15/17, TopK scratch and result reservation 3/4. Literal strings have varying sizes, approximately 1.5 KB each in clustered data, and occur three times: Statement query, copied execution expression query, and temporary conversion Literal.
+
+## Concrete opportunities
+
+* Preserve the current error text but construct error strings only on failed validation. Literal-message `require` should take a borrowed string; header's concatenated message needs a failed-condition branch. Saves 3 allocations/request here.
+* Parse cached header schema once per valid read-cache generation, or borrow header.schema directly when parsing and reuse bounded schema storage. Baseline pays 4 allocations/request for schema construction plus eager header message. Cache invalidation must follow existing storage/table invalidation.
+* Reserve known sizes before building expression/selected/query/order/label vectors. For two-element vectors, each reserve saves one allocation; inline bounded storage or persistent capacity reuse can remove both.
+* Avoid copying the expression vector when wildcard expansion is unnecessary; borrow Statement expressions and query text. Avoid constructing an owning Literal for vector conversion; LiteralView is already available.
+* Reuse TopK heap/base/filter scratch only with budget admission preserved. The shared result Reservation must retain its current ownership semantics if results can outlive a query; removing it needs an alternative owner, not an unaccounted allocation.
+
+Raw allocation traces, JSON aggregate stacks, and inline-frame reports are adjacent. Inline reports use return PC minus one for accurate callsite attribution.
+
+## Optimized working-tree snapshot
+
+Linked the same profiler, compiled against the current headers, to the freshly compiled `work/build/libmvdb_core.a`. All four groups produced `queries 500 samples 0`: **zero measured allocations and zero measured allocated bytes**, versus 28/request unfiltered and 32/request filtered in the frozen 95788b923 baseline. Full details are in `new-summary.json` and `*-new.raw`. This is warmed steady-state behavior for these measured TopK requests; initial plan/cache setup and fallback shapes are outside that claim. No CPU timing conclusion is derived from the stack profiler.
+
+Repeated all four profiles after the final low-budget cache-admission fix and freshly relinked library: all four remain zero allocations/zero bytes. Source/library/profiler hashes captured in `final-source-sha256.txt`.
+
+
+# Independent read-only review of query reuse
+
+Reviewed engine.cpp, engine.hpp, sql.cpp, sql.hpp, local_adapter.cpp and added core regressions. No production edits made by reviewer.
+
+Two concrete ResultColumns defects were reported to the implementation agent and fixed:
+
+1. Default copy assignment from an inline two-label source into a formerly large destination retained destination vector capacity, causing begin() to choose empty large storage. Fixed by fresh-copy then move assignment.
+2. Self-alias append across the inline boundary moved the referenced source before copying it: `ResultColumns c{"one","two"}; c.push_back(c[0]);` produced an empty third label. Fixed by accepting push_back's argument by value and moving that owned argument into storage.
+
+Both fixes reproduced successfully with the current header in `columns-review.cpp`: copy assignment yields `[one] [two]`, alias append yields `[one] [one]`. Implementation agent added corresponding production core regressions.
+
+Other review conclusions:
+
+* Template matching uses two complete token passes before modifying retained literals; token shape, unquoted token spelling, quote/identifier status, complete input consumption and escape rejection preserve strict fallback. Identifier case and comments match normal parser semantics. One vector literal precedes all scalar literals in admitted shapes, matching assignment order. Escaped SQL literals use the ordinary parser.
+* Shape bounded by 16 KiB SQL, two projections, one distance, eight VARCHAR equality conditions, two ordering terms, limit 1..10. Retained plan allowance 98,304 plus dimension*8 is conservative for two stored SQL/query copies, header/schema, scalar conditions and two float buffers at the admitted limits.
+* DML and transactions invalidate the SELECT workspace through unmatched-shape parsing, INSERT explicitly clears before mutation, exceptions clear workspace/read cache/residency state, and mode changes still consult current engine mode at execution.
+* Numeric Results own their labels and inline rows; they borrow neither workspace query text nor cache buffers. Generic retained rows keep a separately owned Reservation. Cache scratch is not exposed in Results.
+* Table cache charges all added persistent heap/base/filter/candidate/distance capacities, admits only bounded slot counts and uses existing fallback when budget cannot admit it. Predicates above filter capacity decline fast_topk.
+
+No further concrete correctness issue found during this review. Existing and added regression tests must still pass on final compiled source before completion.
+
+
+严格词法结构匹配复用一个SELECT模板，输入<=16KiB、LIMIT1..10、最多8个短等值过滤；转义/结构变化走通用解析器。计划保留拥有型字符串和Schema，工作区计入预算，DML/异常/关闭清理；低于4MiB保持原准入。JSONL检索模式直接设置，避免每次SET误清缓存。ResultColumns内联两列，长别名仍拥有字符串且可能分配；多列回退向量。结果自有数据，不借用查询工作区。
+
+
+INSERT的Value槽和向量早已按语句复用，本次新增pack_values_into与有预算的行编码容量复用；>=4MiB且留两页工作余量才保留容量，宽行前可清空，编码二进制格式不变。生产A/B包含全局require成功消息/Schema副本消除，不能将全部分配差异都归因pack；独立pack微基准隔离该项。
+
+
+|模式|旧CPU秒/分配/字节|新CPU秒/分配/字节|
+|---|---|---|
+|pack|{'cpu': 0.017951, 'allocations': 1000000, 'bytes': 31000000}|{'cpu': 0.009887, 'allocations': 1, 'bytes': 31}|
+|sequential|{'cpu': 0.117836, 'allocations': 105199, 'bytes': 17128357}|{'cpu': 0.119395, 'allocations': 44699, 'bytes': 15678157}|
+|ordered|{'cpu': 0.115474, 'allocations': 115601, 'bytes': 18593837}|{'cpu': 0.113974, 'allocations': 44801, 'bytes': 16915937}|
+
+## 500条查询分配与CPU（五次交错中位）
+
+
+|分布|过滤|旧分配|新分配|旧CPUms|新CPUms|
+|---|---|---|---|---|---|
+|clustered|unfiltered|14000|0|63.992999999999995|58.895999999999994|
+|clustered|filtered|16000|0|11.518|12.279|
+|uniform|unfiltered|14000|0|68.22|70.69300000000001|
+|uniform|filtered|16000|0|14.247|12.523|
+
+输入预编码及热身在计时外，包含JSON解析、Engine执行、响应组装，不含管道I/O；栈采样剖析不用于CPU结论。Engine-only五遍均值/三次中位：
+
+
+|分布|过滤|模式|472/957/新版CPUms|
+|---|---|---|---|
+|clustered|unfiltered|exact|[72.924, 55.937, 57.923]|
+|clustered|unfiltered|ann|[15.791, 15.968, 14.617]|
+|clustered|filtered|exact|[24.626, 11.199, 10.87]|
+|clustered|filtered|ann|[8.441, 8.234, 8.12]|
+|uniform|unfiltered|exact|[80.861, 75.297, 74.664]|
+|uniform|unfiltered|ann|[84.33, 77.458, 71.234]|
+|uniform|filtered|exact|[25.086, 12.664, 12.132]|
+|uniform|filtered|ann|[25.168, 12.094, 12.178]|
+
+## 三轮容器中位数
+
+
+每格T秒/B MiB/M MiB。B/M覆盖完整生命周期，T查询不含装载/索引/预热。
+
+
+|分布|内存|项目|472|957|新版|
+|---|---|---|---|---|---|
+|clustered|16m|write|0.422877 / 7.191 / 15.016|0.405847 / 7.137 / 9.656|0.396417 / 7.137 / 9.52|
+|clustered|16m|exact|0.643791 / 8.613 / 16.0|0.52194 / 7.27 / 9.91|0.522732 / 7.27 / 10.141|
+|clustered|16m|ann|0.452856 / 8.609 / 16.0|0.444503 / 7.27 / 10.145|0.434381 / 7.27 / 10.141|
+|clustered|2g|write|0.41083 / 7.094 / 14.816|0.409684 / 7.094 / 9.145|0.420114 / 7.094 / 9.355|
+|clustered|2g|exact|0.595514 / 8.355 / 17.316|0.536676 / 7.227 / 9.898|0.510123 / 7.227 / 10.324|
+|clustered|2g|ann|0.459177 / 8.355 / 17.328|0.446817 / 7.227 / 10.094|0.444822 / 7.227 / 10.164|
+|uniform|16m|write|0.423567 / 7.184 / 14.938|0.404454 / 7.137 / 9.34|0.396548 / 7.141 / 9.379|
+|uniform|16m|exact|0.600995 / 8.605 / 16.0|0.576216 / 7.266 / 10.16|0.560751 / 7.27 / 10.062|
+|uniform|16m|ann|0.627111 / 8.609 / 16.0|0.569686 / 7.277 / 9.926|0.550709 / 7.277 / 10.012|
+|uniform|2g|write|0.428961 / 7.094 / 14.867|0.418719 / 7.094 / 9.477|0.408555 / 7.094 / 9.41|
+|uniform|2g|exact|0.591039 / 8.355 / 17.461|0.563654 / 7.227 / 9.953|0.583275 / 7.227 / 10.047|
+|uniform|2g|ann|0.615601 / 8.355 / 17.352|0.566433 / 7.227 / 10.168|0.57183 / 7.227 / 10.176|
+
+E固定472的写/Exact三轮中位参考，ANN也用同一Exact参考，ε=.001秒/1MiB/1MiB，先逐轮E再取中位；不是线上评分预测。
+
+
+|分布|内存|模式|472 E|957 E|新版E|
+|---|---|---|---|---|---|
+|clustered|16m|exact|0.497356|0.550138|0.550399|
+|clustered|16m|ann|0.534772|0.563929|0.567002|
+|clustered|2g|exact|0.499885|0.538752|0.540648|
+|clustered|2g|ann|0.523109|0.556718|0.555684|
+|uniform|16m|exact|0.499974|0.532893|0.537343|
+|uniform|16m|ann|0.495671|0.535287|0.538328|
+|uniform|2g|exact|0.499203|0.534373|0.531643|
+|uniform|2g|ann|0.49592|0.532747|0.532794|
+
+## 最终门禁与九项硬校验
+
+
+本机/容器CTest18/18；官方原生及只读Docker20/20（95SQL）；冻结R9完整JSONL4000/4000。新回归覆盖模板拒绝、转义、语法错误、DML、ResultColumns复制/自引用/多列、结果跨关闭存活及编码逐字节一致/预算/回滚；低预算断言未放宽。
+
+
+|检查|结果|
+|---|---|
+|r10_conversations_locked|True|
+|r10_units_locked|True|
+|no_external_or_forbidden_words|True|
+|all_ids_and_pointers_valid|True|
+|all_verbatim_substrings|True|
+|all_within_240_chars|True|
+|all_sha256_valid|True|
+|size_within_limit|True|
+|both_files_identical|True|
+
+
+两份130770字节，SHA256 `8cb1d600ce35b8542250c2705f9690a469d6edf3db7abf06eef00127bda6ca2c`，旧10轮31单元不变；11轮35单元70条自身指针，原文摘录/长度/13个实际SHA字段均通过。
+
+
+## 本轮全部108个容器样本
+
+
+|版本|分布|内存|轮|项目|T秒|rbytes|wbytes|M字节|Recall|
+|---|---|---|---|---|---|---|---|---|---|
+|r472|clustered|16m|1|ann|0.4486036440011958|413696|8605696|16777216|[0.9907999999999999, 0.9886]|
+|r472|clustered|16m|1|exact|0.6437906310022754|413696|8617984|16777216|[1.0, 1.0]|
+|r472|clustered|16m|1|write|0.4347843150001154|983040|7098368|15990784|None|
+|r472|clustered|16m|2|ann|0.4528562789978423|413696|8613888|16777216|[0.9907999999999999, 0.9886]|
+|r472|clustered|16m|2|exact|0.5911381100036124|413696|8626176|16777216|[1.0, 1.0]|
+|r472|clustered|16m|2|write|0.42287704200020926|409600|7131136|15745024|None|
+|r472|clustered|16m|3|ann|0.4595228049970501|413696|8622080|16777216|[0.9907999999999999, 0.9886]|
+|r472|clustered|16m|3|exact|0.7009113599951888|413696|8609792|16777216|[1.0, 1.0]|
+|r472|clustered|16m|3|write|0.3963213179995364|409600|7102464|15466496|None|
+|r472|clustered|2g|1|ann|0.45144525799969415|413696|8347648|18395136|[0.9907999999999999, 0.9886]|
+|r472|clustered|2g|1|exact|0.6379460000011932|413696|8347648|18157568|[1.0, 1.0]|
+|r472|clustered|2g|1|write|0.44477320700002565|409600|7028736|15527936|None|
+|r472|clustered|2g|2|ann|0.47778764100394255|413696|8347648|18169856|[0.9907999999999999, 0.9886]|
+|r472|clustered|2g|2|exact|0.5955137899984493|413696|8347648|18202624|[1.0, 1.0]|
+|r472|clustered|2g|2|write|0.4108302020001702|409600|7028736|15572992|None|
+|r472|clustered|2g|3|ann|0.4591765809982462|413696|8347648|18157568|[0.9907999999999999, 0.9886]|
+|r472|clustered|2g|3|exact|0.5872098330091831|413696|8347648|18157568|[1.0, 1.0]|
+|r472|clustered|2g|3|write|0.4051804330001687|409600|7028736|15536128|None|
+|r472|uniform|16m|1|ann|0.6380557270001646|413696|8613888|16777216|[1.0, 1.0]|
+|r472|uniform|16m|1|exact|0.629426176996958|413696|8642560|16777216|[1.0, 1.0]|
+|r472|uniform|16m|1|write|0.4221978550001495|409600|7122944|15663104|None|
+|r472|uniform|16m|2|ann|0.5927851550022751|413696|8630272|16777216|[1.0, 1.0]|
+|r472|uniform|16m|2|exact|0.6009948320020158|413696|8609792|16777216|[1.0, 1.0]|
+|r472|uniform|16m|2|write|0.4246008330001132|409600|7139328|15536128|None|
+|r472|uniform|16m|3|ann|0.6271112570020705|413696|8613888|16777216|[1.0, 1.0]|
+|r472|uniform|16m|3|exact|0.5845194019984774|413696|8597504|16777216|[1.0, 1.0]|
+|r472|uniform|16m|3|write|0.4235665650003284|409600|7122944|15732736|None|
+|r472|uniform|2g|1|ann|0.582632898999691|413696|8347648|18149376|[1.0, 1.0]|
+|r472|uniform|2g|1|exact|0.5838909930000682|413696|8347648|18374656|[1.0, 1.0]|
+|r472|uniform|2g|1|write|0.42050140000014835|409600|7028736|15589376|None|
+|r472|uniform|2g|2|ann|0.615601233992038|413696|8347648|18354176|[1.0, 1.0]|
+|r472|uniform|2g|2|exact|0.6055609200025174|413696|8347648|18239488|[1.0, 1.0]|
+|r472|uniform|2g|2|write|0.4289607900000192|409600|7028736|15527936|None|
+|r472|uniform|2g|3|ann|0.6193582649902964|413696|8347648|18194432|[1.0, 1.0]|
+|r472|uniform|2g|3|exact|0.5910389920031776|413696|8347648|18309120|[1.0, 1.0]|
+|r472|uniform|2g|3|write|0.4355101979999745|409600|7028736|15630336|None|
+|prior|clustered|16m|1|ann|0.4445032500045727|413696|7208960|10391552|[0.9907999999999999, 0.9886]|
+|prior|clustered|16m|1|exact|0.5054322869978023|434176|7213056|10678272|[1.0, 1.0]|
+|prior|clustered|16m|1|write|0.4006464340000093|1110016|7073792|10387456|None|
+|prior|clustered|16m|2|ann|0.4487382679988059|413696|7208960|10637312|[0.9907999999999999, 0.9886]|
+|prior|clustered|16m|2|exact|0.547653173000981|413696|7208960|10391552|[1.0, 1.0]|
+|prior|clustered|16m|2|write|0.40969073199994455|409600|7073792|10125312|None|
+|prior|clustered|16m|3|ann|0.4410722890022498|413696|7213056|10719232|[0.9907999999999999, 0.9886]|
+|prior|clustered|16m|3|exact|0.5219401899980767|413696|7208960|10375168|[1.0, 1.0]|
+|prior|clustered|16m|3|write|0.4058470090001265|409600|7073792|9572352|None|
+|prior|clustered|2g|1|ann|0.4468165819941987|413696|7163904|10407936|[0.9907999999999999, 0.9886]|
+|prior|clustered|2g|1|exact|0.5355316519967346|413696|7163904|10379264|[1.0, 1.0]|
+|prior|clustered|2g|1|write|0.40179851900006724|409600|7028736|9580544|None|
+|prior|clustered|2g|2|ann|0.4598614110032031|413696|7163904|10772480|[0.9907999999999999, 0.9886]|
+|prior|clustered|2g|2|exact|0.5366758670008949|413696|7163904|10440704|[1.0, 1.0]|
+|prior|clustered|2g|2|write|0.41039038299982167|409600|7028736|9588736|None|
+|prior|clustered|2g|3|ann|0.4455582410014358|413696|7163904|10584064|[0.9907999999999999, 0.9886]|
+|prior|clustered|2g|3|exact|0.6369209470024089|413696|7163904|10297344|[1.0, 1.0]|
+|prior|clustered|2g|3|write|0.4096839519997957|409600|7028736|9662464|None|
+|prior|uniform|16m|1|ann|0.5696855830024106|413696|7208960|10280960|[1.0, 1.0]|
+|prior|uniform|16m|1|exact|0.5744617789994209|413696|7208960|10653696|[1.0, 1.0]|
+|prior|uniform|16m|1|write|0.39620981899997787|409600|7069696|9793536|None|
+|prior|uniform|16m|2|ann|0.5934858830039502|413696|7217152|10407936|[1.0, 1.0]|
+|prior|uniform|16m|2|exact|0.5820827549978276|413696|7204864|10891264|[1.0, 1.0]|
+|prior|uniform|16m|2|write|0.41128038700003344|409600|7073792|9629696|None|
+|prior|uniform|16m|3|ann|0.5619200750015807|413696|7217152|10469376|[1.0, 1.0]|
+|prior|uniform|16m|3|exact|0.5762161980003384|413696|7196672|10457088|[1.0, 1.0]|
+|prior|uniform|16m|3|write|0.4044540479999341|409600|7073792|9932800|None|
+|prior|uniform|2g|1|ann|0.5782216360030361|413696|7163904|10661888|[1.0, 1.0]|
+|prior|uniform|2g|1|exact|0.5604266169957555|413696|7163904|10436608|[1.0, 1.0]|
+|prior|uniform|2g|1|write|0.42089469600000484|409600|7028736|9936896|None|
+|prior|uniform|2g|2|ann|0.5602418859978116|413696|7163904|10690560|[1.0, 1.0]|
+|prior|uniform|2g|2|exact|0.5636541769974883|413696|7163904|10567680|[1.0, 1.0]|
+|prior|uniform|2g|2|write|0.41262075300005563|409600|7028736|9650176|None|
+|prior|uniform|2g|3|ann|0.5664327489971583|413696|7163904|10657792|[1.0, 1.0]|
+|prior|uniform|2g|3|exact|0.6234462329921371|413696|7163904|10407936|[1.0, 1.0]|
+|prior|uniform|2g|3|write|0.41871904099980384|409600|7028736|10092544|None|
+|new|clustered|16m|1|ann|0.4294399490017895|413696|7208960|10985472|[0.9907999999999999, 0.9886]|
+|new|clustered|16m|1|exact|0.5239114510036416|413696|7208960|10539008|[1.0, 1.0]|
+|new|clustered|16m|1|write|0.3925571529998706|409600|7077888|9957376|None|
+|new|clustered|16m|2|ann|0.4393718079977589|413696|7229440|10534912|[0.9907999999999999, 0.9886]|
+|new|clustered|16m|2|exact|0.5121701300022323|413696|7208960|10801152|[1.0, 1.0]|
+|new|clustered|16m|2|write|0.3964173159999973|409600|7069696|9981952|None|
+|new|clustered|16m|3|ann|0.43438132999926893|413696|7204864|10633216|[0.9907999999999999, 0.9886]|
+|new|clustered|16m|3|exact|0.522731529983048|413696|7213056|10633216|[1.0, 1.0]|
+|new|clustered|16m|3|write|0.41444039799989696|409600|7073792|10215424|None|
+|new|clustered|2g|1|ann|0.44545878699636887|413696|7163904|10698752|[0.9907999999999999, 0.9886]|
+|new|clustered|2g|1|exact|0.5076683249974394|413696|7163904|10825728|[1.0, 1.0]|
+|new|clustered|2g|1|write|0.45958323200011364|409600|7028736|9568256|None|
+|new|clustered|2g|2|ann|0.4388740250067258|413696|7163904|10657792|[0.9907999999999999, 0.9886]|
+|new|clustered|2g|2|exact|0.5101226130013856|413696|7163904|10366976|[1.0, 1.0]|
+|new|clustered|2g|2|write|0.41762600499987457|409600|7028736|10035200|None|
+|new|clustered|2g|3|ann|0.44482192500163364|413696|7163904|10481664|[0.9907999999999999, 0.9886]|
+|new|clustered|2g|3|exact|0.5129197460023533|413696|7163904|10854400|[1.0, 1.0]|
+|new|clustered|2g|3|write|0.42011376999971617|409600|7028736|9809920|None|
+|new|uniform|16m|1|ann|0.546358638000811|413696|7208960|10444800|[1.0, 1.0]|
+|new|uniform|16m|1|exact|0.5607510949973857|413696|7208960|10547200|[1.0, 1.0]|
+|new|uniform|16m|1|write|0.38906593999990946|409600|7090176|9842688|None|
+|new|uniform|16m|2|ann|0.5593958330055102|413696|7217152|10690560|[1.0, 1.0]|
+|new|uniform|16m|2|exact|0.5837218789945382|413696|7208960|10620928|[1.0, 1.0]|
+|new|uniform|16m|2|write|0.40083099499997843|409600|7077888|9539584|None|
+|new|uniform|16m|3|ann|0.5507091760009644|413696|7221248|10498048|[1.0, 1.0]|
+|new|uniform|16m|3|exact|0.5377055180028947|413696|7208960|10551296|[1.0, 1.0]|
+|new|uniform|16m|3|write|0.3965481930003989|409600|7073792|9834496|None|
+|new|uniform|2g|1|ann|0.571830485003602|413696|7163904|10670080|[1.0, 1.0]|
+|new|uniform|2g|1|exact|0.5832751249927242|413696|7163904|10575872|[1.0, 1.0]|
+|new|uniform|2g|1|write|0.41352705900021647|409600|7028736|9814016|None|
+|new|uniform|2g|2|ann|0.5779343449992211|413696|7163904|10698752|[1.0, 1.0]|
+|new|uniform|2g|2|exact|0.5623352749996684|413696|7163904|10395648|[1.0, 1.0]|
+|new|uniform|2g|2|write|0.4064137089997075|409600|7028736|10080256|None|
+|new|uniform|2g|3|ann|0.5427870479929879|413696|7163904|10547200|[1.0, 1.0]|
+|new|uniform|2g|3|exact|0.5836317079983928|413696|7163904|10534912|[1.0, 1.0]|
+|new|uniform|2g|3|write|0.4085552199999256|409600|7028736|9867264|None|
+
+## 本次局限与独立内存诊断
+
+热路径零分配已达到，不等于四组CPU全部加速：聚类无过滤63.993→58.896ms、聚类过滤11.518→12.279ms、均匀无过滤68.220→70.693ms、均匀过滤14.247→12.523ms。冷建与复杂回退不属于零分配区间。108容器E中位数的八配置辅助均值为0.543104625→0.544230125，不属于赛题规定的跨配置评分；两配置E下降，不预测线上分数。
+
+诊断另用4个容器，未开启于正式计时。anon/file/kernel是约20ms采样最大current时组合，非memory.peak瞬时原子分解；下表字节。
+
+|版|项目|峰值|anon|file|kernel|
+|---|---|---|---|---|---|
+|prior|write|10006528|2330624|6471680|675840|
+|prior|exact|10391552|8110080|1486848|548864|
+
+prior镜像 `sha256:321e3bedcd15269ba40429ef27acc06a34e25758986e9dc83eae76a8b528edc0`
+|new|write|10534912|2330624|6094848|667648|
+|new|exact|10514432|8228864|1482752|540672|
+
+new镜像 `sha256:a50fc9358e907b2c66984467bfc2b144d92df66856e0215b16a6f788f6de3d8c`

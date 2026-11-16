@@ -101,6 +101,9 @@ with tempfile.TemporaryDirectory(prefix='mvdb-jsonl-') as root:
         assert send(p, {'id':ident,'sql':sql})['ok']
     result = send(p, {'id':22,'sql':'SELECT id,v FROM t ORDER BY id;','search_mode':'approx'})
     assert result['rows'] == [[1,[1,2,3]]] and result['columns'] == ['id','v'], result
+    for mode in ['exact', 'exact', 'ann', 'approx', 'exact']:
+        nearest = send(p, {'id': 'reused-topk-' + mode, 'sql': "SELECT id,L2_DISTANCE(v,'[1,2,3]') AS d FROM t ORDER BY d,id LIMIT 1", 'search_mode': mode})
+        assert nearest['columns'] == ['id', 'd'] and nearest['rows'] == [[1, 0]], nearest
     assert send(p, {'id': 'numeric-table', 'sql': 'CREATE TABLE numeric_vectors (id INT, v VECTOR(6));'})['ok']
     assert send(p, {'id': 'numeric-valid', 'sql': "INSERT INTO numeric_vectors VALUES(1,'[ +1.25, -2e1, 3E-2, 1e-9999, -1e-9999, 0x1p+2 ]');"})['ok']
     numbers = send(p, {'id': 'numeric-read', 'sql': 'SELECT v FROM numeric_vectors;'})['rows'][0][0]

@@ -267,7 +267,8 @@ void assemble_success(Response& response,std::string_view id,bool legacy,const m
   if(legacy||!result.columns.empty()){
     response.add(",\"columns\":[");bool first=true;for(const auto& name:result.columns){if(!first)response.add(",");first=false;response.string(name);}response.add("],\"rows\":[");first=true;
     if(result.numeric_count){for(size_t i=0;i<result.numeric_count;++i){if(i)response.add(",");auto& row=result.numeric_rows[i];response.add("[");if(result.numeric_distance_column==0)response.number(row.distance).add(",").integer(row.key);else response.integer(row.key).add(",").number(row.distance);response.add("]");}}
-    else result.each([&](const auto& row){if(!first)response.add(",");first=false;response.add("[");bool cell=true;for(const auto& value:row){if(!cell)response.add(",");cell=false;response.value(value);}response.add("]");});response.add("]");
+    else {result.each([&](const auto& row){if(!first)response.add(",");first=false;response.add("[");bool cell=true;for(const auto& value:row){if(!cell)response.add(",");cell=false;response.value(value);}response.add("]");});}
+    response.add("]");
   }
   response.add("}");
 }
@@ -315,7 +316,7 @@ int main(int argc,char** argv){
             auto mode=request.mode();
             if(mode=="approx")mode="ann";
             if(mode!="exact"&&mode!="ann")throw std::runtime_error("search_mode must be exact, ann, or approx");
-            code="";engine.execute(mode=="ann"?"SET SEARCH_MODE = ann;":"SET SEARCH_MODE = exact;");success(response,id,false,engine.execute(sql));
+            code="";engine.set_search_mode(mode=="ann");success(response,id,false,engine.execute(sql));
           }else {code="unsupported_op";throw std::runtime_error("unsupported operation");}
         }else {sql=line;code="";success(response,id,true,engine.execute(sql));}
       }catch(const std::exception& e){

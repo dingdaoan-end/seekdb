@@ -32,6 +32,9 @@ struct Statement {
   uint64_t limit=UINT64_MAX;
 };
 Statement parse(std::string_view);
+// Reuse a validated SELECT shape. Only unescaped quoted literals may vary;
+// structural mismatches leave the statement untouched and use the full parser.
+bool reuse_select(std::string_view pattern,std::string_view sql,Statement&);
 bool is_insert(std::string_view);
 // Callbacks may run before a later syntax error. The caller must provide
 // statement rollback and must never retry a materializing parser after mutation.
@@ -46,6 +49,7 @@ int compare(const Value&,const Value&);
 std::string json(const Value&);
 std::string quote(const std::string&);
 std::string pack_values(const std::vector<Value>&);
+void pack_values_into(const std::vector<Value>&,std::string&);
 std::vector<Value> unpack_values(const std::string&);
 double l2(const float*,const float*,size_t);
 // Precheck each stored vector once and the query once. safe=true requires both

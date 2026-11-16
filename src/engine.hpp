@@ -4,6 +4,34 @@
 #include <cstdio>
 #include <memory>
 namespace mvdb {
+// Own the two common TopK labels without allocating a vector per response.
+// Larger projections retain ordinary contiguous vector storage.
+class ResultColumns {
+  std::array<std::string,2> small{};
+  std::vector<std::string> large;
+  size_t count=0;
+public:
+  ResultColumns()=default;
+  ResultColumns(const ResultColumns&)=default;
+  ResultColumns& operator=(const ResultColumns& other){if(this!=&other){ResultColumns copy(other);*this=std::move(copy);}return *this;}
+  ResultColumns(ResultColumns&& other)noexcept:small(std::move(other.small)),large(std::move(other.large)),count(other.count){other.count=0;}
+  ResultColumns& operator=(ResultColumns&& other)noexcept{if(this!=&other){small=std::move(other.small);large=std::move(other.large);count=other.count;other.count=0;}return *this;}
+  ResultColumns(std::initializer_list<std::string> names){for(auto& n:names)push_back(n);}
+  ResultColumns& operator=(std::initializer_list<std::string> names){clear();for(auto& n:names)push_back(n);return *this;}
+  size_t size()const{return count;}
+  bool empty()const{return !count;}
+  void clear(){large.clear();for(auto& n:small)n.clear();count=0;}
+  void reserve(size_t n){if(n>2){if(large.capacity()<n)large.reserve(n);if(large.empty())for(size_t i=0;i<count;++i)large.push_back(std::move(small[i]));}}
+  void push_back(std::string name){if(count<2&&large.capacity()==0)small[count]=std::move(name);else{reserve(count+1);large.push_back(std::move(name));}++count;}
+  std::string* begin(){return large.capacity()?large.data():small.data();}
+  const std::string* begin()const{return large.capacity()?large.data():small.data();}
+  std::string* end(){return begin()+count;}
+  const std::string* end()const{return begin()+count;}
+  std::string& operator[](size_t i){return begin()[i];}
+  const std::string& operator[](size_t i)const{return begin()[i];}
+  std::string& back(){return (*this)[count-1];}
+  const std::string& back()const{return (*this)[count-1];}
+};
 namespace detail {
 // A bounded table can afford one exact pass for all calibration samples even
 // when its vector payload does not fit. Larger tables retain the I/O guard.
@@ -16,7 +44,7 @@ struct Result {
   std::array<NumericRow,10> numeric_rows{};
   size_t numeric_count=0,numeric_distance_column=0;
   int64_t affected_rows=0;
-  std::vector<std::string> columns;
+  ResultColumns columns;
   std::shared_ptr<FILE> rows;
   std::shared_ptr<std::vector<std::vector<Value>>> memory_rows;
   std::shared_ptr<void> memory_reservation;
@@ -62,8 +90,30 @@ class Engine {
     std::vector<uint32_t> offsets;
     std::vector<BufferPool::ResidentHandle> vector_pages;
     std::optional<BufferPool::ResidencyLease> vector_lease;
+    struct Neighbor {double squared;SlotId slot;};
+    std::vector<std::pair<size_t,uint16_t>> filters;
+    std::vector<const std::byte*> bases;
+    std::vector<SlotId> candidates;
+    std::vector<std::pair<double,uint32_t>> distances;
+    std::vector<Neighbor> heap;
   };
   std::unique_ptr<TableReadCache> read_cache;
+  struct SelectWorkspace {
+    std::shared_ptr<void> reservation;
+    Statement statement;
+    std::string pattern;
+    Header header;
+    std::vector<Column> columns;
+    std::vector<size_t> selected;
+    std::vector<std::vector<float>> queries;
+    Value query_value;
+    std::vector<std::pair<size_t,bool>> order;
+    std::vector<std::pair<size_t,Value>> predicates;
+  };
+  std::unique_ptr<SelectWorkspace> select_workspace;
+  uint64_t reused_select_queries=0;
+  bool prepare_select(std::string_view,Statement&);
+  bool execute_select_workspace(Result&);
   std::optional<BufferPool::ResidencyLease> prepared_vectors;
   std::string prepared_table;
   bool preparation_cache_allowed=false;
@@ -106,7 +156,8 @@ public:
   Engine(std::filesystem::path root,size_t budget=8*1024*1024,std::function<void(size_t)> progress={})
     :storage(std::move(root),budget,std::move(progress)){}
   Result execute(std::string_view sql);
-  void close(){read_cache.reset();prepared_vectors.reset();storage.close();}
+  void set_search_mode(bool approximate)noexcept{ann=approximate;}
+  void close(){select_workspace.reset();read_cache.reset();prepared_vectors.reset();storage.close();}
   size_t resident_frame_count() const{return storage.pool.resident_page_count();}
   size_t pinned_frame_count() const{return storage.pool.pinned_page_count();}
   size_t resident_frame_bytes() const{return storage.pool.allocated_page_bytes();}
@@ -120,6 +171,7 @@ public:
   uint64_t read_cache_build_count() const{return cache_builds;}
   uint64_t ordered_pk_batch_count() const{return ordered_pk_batches;}
   uint64_t borrowed_insert_batch_count() const{return borrowed_insert_batches;}
+  uint64_t reused_select_query_count() const{return reused_select_queries;}
   uint64_t point_lookup_count() const{return point_lookups;}
   uint64_t candidate_bitmap_blocks() const{return bitmap_blocks;}
   uint64_t candidate_slots_examined() const{return candidate_slots;}

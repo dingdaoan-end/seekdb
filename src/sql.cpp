@@ -205,6 +205,31 @@ template<class T>T read(const std::string& s,size_t& p){if(p+sizeof(T)>s.size())
 
 }
 Statement parse(std::string_view s){return Parser(s).run();}
+bool reuse_select(std::string_view pattern,std::string_view sql,Statement& s){
+  if(s.kind!=Statement::Select)return false;
+  auto match=[&](bool assign){
+    Cursor a(pattern),b(sql);size_t quoted=0;
+    while(!a.done()&&!b.done()){
+      auto x=a.next(),y=b.next();
+      if(x.quoted!=y.quoted||x.identifier!=y.identifier||x.escaped||y.escaped)return false;
+      if(x.quoted){
+        if(quoted&&y.text.size()>256)return false;
+        if(assign){size_t at=quoted;bool found=false;
+          for(auto& e:s.expressions)if(e.distance){if(!at){e.query.assign(y.text);found=true;break;}--at;}
+          if(!found)for(auto& c:s.conditions)if(c.quoted){if(!at){c.literal.assign(y.text);found=true;break;}--at;}
+          if(!found)return false;
+        }
+        ++quoted;
+      }else if(x.identifier){
+        if(x.text.size()!=y.text.size())return false;
+        for(size_t i=0;i<x.text.size();++i)if(std::tolower(static_cast<unsigned char>(x.text[i]))!=std::tolower(static_cast<unsigned char>(y.text[i])))return false;
+      }else if(x.text!=y.text)return false;
+    }
+    return a.done()&&b.done();
+  };
+  // Validate the complete input before updating any retained literal.
+  return match(false)&&match(true);
+}
 bool is_insert(std::string_view s){Cursor c(s);return !c.done()&&!c.peek().quoted&&c.peek().equals("insert");}
 void parse_insert_rows(std::string_view s,const std::function<void(const Statement&)>& header,const std::function<void(const std::vector<LiteralView>&)>& row,size_t max_columns){Parser(s).stream_insert(header,row,max_columns);}
 static size_t unicode_length_view(std::string_view s) {
@@ -232,7 +257,7 @@ void convert_into(const LiteralView& v,const Column& col,Value& destination) {
   }
   if(col.type==Type::Bigint){if(v.quoted)error("BIGINT literal must be numeric");destination=integer(v.text);return;}
   if(!v.quoted)error("string/vector literal must be quoted");
-  if(col.type==Type::Varchar){if(unicode_length_view(v.text)>col.width)error("VARCHAR exceeds code point length");destination=std::string(v.text);return;}
+  if(col.type==Type::Varchar){if(unicode_length_view(v.text)>col.width)error("VARCHAR exceeds code point length");if(!std::holds_alternative<std::string>(destination))destination.emplace<std::string>();std::get<std::string>(destination).assign(v.text);return;}
   if(!std::holds_alternative<std::vector<float>>(destination))destination.emplace<std::vector<float>>();
   auto& out=std::get<std::vector<float>>(destination);out.clear();out.reserve(std::min<size_t>(col.width,v.text.size()/2+1));
   size_t p=0;auto ws=[&]{while(p<v.text.size()&&std::isspace(static_cast<unsigned char>(v.text[p])))++p;};
@@ -302,11 +327,13 @@ std::string json(const Value& v){
   bool first=true;for(float x:vector){if(!first)out+=',';first=false;append_number(out,static_cast<double>(x));}out+=']';return out;
 }
 std::string pack_values(const std::vector<Value>& row) {
-  std::string s;append(s,static_cast<uint32_t>(row.size()));for(auto& v:row){append(s,static_cast<uint8_t>(v.index()));
+  std::string s;pack_values_into(row,s);return s;
+}
+void pack_values_into(const std::vector<Value>& row,std::string& s) {
+  s.clear();append(s,static_cast<uint32_t>(row.size()));for(auto& v:row){append(s,static_cast<uint8_t>(v.index()));
     if(auto n=std::get_if<int64_t>(&v))append(s,*n);else if(auto n=std::get_if<double>(&v))append(s,*n);
     else if(auto text=std::get_if<std::string>(&v)){append(s,static_cast<uint32_t>(text->size()));s+=*text;}
     else{auto& a=std::get<std::vector<float>>(v);append(s,static_cast<uint32_t>(a.size()));s.append(reinterpret_cast<const char*>(a.data()),a.size()*4);}}
-  return s;
 }
 std::vector<Value> unpack_values(const std::string& s) {
   size_t p=0;auto n=read<uint32_t>(s,p);if(n>1024)error("corrupt row count");std::vector<Value> out;
