@@ -12,6 +12,9 @@ constexpr bool skip_ivf_calibration_for_payload(uint64_t active_rows,uint64_t pa
 }
 }
 struct Result {
+  struct NumericRow {int64_t key;double distance;};
+  std::array<NumericRow,10> numeric_rows{};
+  size_t numeric_count=0,numeric_distance_column=0;
   int64_t affected_rows=0;
   std::vector<std::string> columns;
   std::shared_ptr<FILE> rows;
@@ -95,14 +98,14 @@ class Engine {
   void put_bucket(const std::string&,const Header&,SlotId,uint32_t);
   uint32_t calibrate(const std::string&,Header&,const std::vector<Column>&);
   Result execute_inner(const Statement&);
-  Result insert_stream(const std::string&);
-  bool insert_is_ascending(const std::string&);
-  Result insert_sequential(const std::string&);
-  Result insert_ordered(const std::string&);
+  Result insert_stream(std::string_view);
+  bool insert_is_ascending(std::string_view);
+  Result insert_sequential(std::string_view);
+  Result insert_ordered(std::string_view);
 public:
   Engine(std::filesystem::path root,size_t budget=8*1024*1024,std::function<void(size_t)> progress={})
     :storage(std::move(root),budget,std::move(progress)){}
-  Result execute(const std::string& sql);
+  Result execute(std::string_view sql);
   void close(){read_cache.reset();prepared_vectors.reset();storage.close();}
   size_t resident_frame_count() const{return storage.pool.resident_page_count();}
   size_t pinned_frame_count() const{return storage.pool.pinned_page_count();}

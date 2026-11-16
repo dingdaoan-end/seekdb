@@ -31,11 +31,11 @@ struct Statement {
   std::vector<std::pair<std::string,bool>> order;
   uint64_t limit=UINT64_MAX;
 };
-Statement parse(const std::string&);
-bool is_insert(const std::string&);
+Statement parse(std::string_view);
+bool is_insert(std::string_view);
 // Callbacks may run before a later syntax error. The caller must provide
 // statement rollback and must never retry a materializing parser after mutation.
-void parse_insert_rows(const std::string&,const std::function<void(const Statement&)>&,
+void parse_insert_rows(std::string_view,const std::function<void(const Statement&)>&,
                        const std::function<void(const std::vector<LiteralView>&)>&,size_t max_columns=SIZE_MAX);
 size_t unicode_length(const std::string&);
 Value convert(const Literal&,const Column&);

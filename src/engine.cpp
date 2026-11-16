@@ -73,7 +73,7 @@ public:
   std::shared_ptr<FILE> finish(){run();std::shared_ptr<FILE> out;for(auto& f:levels)if(f)out=out?merge(out,f):f;if(!out)out=storage.temporary();std::rewind(out.get());return out;}
 };
 }
-void Result::each(const std::function<void(const std::vector<Value>&)>& callback) const {if(memory_rows){for(auto& r:*memory_rows)callback(r);return;}if(!rows)return;std::rewind(rows.get());std::vector<Value> r;while(spill_read(rows.get(),r))callback(r);discard_cache(rows.get());}
+void Result::each(const std::function<void(const std::vector<Value>&)>& callback) const {if(numeric_count){std::vector<Value> row(2);for(size_t i=0;i<numeric_count;++i){row[numeric_distance_column]=numeric_rows[i].distance;row[1-numeric_distance_column]=numeric_rows[i].key;callback(row);}return;}if(memory_rows){for(auto& r:*memory_rows)callback(r);return;}if(!rows)return;std::rewind(rows.get());std::vector<Value> r;while(spill_read(rows.get(),r))callback(r);discard_cache(rows.get());}
 uint64_t Engine::spill_bytes() const{return total_spill_bytes;}
 Engine::Header Engine::header(const std::string& t){auto h=storage.load<Header>(t+".header",0);require(h.magic==0x4d564442,"table does not exist: "+t);return h;}
 std::vector<Column> Engine::schema(const Header& h){require(h.schema_size<sizeof(h.schema),"corrupt schema");return parse(std::string(h.schema,h.schema_size)).columns;}
@@ -530,14 +530,21 @@ bool Engine::fast_topk(const Statement& s,const Header& h,const std::vector<Colu
       scan_range(first,last);
     }
   }
-  std::sort(heap.begin(),heap.end(),less);result.memory_rows=std::make_shared<std::vector<std::vector<Value>>>();result.memory_rows->reserve(heap.size());
-  for(auto& n:heap){std::vector<Value> values(2);values[distance]=std::sqrt(n.squared);values[1-distance]=c->keys[n.slot];result.memory_rows->push_back(std::move(values));}
+  std::sort(heap.begin(),heap.end(),less);
+  size_t retained=256;
+  if(heap.size()<=result.numeric_rows.size()){
+    result.numeric_count=heap.size();result.numeric_distance_column=distance;
+    for(size_t i=0;i<heap.size();++i)result.numeric_rows[i]={c->keys[heap[i].slot],std::sqrt(heap[i].squared)};
+  }else{
+    result.memory_rows=std::make_shared<std::vector<std::vector<Value>>>();result.memory_rows->reserve(heap.size());
+    for(auto& n:heap){std::vector<Value> values(2);values[distance]=std::sqrt(n.squared);values[1-distance]=c->keys[n.slot];result.memory_rows->push_back(std::move(values));}
+    retained+=result.memory_rows->capacity()*(sizeof(std::vector<Value>)+2*sizeof(Value));
+  }
   std::vector<SlotId>().swap(candidates);std::vector<Neighbor>().swap(heap);std::vector<const std::byte*>().swap(bases);std::vector<std::pair<double,uint32_t>>().swap(distances);
-  auto retained=result.memory_rows->capacity()*(sizeof(std::vector<Value>)+2*sizeof(Value))+256;
   storage.budget.release(reservation->n-retained);reservation->n=retained;
   result.memory_reservation=std::move(reservation);return true;
 }
-Result Engine::execute(const std::string& sql){
+Result Engine::execute(std::string_view sql){
   try {
   last_probes=last_lists=last_recommended=0;route="none";
   if(is_insert(sql)){
@@ -562,10 +569,10 @@ Result Engine::execute(const std::string& sql){
   catch(...){preparation_cache_allowed=false;if(writes){storage.rollback_to(point);if(automatic)storage.rollback();}throw;}
   }catch(...){read_cache.reset();prepared_vectors.reset();prepared_table.clear();throw;}
 }
-Result Engine::insert_stream(const std::string& sql){
+Result Engine::insert_stream(std::string_view sql){
   return insert_is_ascending(sql)?insert_sequential(sql):insert_ordered(sql);
 }
-bool Engine::insert_is_ascending(const std::string& sql){
+bool Engine::insert_is_ascending(std::string_view sql){
   // Read-only preflight: never write a speculative prefix. Retain schema and
   // one previous key, not batch keys or borrowed literal views. A disorder
   // stops this scan early; the ordered helper validates the remaining SQL.
@@ -589,7 +596,7 @@ bool Engine::insert_is_ascending(const std::string& sql){
   }catch(const Disorder&){return false;}
   return true;
 }
-Result Engine::insert_sequential(const std::string& sql){
+Result Engine::insert_sequential(std::string_view sql){
   // Owned page images remain valid while PK/index writes replace pool frames.
   // Only new, header-invisible extents use append; bitmap bytes use normal undo.
   struct Pending {std::string file;uint64_t page=0;Page bytes{};size_t first=PAGE,last=0;bool append=true;};
@@ -642,7 +649,7 @@ Result Engine::insert_sequential(const std::string& sql){
   if(capacity)storage.store(table+".header",0,h);
   return result;
 }
-Result Engine::insert_ordered(const std::string& sql){
+Result Engine::insert_ordered(std::string_view sql){
   // Owned page images remain valid while PK/index writes replace pool frames.
   // Only new, header-invisible extents use append; bitmap bytes use normal undo.
   struct Pending {std::string file;uint64_t page=0;Page bytes{};size_t first=PAGE,last=0;bool append=true;};

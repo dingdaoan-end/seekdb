@@ -266,7 +266,8 @@ void assemble_success(Response& response,std::string_view id,bool legacy,const m
   if(legacy||result.columns.empty())response.add(",\"affected_rows\":").integer(result.affected_rows);
   if(legacy||!result.columns.empty()){
     response.add(",\"columns\":[");bool first=true;for(const auto& name:result.columns){if(!first)response.add(",");first=false;response.string(name);}response.add("],\"rows\":[");first=true;
-    result.each([&](const auto& row){if(!first)response.add(",");first=false;response.add("[");bool cell=true;for(const auto& value:row){if(!cell)response.add(",");cell=false;response.value(value);}response.add("]");});response.add("]");
+    if(result.numeric_count){for(size_t i=0;i<result.numeric_count;++i){if(i)response.add(",");auto& row=result.numeric_rows[i];response.add("[");if(result.numeric_distance_column==0)response.number(row.distance).add(",").integer(row.key);else response.integer(row.key).add(",").number(row.distance);response.add("]");}}
+    else result.each([&](const auto& row){if(!first)response.add(",");first=false;response.add("[");bool cell=true;for(const auto& value:row){if(!cell)response.add(",");cell=false;response.value(value);}response.add("]");});response.add("]");
   }
   response.add("}");
 }
@@ -299,7 +300,7 @@ int main(int argc,char** argv){
       auto before=engine.vector_page_reads();auto spill_before=engine.spill_bytes();
       bool legacy=!json_line(line),shutdown=false;std::string_view id="null";std::string code="invalid_request";RequestInput request;
       try{
-        std::string sql;
+        std::string_view sql;
         if(!legacy){
           request.parse(line);id=request.id();
           auto op=request.operation();
@@ -308,9 +309,9 @@ int main(int argc,char** argv){
             response.begin(id,false).add("}").emit();
           }else if(op=="ping")response.begin(id,false).add("}").emit();
           else if(op=="execute"){
-            // Materialize only at the existing string-based engine boundary.
+            // Borrow the request-owned SQL until synchronous execution completes.
             if(request.fast)sql=request.sql();
-            else sql=std::move(mvdb::protocol::required_string(request.fallback,"sql"));
+            else sql=mvdb::protocol::required_string(request.fallback,"sql");
             auto mode=request.mode();
             if(mode=="approx")mode="ann";
             if(mode!="exact"&&mode!="ann")throw std::runtime_error("search_mode must be exact, ann, or approx");

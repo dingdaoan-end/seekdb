@@ -30,6 +30,16 @@ int main(){
       std::string sql="INSERT INTO t VALUES ";for(unsigned i=0;i<100;++i){if(i)sql+=',';unsigned id=(reversed?200-i:i+1);auto row_literal=literal;row_literal.replace(1,row_literal.find(',')-1,std::to_string(id));sql+='('+std::to_string(id)+",'ok','"+row_literal+"')";}e.execute(sql+";");
     }
     size_t count=0;e.execute("SELECT id,v FROM t ORDER BY id;").each([&](auto& row){auto& v=std::get<std::vector<float>>(row[1]);assert(v.size()==oracle.size()&&v[0]==float(std::get<int64_t>(row[0]))&&std::equal(v.begin()+1,v.end(),oracle.begin()+1));++count;});assert(count==200);
+    // Non-terminated borrowed SQL must not consume the following request bytes.
+    std::string framed="SELECT id,L2_DISTANCE(v,'"+literal+"') AS d FROM t ORDER BY d,id LIMIT 10;INVALID";
+    auto top=e.execute(std::string_view(framed.data(),framed.size()-7));
+    assert(top.numeric_count==10&&!top.memory_rows);auto saved=top.numeric_rows;
+    e.execute("BEGIN");e.execute("DELETE FROM t WHERE id=1");e.execute("ROLLBACK");
+    assert(top.numeric_rows[0].key==saved[0].key&&top.numeric_rows[0].distance==saved[0].distance);
+    auto reverse=e.execute("SELECT L2_DISTANCE(v,'"+literal+"') AS d,id FROM t ORDER BY d,id LIMIT 10;");
+    assert(reverse.numeric_count==10&&reverse.numeric_distance_column==0);
+    auto wide=e.execute("SELECT id,L2_DISTANCE(v,'"+literal+"') AS d FROM t ORDER BY d,id LIMIT 11;");
+    assert(wide.memory_rows&&wide.memory_rows->size()==11);
     e.execute("BEGIN;");e.execute("INSERT INTO t VALUES (1000,'ok','"+literal+"');");
     bool failed=false;try{e.execute("INSERT INTO t VALUES (1001,'ok','"+literal+"'),(1002,'ok','[NaN]');");}catch(...){failed=true;}assert(failed);
     count=0;e.execute("SELECT id FROM t WHERE id>=1000 ORDER BY id;").each([&](auto& row){assert(std::get<int64_t>(row[0])==1000);++count;});assert(count==1);e.execute("ROLLBACK;");e.close();

@@ -30,8 +30,8 @@ struct TokenView {
   }
 };
 struct Cursor {
-  const std::string& sql;size_t pos=0;TokenView token{};bool loaded=false,eof=false;
-  explicit Cursor(const std::string& s):sql(s){}
+  std::string_view sql;size_t pos=0;TokenView token{};bool loaded=false,eof=false;
+  explicit Cursor(std::string_view s):sql(s){}
   void load(){
     if(loaded)return;
     loaded=true;
@@ -142,7 +142,7 @@ bool short_decimal(const char* first,const char* last,double& value,const char*&
 }
 struct Parser {
   Cursor cursor;
-  explicit Parser(const std::string& s):cursor(s){}
+  explicit Parser(std::string_view s):cursor(s){}
   bool accept(std::string_view s){if(!cursor.done()&&!cursor.peek().quoted&&cursor.peek().equals(s)){cursor.next();return true;}return false;}
   void need(std::string_view s){if(!accept(s))error("expected "+std::string(s));}
   TokenView take(){if(cursor.done())error("unexpected end of SQL");return cursor.next();}
@@ -204,9 +204,9 @@ template<class T>void append(std::string& s,T n){s.append(reinterpret_cast<const
 template<class T>T read(const std::string& s,size_t& p){if(p+sizeof(T)>s.size())error("invalid stored row");T n;std::memcpy(&n,s.data()+p,sizeof(n));p+=sizeof(n);return n;}
 
 }
-Statement parse(const std::string& s){return Parser(s).run();}
-bool is_insert(const std::string& s){Cursor c(s);return !c.done()&&!c.peek().quoted&&c.peek().equals("insert");}
-void parse_insert_rows(const std::string& s,const std::function<void(const Statement&)>& header,const std::function<void(const std::vector<LiteralView>&)>& row,size_t max_columns){Parser(s).stream_insert(header,row,max_columns);}
+Statement parse(std::string_view s){return Parser(s).run();}
+bool is_insert(std::string_view s){Cursor c(s);return !c.done()&&!c.peek().quoted&&c.peek().equals("insert");}
+void parse_insert_rows(std::string_view s,const std::function<void(const Statement&)>& header,const std::function<void(const std::vector<LiteralView>&)>& row,size_t max_columns){Parser(s).stream_insert(header,row,max_columns);}
 static size_t unicode_length_view(std::string_view s) {
   size_t count=0;
   for(size_t p=0;p<s.size();) {uint32_t c=static_cast<unsigned char>(s[p++]);unsigned n=0;uint32_t minimum=0;

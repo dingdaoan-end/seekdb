@@ -1,3 +1,5 @@
+> 最新结果在文末“本轮继续”部分；前半部保留上一轮实测，不能混用两轮时间窗口。
+
 # 结构性性能迭代：最终实测与恢复边界
 
 2026-11-16。代码从 `ae06c13959bd40931386bb7855fcb542d655f94d` 继续；固定参考为 `4722cb866b3c8266c2b34fa2290a9be5650ad392`。历史证据底稿为 R10-Safe `7eb530ccfd81d1a79c3d7a611b78d974404573cf`，其原有10轮及31个学习单元完全不变。只推送备用仓库。
@@ -344,3 +346,294 @@ python3 tests/benchmark_cgroup.py --image minivectordb:structural --phase new --
 |本轮|uniform|2g|3|ann|0.873660|413696|7163904|7577600|10907648|0.115445|[1.0, 1.0]|
 |本轮|uniform|2g|3|exact|0.870170|413696|7163904|7577600|10567680|0.115264|[1.0, 1.0]|
 |本轮|uniform|2g|3|write|0.587268|409600|7028736|7438336|10084352|0.000000|None|
+
+
+# 本轮继续：输入与结果封装的拆分对照
+
+
+本轮以125016a为上版，4722cb8为固定本地参考。三轮共108个独立容器，顺序及B/M口径与上文一致，所有数据为新跑，未混用上轮样本。每轮每版本12配置，当前输入借用与紧凑结果一并保留。普通SQL解析仍会分配，不能宣称全链路零堆分配。
+
+
+## 已证伪假设与最终代码边界
+
+
+`.blob`由pack_values编码整行（包含主键），Meta只持整行offset/length。write_row在旧记录空间足够时原地覆盖；因此它不是不可变的独立字符串池，跨行共享offset会破坏隔离/回滚，未实现去重。fast_topk中exact_fallback路由在if(ivf)质心评分前发生，本来就是零质心直通，未重复修改。
+
+
+SQL Cursor/Parser/Engine的入口改为string_view，所有借用限于同步执行期间，反转义JSON仍由RequestInput持有。Result仅对<=10条TopK持有内嵌数值，adapter直接to_chars；大K保留旧rows，通用each逐行复用临时Value行。新增回归验证非终止SQL视图、结果跨DML回滚存活、列交换和K11。原有输出本就无逐格数字字符串，收益在减少SQL拷贝和结果容器；不将其误述为替换字符串矩阵。存储、索引、SIMD、默认预算均未改。
+
+
+## 最终三轮中位数
+
+
+|分布|内存|项目|4722cb8 T/B/M|125016a T/B/M|本轮 T/B/M|
+|---|---|---|---|---|---|
+|clustered|16m|write|0.364355 / 7.164 / 15.129|0.344833 / 7.137 / 9.707|0.328578 / 7.137 / 9.219|
+|clustered|16m|exact|0.618023 / 8.621 / 16.000|0.529318 / 7.273 / 9.984|0.519338 / 7.270 / 10.207|
+|clustered|16m|ann|0.454046 / 8.598 / 16.000|0.448792 / 7.273 / 10.160|0.444084 / 7.270 / 9.840|
+|clustered|2g|write|0.342633 / 7.094 / 14.715|0.373140 / 7.094 / 9.398|0.341295 / 7.094 / 9.324|
+|clustered|2g|exact|0.619604 / 8.355 / 17.312|0.525331 / 7.227 / 9.984|0.513111 / 7.227 / 10.227|
+|clustered|2g|ann|0.457856 / 8.355 / 17.480|0.441783 / 7.227 / 10.043|0.438971 / 7.227 / 10.137|
+|uniform|16m|write|0.418346 / 7.184 / 14.812|0.339801 / 7.137 / 9.469|0.344950 / 7.137 / 9.656|
+|uniform|16m|exact|0.604951 / 8.617 / 16.000|0.566365 / 7.273 / 10.281|0.540672 / 7.273 / 10.141|
+|uniform|16m|ann|0.592092 / 8.605 / 16.000|0.561317 / 7.273 / 10.152|0.567603 / 7.270 / 9.934|
+|uniform|2g|write|0.414771 / 7.094 / 14.918|0.342842 / 7.094 / 9.504|0.399484 / 7.094 / 9.484|
+|uniform|2g|exact|0.611959 / 8.355 / 17.355|0.586524 / 7.227 / 10.113|0.557453 / 7.227 / 10.012|
+|uniform|2g|ann|0.577546 / 8.355 / 17.348|0.558720 / 7.227 / 10.297|0.563864 / 7.227 / 10.184|
+
+
+单位秒/MiB/MiB；E计算公式与上文相同，旧参考各配置写/Exact三轮中位数固定，ANN也用同一Exact参考，ε=.001s/1MiB/1MiB。下面先各轮E再取中位，原始输入附后，不等同于用中位输入算E。
+
+
+|分布|内存|模式|4722cb8 E|125016a E|本轮 E|
+|---|---|---|---|---|---|
+|clustered|16m|exact|0.49422|0.543775|0.548819|
+|clustered|16m|ann|0.529013|0.553806|0.563983|
+|clustered|2g|exact|0.49955|0.542174|0.546138|
+|clustered|2g|ann|0.526057|0.556582|0.561246|
+|uniform|16m|exact|0.499248|0.543346|0.545067|
+|uniform|16m|ann|0.502262|0.54448|0.539742|
+|uniform|2g|exact|0.500037|0.532099|0.540527|
+|uniform|2g|ann|0.506967|0.546531|0.537478|
+
+
+## 分配与CPU拆分
+
+
+|分布|过滤|基线ms|联合ms|仅视图ms|基线/联合/仅视图分配|
+|---|---|---|---|---|---|
+|clustered|unfiltered|65.071|56.942|64.218|[20500]/[14000]/[20000]|
+|clustered|filtered|13.503|12.377|13.42|[22500]/[16000]/[22000]|
+|uniform|unfiltered|71.721|76.122|79.659|[20500]/[14000]/[20000]|
+|uniform|filtered|12.831|12.661|13.045|[22500]/[16000]/[22000]|
+
+
+上述每组500请求，5次交错中位，输入JSON预编码在计时外，包含解析/执行/组装，不含管道I/O。均匀无过滤等子项有负结果；联合优于仅视图的四组，不以分配数代替时间判断。完整引擎CPU三版本另列：
+
+
+|分布|过滤|模式|472 CPUms|125 CPUms|本轮CPUms|
+|---|---|---|---|---|---|
+|clustered|unfiltered|exact|76.988|57.554|57.689|
+|clustered|unfiltered|ann|16.362|15.932|15.83|
+|clustered|filtered|exact|24.558|12.744|11.587|
+|clustered|filtered|ann|8.431|8.339|8.028|
+|uniform|unfiltered|exact|75.705|74.558|73.416|
+|uniform|unfiltered|ann|75.906|78.659|76.858|
+|uniform|filtered|exact|29.863|12.964|12.673|
+|uniform|filtered|ann|25.636|12.381|12.802|
+
+
+## 否决的门控与缓存实验
+
+
+# Batch warm-prefix experiment
+
+120 samples: 5 outer alternating repeats x 8 groups x 3 variants. Each benchmark performs one warmup pass and five measured passes of 500 SQL queries at 10485760-byte budget. All checksums match per group. Current 1024 snapshot versus isolated copies changing only warm-prefix constant; no production edits.
+
+| Distribution/group/mode | 1024 ms | 192 ms | 192 delta | 256 ms | 256 delta | Checksum |
+|---|---:|---:|---:|---:|---:|---:|
+| clustered/unfiltered/exact | 56.282 | 60.275 | +7.09% | 58.735 | +4.36% | 149955902 |
+| clustered/unfiltered/ann | 15.366 | 15.314 | -0.34% | 14.892 | -3.08% | 149816438 |
+| clustered/filtered/exact | 11.596 | 10.947 | -5.60% | 10.825 | -6.65% | 148623704 |
+| clustered/filtered/ann | 7.637 | 7.971 | +4.37% | 7.851 | +2.79% | 148701512 |
+| uniform/unfiltered/exact | 71.846 | 69.819 | -2.82% | 69.936 | -2.66% | 151211168 |
+| uniform/unfiltered/ann | 72.902 | 67.916 | -6.84% | 70.281 | -3.60% | 151211168 |
+| uniform/filtered/exact | 12.029 | 11.820 | -1.74% | 11.537 | -4.10% | 150087398 |
+| uniform/filtered/ann | 11.675 | 11.819 | +1.24% | 12.202 | +4.51% | 150087398 |
+
+Decision: retain 1024. Clustered unfiltered exact worsens 7.09% at 192 and 4.36% at 256. Both earlier gates fail the conservative no-regression criterion. Incidental changes also appear in untouched paths. Pointer-four prototype was optional and was not attempted. batch192.patch records the isolated one-line experiment, not a recommended production change.
+
+
+# Metadata cache experiment result
+
+16 native Linux cases completed. All query outputs, shorter UPDATE results, and ROLLBACK restoration matched exactly across modes. No tracked source changes.
+
+| Fixture | Cardinality | Mode | Frame backing B | Kernel metadata B | First topK rbytes | Warm topK rbytes | Projection rbytes | UPDATE rbytes |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| fresh | low | off | 966656 | 278528 | 0 | 0 | 0 | 0 |
+| fresh | low | frames | 851968 | 278528 | 0 | 0 | 0 | 0 |
+| fresh | low | drop | 851968 | 278528 | 0 | 0 | 0 | 0 |
+| fresh | low | weak | 851968 | 278528 | 0 | 0 | 0 | 0 |
+| fresh | high | off | 1064960 | 270336 | 0 | 0 | 0 | 0 |
+| fresh | high | frames | 1064960 | 270336 | 0 | 0 | 0 | 0 |
+| fresh | high | drop | 1064960 | 270336 | 0 | 0 | 0 | 0 |
+| fresh | high | weak | 851968 | 270336 | 0 | 0 | 0 | 0 |
+| reopened | low | off | 884736 | 286720 | 36864 | 0 | 0 | 0 |
+| reopened | low | frames | 835584 | 286720 | 36864 | 0 | 0 | 0 |
+| reopened | low | drop | 835584 | 65536 | 36864 | 0 | 131072 | 24576 |
+| reopened | low | weak | 835584 | 65536 | 36864 | 0 | 131072 | 24576 |
+| reopened | high | off | 950272 | 270336 | 36864 | 0 | 0 | 0 |
+| reopened | high | frames | 950272 | 270336 | 36864 | 0 | 0 | 0 |
+| reopened | high | drop | 950272 | 270336 | 36864 | 0 | 0 | 0 |
+| reopened | high | weak | 835584 | 65536 | 36864 | 0 | 131072 | 24576 |
+
+Fresh low-cardinality clean-frame release saved 114688 bytes (7 frames), with no additional physical reads in this short workflow. DONTNEED returned success but reclaimed zero kernel metadata bytes while those kernel pages were dirty. No release refusal occurred: index publication had flushed metadata frames clean.
+
+Reopened low-cardinality release saved 49152 bytes of frame backing (3 frames). Kernel-drop saved an additional 221184 resident kernel metadata bytes, while causing 131072 projection read_bytes plus 24576 UPDATE read_bytes. Warm topK remained zero read_bytes.
+
+High-cardinality guarded frames/drop modes performed no releases and made no memory improvement. Deliberately weakened guard released 114688 backing bytes plus 204800 kernel metadata bytes in the reopened case, causing the same 155648 extra fallback/DML physical-read bytes.
+
+Peak limitation: these are allocation and mincore snapshots, not isolated cgroup memory.peak. Process RSS/VmHWM are included in raw results, but library/text demand faults and Linux RSS accounting make the tiny cross-process comparison unsuitable as proof of peak reduction. Releasing metadata after first-query TableReadCache publication cannot reduce the preceding CREATE VECTOR INDEX memory peak.
+
+Decision: retain no production change. The full guard is a no-op on the target high-cardinality content fixture; weakening it demonstrably introduces physical reads. The safe frame-only low-cardinality optimization is real but does not meet the target fixture/peak-improvement requirement. Prepare-before-v0 needs a separate metadata-only cache and index-refresh design, not moving current cache() earlier. .blob remains a mutable authoritative row image and cannot be deduplicated by value.
+
+
+
+缓存实验为16个原生审计，mincore/帧背衬不等同cgroup峰值；高基数严格守卫无目标收益，放宽守卫导致后续155648B重读。先建完整cache再加载向量也不是局部重排：cache依赖训练质心与分桶，需另一种元数据阶段。当前不合入此方案。未试验4指针批核，避免在已有负例下扩大改动面。
+
+
+## 独立内存诊断
+
+
+每版本2g聚类写入/Exact各一次，采样关闭于正式108个计时容器。以下anon/file/kernel为约20ms采样最大current时组合，并非memory.peak瞬时原子分解，不能凭一次诊断声称稳定峰值下降。
+
+
+|版本|项目|memory.peak B|anon B|file B|kernel B|
+|---|---|---|---|---|---|
+|prior|write|9879552|2461696|6475776|679936|
+|prior|exact|10674176|8179712|1482752|544768|
+|new|write|9728000|2326528|6471680|667648|
+|new|exact|10399744|8040448|1486848|548864|
+
+## 最终门禁与证据
+
+
+本机/容器CTest各18/18；官方原生/只读Docker各20/20（95SQL）；冻结R9完整JSONL4000/4000；4/8/10/16MiB低内存门禁全部通过。默认DOCKER_BUILDKIT=0构建成功，无运行时构建CTest；Dockerfile.test单独执行。所有内部脚本/数据留在忽略work目录。
+
+
+|硬校验|结果|
+|---|---|
+|r10_conversations_locked|True|
+|r10_units_locked|True|
+|no_external_or_forbidden_words|True|
+|all_ids_and_pointers_valid|True|
+|all_verbatim_substrings|True|
+|all_within_240_chars|True|
+|all_sha256_valid|True|
+|size_within_limit|True|
+|both_files_identical|True|
+
+
+证据文件130689字节，SHA256 `0c58e1c97f96c747b65cee2c8407afb6a626428f581e88a2f88fa372ca262a81`；前10轮31单元不变，11轮35单元70条自身指针，各源摘录精确匹配，UTF8/重复键/非有限数/SHA通过。
+
+
+## 本轮全部108样本
+
+
+|版本|分布|内存|轮|项目|T秒|rbytes|wbytes|M字节|Recall|
+|---|---|---|---|---|---|---|---|---|---|
+|r472|clustered|16m|1|ann|0.4540464059864462|413696|8597504|16777216|[0.9907999999999999, 0.9886]|
+|r472|clustered|16m|1|exact|0.6730504289225792|413696|8634368|16777216|[1.0, 1.0]|
+|r472|clustered|16m|1|write|0.36435458899723017|970752|7127040|16392192|None|
+|r472|clustered|16m|2|ann|0.44030538997321855|413696|8601600|16777216|[0.9907999999999999, 0.9886]|
+|r472|clustered|16m|2|exact|0.6180232040787814|413696|8626176|16777216|[1.0, 1.0]|
+|r472|clustered|16m|2|write|0.34541578400239814|409600|7090176|15863808|None|
+|r472|clustered|16m|3|ann|0.47000387899242924|413696|8605696|16777216|[0.9907999999999999, 0.9886]|
+|r472|clustered|16m|3|exact|0.602323890041589|413696|8597504|16777216|[1.0, 1.0]|
+|r472|clustered|16m|3|write|0.43627449799896567|409600|7102464|15347712|None|
+|r472|clustered|2g|1|ann|0.45328239697846584|413696|8347648|18329600|[0.9907999999999999, 0.9886]|
+|r472|clustered|2g|1|exact|0.6224820719362469|413696|8347648|18153472|[1.0, 1.0]|
+|r472|clustered|2g|1|write|0.3426330729998881|409600|7028736|15417344|None|
+|r472|clustered|2g|2|ann|0.47800167106470326|413696|8347648|18063360|[0.9907999999999999, 0.9886]|
+|r472|clustered|2g|2|exact|0.5783092860510806|413696|8347648|18120704|[1.0, 1.0]|
+|r472|clustered|2g|2|write|0.3416353689972311|409600|7028736|15429632|None|
+|r472|clustered|2g|3|ann|0.4578564299372374|413696|8347648|18329600|[0.9907999999999999, 0.9886]|
+|r472|clustered|2g|3|exact|0.6196035269531421|413696|8347648|18276352|[1.0, 1.0]|
+|r472|clustered|2g|3|write|0.41086146700035897|409600|7028736|15568896|None|
+|r472|uniform|16m|1|ann|0.6167305699636927|413696|8634368|16777216|[1.0, 1.0]|
+|r472|uniform|16m|1|exact|0.5931048089805699|413696|8609792|16777216|[1.0, 1.0]|
+|r472|uniform|16m|1|write|0.3490039780008374|409600|7122944|15687680|None|
+|r472|uniform|16m|2|ann|0.5920915459828393|413696|8597504|16777216|[1.0, 1.0]|
+|r472|uniform|16m|2|exact|0.6277872290484083|413696|8642560|16777216|[1.0, 1.0]|
+|r472|uniform|16m|2|write|0.41834591399674537|409600|7106560|15527936|None|
+|r472|uniform|16m|3|ann|0.5877977009113238|413696|8609792|16777216|[1.0, 1.0]|
+|r472|uniform|16m|3|exact|0.6049511789424287|413696|8622080|16777216|[1.0, 1.0]|
+|r472|uniform|16m|3|write|0.42449368300367496|409600|7135232|15532032|None|
+|r472|uniform|2g|1|ann|0.5997799549659248|413696|8347648|18198528|[1.0, 1.0]|
+|r472|uniform|2g|1|exact|0.5837399699521484|413696|8347648|18468864|[1.0, 1.0]|
+|r472|uniform|2g|1|write|0.3671913360012695|409600|7028736|15724544|None|
+|r472|uniform|2g|2|ann|0.5686661540166824|413696|8347648|18079744|[1.0, 1.0]|
+|r472|uniform|2g|2|exact|0.6276948631457344|413696|8347648|18190336|[1.0, 1.0]|
+|r472|uniform|2g|2|write|0.41946186399945873|409600|7028736|15642624|None|
+|r472|uniform|2g|3|ann|0.5775456189803663|413696|8347648|18190336|[1.0, 1.0]|
+|r472|uniform|2g|3|exact|0.6119592429568002|413696|8347648|18198528|[1.0, 1.0]|
+|r472|uniform|2g|3|write|0.41477067599771544|409600|7028736|15605760|None|
+|prior|clustered|16m|1|ann|0.4758393100273679|413696|7213056|10846208|[0.9907999999999999, 0.9886]|
+|prior|clustered|16m|1|exact|0.5125795069798187|434176|7221248|10715136|[1.0, 1.0]|
+|prior|clustered|16m|1|write|0.3448333000014827|1093632|7073792|10833920|None|
+|prior|clustered|16m|2|ann|0.44132301101490157|413696|7221248|10371072|[0.9907999999999999, 0.9886]|
+|prior|clustered|16m|2|exact|0.5423257989823469|413696|7213056|10469376|[1.0, 1.0]|
+|prior|clustered|16m|2|write|0.3364638970015221|409600|7073792|9736192|None|
+|prior|clustered|16m|3|ann|0.4487924920358637|413696|7208960|10653696|[0.9907999999999999, 0.9886]|
+|prior|clustered|16m|3|exact|0.5293178189713217|413696|7208960|10461184|[1.0, 1.0]|
+|prior|clustered|16m|3|write|0.39102135799839743|409600|7069696|10178560|None|
+|prior|clustered|2g|1|ann|0.44178313091106247|413696|7163904|10600448|[0.9907999999999999, 0.9886]|
+|prior|clustered|2g|1|exact|0.5128764919754758|413696|7163904|10518528|[1.0, 1.0]|
+|prior|clustered|2g|1|write|0.3731403730016609|409600|7028736|9854976|None|
+|prior|clustered|2g|2|ann|0.4393325239652768|413696|7163904|10395648|[0.9907999999999999, 0.9886]|
+|prior|clustered|2g|2|exact|0.5321439450381149|413696|7163904|10469376|[1.0, 1.0]|
+|prior|clustered|2g|2|write|0.3264295869958005|409600|7028736|9871360|None|
+|prior|clustered|2g|3|ann|0.4443241908957134|413696|7163904|10530816|[0.9907999999999999, 0.9886]|
+|prior|clustered|2g|3|exact|0.5253311890010082|413696|7163904|10354688|[1.0, 1.0]|
+|prior|clustered|2g|3|write|0.3983196409972152|409600|7028736|9842688|None|
+|prior|uniform|16m|1|ann|0.5516417670442024|413696|7213056|10719232|[1.0, 1.0]|
+|prior|uniform|16m|1|exact|0.5663653859846818|413696|7208960|10338304|[1.0, 1.0]|
+|prior|uniform|16m|1|write|0.3398012979996565|409600|7073792|10035200|None|
+|prior|uniform|16m|2|ann|0.5613167349583819|413696|7213056|10645504|[1.0, 1.0]|
+|prior|uniform|16m|2|exact|0.5406897899629257|413696|7213056|10780672|[1.0, 1.0]|
+|prior|uniform|16m|2|write|0.33429399699525675|409600|7073792|9830400|None|
+|prior|uniform|16m|3|ann|0.6162801410282555|413696|7208960|10567680|[1.0, 1.0]|
+|prior|uniform|16m|3|exact|0.5891990260461171|413696|7213056|10928128|[1.0, 1.0]|
+|prior|uniform|16m|3|write|0.40783729900067556|409600|7069696|9928704|None|
+|prior|uniform|2g|1|ann|0.5370868810496177|413696|7163904|10960896|[1.0, 1.0]|
+|prior|uniform|2g|1|exact|0.5425563559874718|413696|7163904|10604544|[1.0, 1.0]|
+|prior|uniform|2g|1|write|0.3375340829989|409600|7028736|10055680|None|
+|prior|uniform|2g|2|ann|0.5587196389715245|413696|7163904|10424320|[1.0, 1.0]|
+|prior|uniform|2g|2|exact|0.6451478090748424|413696|7163904|10567680|[1.0, 1.0]|
+|prior|uniform|2g|2|write|0.34284181999828434|409600|7028736|9965568|None|
+|prior|uniform|2g|3|ann|0.5775405448766833|413696|7163904|10797056|[1.0, 1.0]|
+|prior|uniform|2g|3|exact|0.5865238950573257|413696|7163904|10784768|[1.0, 1.0]|
+|prior|uniform|2g|3|write|0.41008052400138695|409600|7028736|9773056|None|
+|new|clustered|16m|1|ann|0.4502604780245747|413696|7208960|10285056|[0.9907999999999999, 0.9886]|
+|new|clustered|16m|1|exact|0.5170079259769409|413696|7208960|10862592|[1.0, 1.0]|
+|new|clustered|16m|1|write|0.3285776539996732|409600|7073792|9617408|None|
+|new|clustered|16m|2|ann|0.4440836299327202|413696|7217152|10653696|[0.9907999999999999, 0.9886]|
+|new|clustered|16m|2|exact|0.5193376280658413|413696|7208960|10407936|[1.0, 1.0]|
+|new|clustered|16m|2|write|0.3230018169997493|409600|7073792|9846784|None|
+|new|clustered|16m|3|ann|0.43704511901160004|413696|7208960|10317824|[0.9907999999999999, 0.9886]|
+|new|clustered|16m|3|exact|0.5223213369717996|413696|7204864|10702848|[1.0, 1.0]|
+|new|clustered|16m|3|write|0.3957101970008807|409600|7073792|9666560|None|
+|new|clustered|2g|1|ann|0.43131169097250677|413696|7163904|10600448|[0.9907999999999999, 0.9886]|
+|new|clustered|2g|1|exact|0.5129423630096426|413696|7163904|10383360|[1.0, 1.0]|
+|new|clustered|2g|1|write|0.3229763589988579|409600|7028736|9773056|None|
+|new|clustered|2g|2|ann|0.438970944040193|413696|7163904|10792960|[0.9907999999999999, 0.9886]|
+|new|clustered|2g|2|exact|0.5131110259608249|413696|7163904|10723328|[1.0, 1.0]|
+|new|clustered|2g|2|write|0.34129514300002484|409600|7028736|9777152|None|
+|new|clustered|2g|3|ann|0.456798861057905|413696|7163904|10629120|[0.9907999999999999, 0.9886]|
+|new|clustered|2g|3|exact|0.523532878014521|413696|7163904|10772480|[1.0, 1.0]|
+|new|clustered|2g|3|write|0.40128314799949294|409600|7028736|9928704|None|
+|new|uniform|16m|1|ann|0.5427706579976075|413696|7208960|10416128|[1.0, 1.0]|
+|new|uniform|16m|1|exact|0.5506896619590407|413696|7208960|10412032|[1.0, 1.0]|
+|new|uniform|16m|1|write|0.3449504370037175|409600|7073792|10125312|None|
+|new|uniform|16m|2|ann|0.5872047170123551|413696|7208960|10416128|[1.0, 1.0]|
+|new|uniform|16m|2|exact|0.5406719320853881|413696|7221248|10797056|[1.0, 1.0]|
+|new|uniform|16m|2|write|0.33507727599862847|409600|7073792|10366976|None|
+|new|uniform|16m|3|ann|0.5676031510884059|413696|7208960|10428416|[1.0, 1.0]|
+|new|uniform|16m|3|exact|0.5374378040760348|413696|7213056|10633216|[1.0, 1.0]|
+|new|uniform|16m|3|write|0.42478952599776676|409600|7077888|9981952|None|
+|new|uniform|2g|1|ann|0.5620939689943043|413696|7163904|10665984|[1.0, 1.0]|
+|new|uniform|2g|1|exact|0.557452500994259|413696|7163904|10440704|[1.0, 1.0]|
+|new|uniform|2g|1|write|0.3994840609993844|409600|7028736|10469376|None|
+|new|uniform|2g|2|ann|0.5684491370302567|413696|7163904|10678272|[1.0, 1.0]|
+|new|uniform|2g|2|exact|0.5615128099561844|413696|7163904|10559488|[1.0, 1.0]|
+|new|uniform|2g|2|write|0.33771187500315136|409600|7028736|9945088|None|
+|new|uniform|2g|3|ann|0.5638641950099554|413696|7163904|10739712|[1.0, 1.0]|
+|new|uniform|2g|3|exact|0.5504378689038276|413696|7163904|10498048|[1.0, 1.0]|
+|new|uniform|2g|3|write|0.40069769699766766|409600|7028736|9654272|None|
+
+本轮限制：八配置E中位数的辅助均值0.545349→0.547875（约+0.46%），非赛题指定的跨配置评分，也不是线上指标预测。6/8配置上升，均匀ANN两配置下降；均匀2g写入0.342842→0.399484s。不能称所有项目提速。物理读在72个同配置/轮次对比中均未增加；旧版少量启动读偏高，原始值未剔除。
+
+本轮冻结镜像ID：
+- r472: `sha256:265ce5d83e60c9c74db7b452d7be7e2296b6c4444516f3e532c95f2819bb9f86`
+- prior: `sha256:a5e9ce0787b2fecc48b53ef1f19cbbd5b8b4cfa5ca56b5678ec8e4334bc9aedd`
+- new: `sha256:321e3bedcd15269ba40429ef27acc06a34e25758986e9dc83eae76a8b528edc0`
