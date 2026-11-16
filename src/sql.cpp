@@ -1,5 +1,6 @@
 #include "sql.hpp"
 #include <algorithm>
+#include <bit>
 #include <charconv>
 #include <cmath>
 #include <cctype>
@@ -44,12 +45,15 @@ struct Cursor {
     if(pos==sql.size()){eof=true;return;}
     size_t first=pos;unsigned char c=sql[pos++];token={};
     if(c=='\''){
-      first=pos;bool closed=false;
-      while(pos<sql.size())if(sql[pos++]=='\''){
+      first=pos;
+      while(true){
+        // Search the bounded byte span in bulk; embedded NUL is literal data.
+        const auto quote=sql.find('\'',pos);
+        if(quote==std::string::npos)error("unterminated SQL string");
+        pos=quote+1;
         if(pos<sql.size()&&sql[pos]=='\''){token.escaped=true;++pos;}
-        else{closed=true;break;}
+        else break;
       }
-      if(!closed)error("unterminated SQL string");
       token.quoted=true;token.text=std::string_view(sql).substr(first,pos-first-1);return;
     }
     if(std::isalpha(c)||c=='_'){
@@ -73,6 +77,68 @@ int64_t integer(std::string_view s) {
   auto [end,ec]=std::from_chars(first,s.data()+s.size(),n);
   if(ec!=std::errc{}||end!=s.data()+s.size())error("invalid or overflowing BIGINT");
   return n;
+}
+// Clinger's exact fast path: <=15 decimal digits fit exactly in binary64,
+// as do powers of ten through 10^22. A single multiply/divide therefore gives
+// the same rounded double as the general converter. Keep the nine-digit path
+// for common short fixed-point input; continue from its accumulated digits.
+bool scaled_decimal(const char* p,const char* last,uint64_t mantissa,unsigned digits,
+                    unsigned fraction,bool dot,bool negative,double& value,const char*& end){
+  // Seven more digit bytes imply at least 16 digits. Reject those common
+  // long tokens in one bounded load instead of scanning and then rescanning.
+  if(digits==9&&last-p>=8){
+    uint64_t bytes;std::memcpy(&bytes,p,sizeof(bytes));
+    constexpr uint64_t first_seven_high_bits=std::endian::native==std::endian::little?
+      UINT64_C(0x0080808080808080):UINT64_C(0x8080808080808000);
+    if((((bytes+UINT64_C(0x4646464646464646))|(bytes-UINT64_C(0x3030303030303030)))&first_seven_high_bits)==0)return false;
+  }
+  while(p!=last){const unsigned digit=static_cast<unsigned char>(*p)-'0';
+    if(digit<10){if(digits==15)return false;mantissa=mantissa*10+digit;++digits;if(dot)++fraction;++p;}
+    else if(*p=='.'&&!dot){dot=true;++p;}else break;
+  }
+  if(!digits)return false;
+  int exponent=0;
+  if(p!=last&&(*p=='e'||*p=='E')){
+    ++p;bool minus=false;if(p!=last&&(*p=='+'||*p=='-')){minus=*p=='-';++p;}
+    const char* exponent_first=p;
+    while(p!=last&&static_cast<unsigned>(*p-'0')<10u){
+      if(p-exponent_first==2)return false;
+      exponent=exponent*10+(*p++-'0');
+    }
+    if(p==exponent_first)return false;
+    if(minus)exponent=-exponent;
+  }
+  exponent-=static_cast<int>(fraction);
+  if(exponent < -22||exponent > 22||
+     (p!=last&&*p!=','&&*p!=']'&&!std::isspace(static_cast<unsigned char>(*p))))return false;
+  static constexpr double powers[]={1e0,1e1,1e2,1e3,1e4,1e5,1e6,1e7,1e8,1e9,1e10,1e11,1e12,1e13,1e14,1e15,1e16,1e17,1e18,1e19,1e20,1e21,1e22};
+  double x=static_cast<double>(mantissa);
+  x=exponent<0?x/powers[-exponent]:x*powers[exponent];
+  // Leave float subnormals/extremes and exact float midpoints to the frozen
+  // double-then-float route. Low 29 binary64 bits identify float midpoints;
+  // never replace the baseline's deliberate double rounding with strtof.
+  if(x!=0&&(x<std::numeric_limits<float>::min()||x>std::numeric_limits<float>::max()||
+            (std::bit_cast<uint64_t>(x)&((uint64_t{1}<<29)-1))==(uint64_t{1}<<28)))return false;
+  value=negative?-x:x;end=p;return true;
+}
+// Short plain decimals need no general-purpose conversion. Both the integer
+// (at most nine digits) and 10^fraction are exactly representable as doubles,
+// so this division rounds once to double, just like the R9 converter. Keep
+// the subsequent float cast: parsing directly to float changes midpoint cases.
+bool short_decimal(const char* first,const char* last,double& value,const char*& end){
+  const char* p=first;const bool negative=p!=last&&*p=='-';if(negative)++p;
+  uint32_t mantissa=0;unsigned digits=0,fraction=0;bool dot=false;
+  while(p!=last){const unsigned digit=static_cast<unsigned char>(*p)-'0';
+    if(digit<10){if(digits==9)return scaled_decimal(p,last,mantissa,digits,fraction,dot,negative,value,end);mantissa=mantissa*10+digit;++digits;if(dot)++fraction;++p;}
+    else if(*p=='.'&&!dot){dot=true;++p;}else break;
+  }
+  // Finish the common path only at a separator. Continue longer decimals
+  // and bounded exponents without rescanning the digits already consumed.
+  if(!digits)return false;
+  if(p!=last&&*p!=','&&*p!=']'&&!std::isspace(static_cast<unsigned char>(*p)))
+    return scaled_decimal(p,last,mantissa,digits,fraction,dot,negative,value,end);
+  static constexpr double powers[]={1,10,100,1000,10000,100000,1000000,10000000,100000000,1000000000};
+  value=static_cast<double>(mantissa)/powers[fraction];if(negative)value=-value;end=p;return true;
 }
 struct Parser {
   Cursor cursor;
@@ -171,23 +237,31 @@ Value convert(const LiteralView& v,const Column& col) {
     const char* first=v.text.data()+p;const char* last=v.text.data()+v.text.size();
     const char* number=first;if(number!=last&&*number=='+')++number;
     if(number==last||(number!=first&&(*number=='-'||*number=='+')))error("invalid VECTOR component");
-    double x=0;auto parsed=std::from_chars(number,last,x,std::chars_format::general);
-    const char* end=parsed.ptr;
-    const char* magnitude=number;if(magnitude!=last&&*magnitude=='-')++magnitude;
-    const bool hex=last-magnitude>=2&&magnitude[0]=='0'&&(magnitude[1]=='x'||magnitude[1]=='X');
-    if(hex||parsed.ec==std::errc::result_out_of_range){
-      // Preserve strtod's hexadecimal and underflow-to-zero admission, using
-      // an explicit locale only on these uncommon paths. Decimal parsing is
-      // allocation-free and independent of the process locale.
-      static locale_t c_locale=[] {auto locale=newlocale(LC_NUMERIC_MASK,"C",nullptr);if(!locale)error("cannot create numeric locale");return locale;}();
-      // strtod requires a terminator. Bound its scratch copy to this numeric
-      // component, so many hex/underflow values remain linear in input size
-      // and a whitespace tail is never copied once per component.
-      const char* component_end=first;
-      while(component_end!=last&&*component_end!=','&&*component_end!=']'&&
-            !std::isspace(static_cast<unsigned char>(*component_end)))++component_end;
-      std::string bounded(first,component_end);char* fallback_end=nullptr;x=strtod_l(bounded.c_str(),&fallback_end,c_locale);end=first+(fallback_end-bounded.data());
-    }else if(parsed.ec!=std::errc{})error("invalid VECTOR component");
+    double x=0;const char* end=number;
+    if(!short_decimal(number,last,x,end)){
+      auto parsed=std::from_chars(number,last,x,std::chars_format::general);end=parsed.ptr;
+      const char* magnitude=number;if(magnitude!=last&&*magnitude=='-')++magnitude;
+      const bool hex=last-magnitude>=2&&magnitude[0]=='0'&&(magnitude[1]=='x'||magnitude[1]=='X');
+      if(hex||parsed.ec==std::errc::result_out_of_range){
+        // Preserve strtod's hexadecimal and underflow-to-zero admission, using
+        // an explicit locale only on these uncommon paths. Decimal parsing is
+        // allocation-free and independent of the process locale.
+        static locale_t c_locale=[] {auto locale=newlocale(LC_NUMERIC_MASK,"C",nullptr);if(!locale)error("cannot create numeric locale");return locale;}();
+        // strtod requires a terminator. Bound its scratch copy to this numeric
+        // component, so many hex/underflow values remain linear in input size
+        // and a whitespace tail is never copied once per component.
+        const char* component_end=first;
+        while(component_end!=last&&*component_end!=','&&*component_end!=']'&&
+              !std::isspace(static_cast<unsigned char>(*component_end)))++component_end;
+        char scratch[64];std::string long_component;const char* bounded=nullptr;
+        const auto length=static_cast<size_t>(component_end-first);
+        if(length<sizeof(scratch)){std::memcpy(scratch,first,length);scratch[length]='\0';bounded=scratch;}
+        else{long_component.assign(first,length);bounded=long_component.c_str();}
+        // Never truncate: a late exponent or invalid suffix can change either
+        // the value or admission. Only the uncommon long component allocates.
+        char* fallback_end=nullptr;x=strtod_l(bounded,&fallback_end,c_locale);end=first+(fallback_end-bounded);
+      }else if(parsed.ec!=std::errc{})error("invalid VECTOR component");
+    }
     if(end==first||!std::isfinite(x)||std::abs(x)>std::numeric_limits<float>::max())error("nonfinite or overflowing VECTOR component");
     if(out.size()>=col.width)error("VECTOR dimension mismatch");
     p=static_cast<size_t>(end-v.text.data());out.push_back(static_cast<float>(x));ws();

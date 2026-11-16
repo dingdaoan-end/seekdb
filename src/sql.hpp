@@ -13,7 +13,7 @@ struct Column {std::string name;Type type;uint32_t width=0;bool primary=false;};
 struct Expr {std::string column,alias;bool distance=false;std::string query;};
 struct Condition {std::string column,op;std::string literal;bool quoted=false;};
 struct Literal {std::string text;bool quoted=false;};
-// Borrowed for the duration of a streaming row callback. Doubled SQL quotes
+// Borrowed while the original SQL string stays alive and unchanged. Doubled quotes
 // are decoded by convert() only on the uncommon escaped-literal path.
 struct LiteralView {
   std::string_view text;bool quoted,escaped;
@@ -53,6 +53,14 @@ double l2_fast(const float*,const float*,size_t,bool safe);
 double l2_exact(const float*,const float*,size_t);
 double l2_squared_fast(const float*,const float*,size_t,bool safe);
 double l2_squared_exact(const float*,const float*,size_t);
+struct BoundedDistance {double squared;bool pruned;};
+// Takes an exact squared-distance heap threshold; rounds the conservative
+// margin upward to float. Overflow/nonfinite input disables pruning.
+double l2_bounded_cutoff(double exact_squared);
+// The caller prechecks both vectors as for l2_squared_fast, and passes the
+// inflated cutoff above. Only 128D and prefix 32/64 are supported. A pruned
+// result contains the partial squared distance; survivors match the old kernel.
+BoundedDistance l2_squared_bounded_128(const float*,const float*,double cutoff,bool safe,size_t prefix=32);
 bool avx2_available();
 bool fma_available();
 }

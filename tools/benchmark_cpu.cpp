@@ -1,5 +1,6 @@
 #include "engine.hpp"
 #include <chrono>
+#include <ctime>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -16,20 +17,30 @@ int main(int argc,char** argv){
     while(std::getline(input,line))if(!line.empty())queries.push_back(line);
     if(queries.empty())throw std::runtime_error("no queries");
     using Clock=std::chrono::steady_clock;
-    uint64_t checksum=0;auto start=Clock::now();
+    uint64_t checksum=0;auto start=Clock::now();auto cpu_start=std::clock();
     for(unsigned r=0;r<5;++r)for(auto& sql:queries){auto s=mvdb::parse(sql);checksum+=s.expressions.size();}
+    double parse_cpu_seconds=double(std::clock()-cpu_start)/CLOCKS_PER_SEC/5;
     double parse_seconds=std::chrono::duration<double>(Clock::now()-start).count()/5;
     mvdb::Engine engine(argv[1],budget);engine.execute(std::string("SET SEARCH_MODE = ")+argv[3]+";");
     // A full pass establishes the same deterministic in-process warmup.
     for(auto& sql:queries)engine.execute(sql).each([&](const auto& row){checksum+=static_cast<uint64_t>(std::get<int64_t>(row[0]));});
-    auto pages=engine.vector_page_reads();start=Clock::now();
+    auto pages=engine.vector_page_reads();auto attempts=engine.bounded_distance_attempts(),pruned=engine.bounded_distance_pruned(),fallbacks=engine.bounded_distance_fallbacks();
+    auto accesses=engine.page_access_count();start=Clock::now();cpu_start=std::clock();
     for(unsigned r=0;r<5;++r)for(auto& sql:queries)
       engine.execute(sql).each([&](const auto& row){checksum+=static_cast<uint64_t>(std::get<int64_t>(row[0]));});
+    double engine_cpu_seconds=double(std::clock()-cpu_start)/CLOCKS_PER_SEC/5;
     double execute_seconds=std::chrono::duration<double>(Clock::now()-start).count()/5;
     auto reads=engine.vector_page_reads()-pages;
     std::cout<<"{\"queries\":"<<queries.size()<<",\"mode\":"<<mvdb::quote(argv[3])
       <<",\"parse_seconds\":"<<parse_seconds<<",\"engine_seconds\":"<<execute_seconds
+      <<",\"parse_cpu_seconds\":"<<parse_cpu_seconds<<",\"engine_cpu_seconds\":"<<engine_cpu_seconds
       <<",\"vector_page_loads_measured\":"<<reads<<",\"budget_bytes\":"<<budget
+      <<",\"bounded_attempts\":"<<engine.bounded_distance_attempts()-attempts
+      <<",\"bounded_pruned\":"<<engine.bounded_distance_pruned()-pruned
+      <<",\"bounded_fallbacks\":"<<engine.bounded_distance_fallbacks()-fallbacks
+      <<",\"page_accesses\":"<<engine.page_access_count()-accesses
+      <<",\"effective_nprobe\":"<<engine.effective_nprobe()
+      <<",\"route\":"<<mvdb::quote(engine.last_route())
       <<",\"checksum\":"<<checksum<<"}\n";
     engine.close();
   }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}

@@ -1,7 +1,7 @@
 #include "sql.hpp"
-#include "simd.hpp"
 #include <cmath>
 #include <immintrin.h>
+#include <limits>
 
 namespace mvdb {
 namespace {
@@ -31,30 +31,38 @@ __attribute__((target("avx2,fma"))) double simd_squared_fma(const float* a,const
   L2_BODY(_mm256_fmadd_ps(d,d,sums[j]))
 }
 #undef L2_BODY
-// Four candidates share each query load, with independent SIMD accumulators.
-#define BATCH4_BODY(ACCUMULATE) \
+// Keep the four original accumulators live across the check, then finish in
+// exactly the original order. The checkpoint reduction never feeds back into
+// them, so survivors remain bit-identical to simd_squared[_fma](...,128).
+#define BOUNDED_REDUCE() \
+  __m256 merged=_mm256_add_ps(_mm256_add_ps(sums[0],sums[1]),_mm256_add_ps(sums[2],sums[3])); \
+  __m128 halves=_mm_add_ps(_mm256_castps256_ps128(merged),_mm256_extractf128_ps(merged,1)); \
+  halves=_mm_hadd_ps(halves,halves);halves=_mm_hadd_ps(halves,halves); \
+  double reduced=_mm_cvtss_f32(halves);
+#define BOUNDED_BODY(ACCUMULATE) \
   __m256 sums[4]={_mm256_setzero_ps(),_mm256_setzero_ps(),_mm256_setzero_ps(),_mm256_setzero_ps()}; \
-  __m256 other[4]={_mm256_setzero_ps(),_mm256_setzero_ps(),_mm256_setzero_ps(),_mm256_setzero_ps()}; \
-  size_t i=0; \
-  for(;i+16<=n;i+=16){ \
-    auto q=_mm256_loadu_ps(query+i); \
-    for(size_t j=0;j<4;++j){auto d=_mm256_sub_ps(q,_mm256_loadu_ps(vectors[j]+i));auto& sum=sums[j];sum=ACCUMULATE;} \
-    q=_mm256_loadu_ps(query+i+8); \
-    for(size_t j=0;j<4;++j){auto d=_mm256_sub_ps(q,_mm256_loadu_ps(vectors[j]+i+8));auto& sum=other[j];sum=ACCUMULATE;}} \
-  for(;i+8<=n;i+=8){auto q=_mm256_loadu_ps(query+i); \
-    for(size_t j=0;j<4;++j){auto d=_mm256_sub_ps(q,_mm256_loadu_ps(vectors[j]+i));auto& sum=sums[j];sum=ACCUMULATE;}} \
-  for(size_t j=0;j<4;++j){ \
-    auto merged=_mm256_add_ps(sums[j],other[j]); \
-    auto halves=_mm_add_ps(_mm256_castps256_ps128(merged),_mm256_extractf128_ps(merged,1)); \
-    halves=_mm_hadd_ps(halves,halves);halves=_mm_hadd_ps(halves,halves);output[j]=_mm_cvtss_f32(halves); \
-    for(size_t k=i;k<n;++k){double d=double(query[k])-vectors[j][k];output[j]+=d*d;} }
-__attribute__((target("avx2"))) void simd_batch4(const float* query,const float* const vectors[4],size_t n,double output[4]){
-  BATCH4_BODY(_mm256_add_ps(sum,_mm256_mul_ps(d,d)))
+  for(size_t i=0;i<Prefix;i+=32)for(size_t j=0;j<4;++j){ \
+    __m256 d=_mm256_sub_ps(_mm256_loadu_ps(a+i+j*8),_mm256_loadu_ps(b+i+j*8)); \
+    sums[j]=ACCUMULATE; \
+  } \
+  {BOUNDED_REDUCE() if(reduced>cutoff&&reduced>1e-20)return {reduced,true};} \
+  for(size_t i=Prefix;i<128;i+=32)for(size_t j=0;j<4;++j){ \
+    __m256 d=_mm256_sub_ps(_mm256_loadu_ps(a+i+j*8),_mm256_loadu_ps(b+i+j*8)); \
+    sums[j]=ACCUMULATE; \
+  } \
+  BOUNDED_REDUCE() \
+  if(!std::isfinite(reduced)||reduced<=1e-20)reduced=l2_squared_exact(a,b,128); \
+  return {reduced,false};
+template<size_t Prefix>
+__attribute__((target("avx2"))) BoundedDistance simd_bounded(const float* a,const float* b,double cutoff){
+  BOUNDED_BODY(_mm256_add_ps(sums[j],_mm256_mul_ps(d,d)))
 }
-__attribute__((target("avx2,fma"))) void simd_batch4_fma(const float* query,const float* const vectors[4],size_t n,double output[4]){
-  BATCH4_BODY(_mm256_fmadd_ps(d,d,sum))
+template<size_t Prefix>
+__attribute__((target("avx2,fma"))) BoundedDistance simd_bounded_fma(const float* a,const float* b,double cutoff){
+  BOUNDED_BODY(_mm256_fmadd_ps(d,d,sums[j]))
 }
-#undef BATCH4_BODY
+#undef BOUNDED_BODY
+#undef BOUNDED_REDUCE
 __attribute__((target("avx2"))) bool simd_extreme(const float* a,size_t n) {
   const auto sign=_mm256_set1_ps(-0.0f),limit=_mm256_set1_ps(1e16f);size_t i=0;
   for(;i+8<=n;i+=8){auto x=_mm256_andnot_ps(sign,_mm256_loadu_ps(a+i));
@@ -74,6 +82,25 @@ bool has_extreme(const float* a,size_t n){
 double l2_squared_exact(const float* a,const float* b,size_t n){
   double sum=0;for(size_t i=0;i<n;++i){double d=static_cast<double>(a[i])-b[i];sum+=d*d;}return sum;
 }
+double l2_bounded_cutoff(double exact_squared){
+  const double infinity=std::numeric_limits<double>::infinity();
+  if(!std::isfinite(exact_squared)||exact_squared<0)return infinity;
+  // At 64D a lane sums two products and the reduction has five additions.
+  // Including subtraction and multiplication, gamma(32), u=2^-24, bounds
+  // relative overestimation by <2e-6 under normal round-to-nearest arithmetic.
+  // 1e-4 is deliberately looser. DAZ/FTZ's absolute lost-input/product error
+  // for 128 safe coordinates is far below 1e-5, covered by this additive term.
+  // The safe <=1e16 coordinate bound keeps all intermediates below FLT_MAX.
+  double margin=exact_squared*1.0001+1e-5;
+  if(!std::isfinite(margin)||margin>=std::numeric_limits<float>::max())return infinity;
+  return std::nextafter(static_cast<float>(margin),std::numeric_limits<float>::infinity());
+}
+BoundedDistance l2_squared_bounded_128(const float* a,const float* b,double cutoff,bool safe,size_t prefix){
+  if(!safe||!avx2_available()||(prefix!=32&&prefix!=64))return {l2_squared_exact(a,b,128),false};
+  if(!std::isfinite(cutoff)||cutoff<0)return {l2_squared_fast(a,b,128,true),false};
+  if(fma_available())return prefix==32?simd_bounded_fma<32>(a,b,cutoff):simd_bounded_fma<64>(a,b,cutoff);
+  return prefix==32?simd_bounded<32>(a,b,cutoff):simd_bounded<64>(a,b,cutoff);
+}
 double l2_exact(const float* a,const float* b,size_t n){return std::sqrt(l2_squared_exact(a,b,n));}
 double l2_squared_fast(const float* a,const float* b,size_t n,bool safe){
   if(!safe||n>4096||!avx2_available())return l2_squared_exact(a,b,n);
@@ -81,22 +108,6 @@ double l2_squared_fast(const float* a,const float* b,size_t n,bool safe){
   // Recompute tiny sums to avoid float square underflow (including FTZ mode).
   if(!std::isfinite(sum)||sum<=1e-20)return l2_squared_exact(a,b,n);
   return sum;
-}
-void l2_sq_f32_batch4(const float* query,const float* const vectors[4],size_t n,double output[4],bool safe){
-  if(!safe||n>4096||!avx2_available()){
-    for(size_t j=0;j<4;++j)output[j]=l2_squared_exact(query,vectors[j],n);
-    return;
-  }
-  if(fma_available())simd_batch4_fma(query,vectors,n,output);
-  else simd_batch4(query,vectors,n,output);
-  for(size_t j=0;j<4;++j)if(!std::isfinite(output[j])||output[j]<=1e-20)
-    output[j]=l2_squared_exact(query,vectors[j],n);
-}
-void l2_sq_f32_batch4(const float* query,const float* v0,const float* v1,const float* v2,const float* v3,size_t dim,float out[4]){
-  const float* vectors[4]={v0,v1,v2,v3};double wide[4];bool safe=!has_extreme(query,dim);
-  for(auto p:vectors)safe&=!has_extreme(p,dim);
-  l2_sq_f32_batch4(query,vectors,dim,wide,safe);
-  for(size_t j=0;j<4;++j)out[j]=static_cast<float>(wide[j]);
 }
 double l2_fast(const float* a,const float* b,size_t n,bool safe){return std::sqrt(l2_squared_fast(a,b,n,safe));}
 double l2(const float* a,const float* b,size_t n){return l2_fast(a,b,n,!has_extreme(a,n)&&!has_extreme(b,n));}

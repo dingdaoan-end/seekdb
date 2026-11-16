@@ -1,15 +1,39 @@
 #include "storage.hpp"
 #include <algorithm>
+#include <bit>
 #include <cerrno>
 #include <cstdlib>
 #include <fcntl.h>
 #include <limits>
 #include <stdexcept>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <fstream>
 #include <zlib.h>
 
 namespace mvdb {
+size_t detail::bitmap_next(const std::byte* bytes,size_t begin,size_t end,bool want_set){
+  if(begin>=end)return end;
+  size_t base=begin-begin%64;
+  for(;;){
+    const size_t valid=std::min<size_t>(64,end-base);
+    const size_t count=(valid+7)/8;
+    uint64_t word=0;
+    if constexpr(std::endian::native==std::endian::little){
+      if(count==sizeof(word))std::memcpy(&word,bytes+base/8,sizeof(word));
+      else std::memcpy(&word,bytes+base/8,count);
+    }
+    else
+      for(size_t i=0;i<count;++i)word|=uint64_t(std::to_integer<unsigned>(bytes[base/8+i]))<<(8*i);
+    if(!want_set)word=~word;
+    word&=~uint64_t(0)<<(begin-base);
+    if(valid<64)word&=(uint64_t(1)<<valid)-1;
+    // countr_zero is reached only for a nonzero word on every platform.
+    if(word)return base+std::countr_zero(word);
+    if(end-base<=64)return end;
+    base+=64;begin=base;
+  }
+}
 namespace {
 void require(bool yes,const char* message) { if(!yes) throw std::runtime_error(message); }
 template<class F> auto retry_eintr(F operation){
@@ -113,17 +137,20 @@ std::optional<LogRecord> read_record(int fd,uint64_t pos) {
 }
 }
 
+std::string detail::page_delta(const std::string& file,uint64_t page,const Page& old,const Page& next){return delta(file,page,old,next);}
+
 void MemoryBudget::acquire(size_t n) {require(n<=limit-used,"memory budget exceeded");used+=n;peak=std::max(peak,used);}
+void BufferPool::PageDeleter::operator()(std::byte* p) const noexcept {::munmap(p,PAGE);}
 BufferPool::BufferPool(std::filesystem::path path,MemoryBudget& b):directory(std::move(path)),budget(b) {
   std::filesystem::create_directories(directory);
   size_t allocation=b.limit>8*1024*1024 ? b.limit-b.limit/4 : b.limit/2;
   size_t count=std::max<size_t>(3,allocation/(PAGE+sizeof(Frame)+384));
   require(count>=2,"buffer budget needs at least two frames");
   reservation=count*(PAGE+sizeof(Frame)+384);budget.acquire(reservation);
-  require(::posix_memalign(reinterpret_cast<void**>(&arena),4096,count*PAGE)==0,"aligned allocation failed");
-  frames.resize(count);lookup.reserve(count);descriptors.reserve(std::min<size_t>(16,count));
+  try{frames.resize(count);pages.resize(count);lookup.reserve(count);descriptors.reserve(std::min<size_t>(16,count));}
+  catch(...){budget.release(reservation);throw;}
 }
-BufferPool::~BufferPool() {for(auto& entry:descriptors)::close(entry.second);std::free(arena);budget.release(reservation);}
+BufferPool::~BufferPool() {for(auto& entry:descriptors)::close(entry.second);budget.release(reservation);}
 int BufferPool::descriptor(const std::string& file){auto it=descriptors.find(file);if(it!=descriptors.end())return it->second;
   if(descriptors.size()>=std::min<size_t>(16,frames.size())){auto victim=descriptors.begin();::close(victim->second);descriptors.erase(victim);}
   int fd=page_fd(directory/file);descriptors.emplace(file,fd);return fd;
@@ -131,10 +158,11 @@ int BufferPool::descriptor(const std::string& file){auto it=descriptors.find(fil
 void BufferPool::flush(size_t i) {
   auto& f=frames[i];if(f.valid&&f.dirty) {
     if(f.uncommitted&&before_flush)before_flush(f.file,f.page);
-    page_write(descriptor(f.file),arena+i*PAGE,static_cast<off_t>(f.page*PAGE));data_page_write_bytes+=PAGE;f.dirty=false;
+    page_write(descriptor(f.file),pages[i].get(),static_cast<off_t>(f.page*PAGE));data_page_write_bytes+=PAGE;f.dirty=false;
   }
 }
 size_t BufferPool::pin(const std::string& file,uint64_t page) {
+  ++page_accesses;
   auto key=file+":"+std::to_string(page);auto found=lookup.find(key);
   if(found!=lookup.end()){frames[found->second].age=++clock;return found->second;}
   // Give frequently reused primary/header pages a bounded protected share.
@@ -165,25 +193,33 @@ size_t BufferPool::pin(const std::string& file,uint64_t page) {
     }
     if(alternative<frames.size())victim=alternative;
   }
-  flush(victim);if(frames[victim].valid)lookup.erase(frames[victim].file+":"+std::to_string(frames[victim].page));auto p=arena+victim*PAGE;std::memset(p,0,PAGE);
+  // Anonymous page mappings avoid a malloc alignment/header page per frame,
+  // and unmapping discarded backing returns it without touching data-file cache.
+  if(!pages[victim]){void* p=::mmap(nullptr,PAGE,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);require(p!=MAP_FAILED,"aligned allocation failed");pages[victim].reset(static_cast<std::byte*>(p));}
+  flush(victim);
+  if(frames[victim].valid)lookup.erase(frames[victim].file+":"+std::to_string(frames[victim].page));
+  // Invalidate before reusing backing so failed reads cannot expose overwritten
+  // bytes through a handle for the previous occupant.
+  frames[victim].valid=frames[victim].dirty=false;
+  const auto version=++frames[victim].version;
+  auto p=pages[victim].get();std::memset(p,0,PAGE);
   auto n=page_read(descriptor(file),p,PAGE,static_cast<off_t>(page*PAGE));
   require(n==0||n==static_cast<ssize_t>(PAGE),"short/corrupt data page");
   ++physical_reads;
   auto marker=file.rfind(".v");
   if(marker!=std::string::npos&&marker+2<file.size()&&file[marker+2]>='0'&&file[marker+2]<='9')++vector_reads;
-  auto version=frames[victim].version+1;
   frames[victim]={file,page,++clock,version,true,false,false,metadata};lookup.emplace(std::move(key),victim);return victim;
 }
 Page BufferPool::get(const std::string& f,uint64_t p) {Page r;std::memcpy(r.data(),view(f,p),PAGE);return r;}
-const std::byte* BufferPool::view(const std::string& f,uint64_t p) {return arena+pin(f,p)*PAGE;}
-BufferPool::PageGuard BufferPool::lease(const std::string& f,uint64_t p){auto i=pin(f,p);++frames[i].pins;return {this,i,arena+i*PAGE};}
+const std::byte* BufferPool::view(const std::string& f,uint64_t p) {return pages[pin(f,p)].get();}
+BufferPool::PageGuard BufferPool::lease(const std::string& f,uint64_t p){auto i=pin(f,p);++frames[i].pins;return {this,i,pages[i].get()};}
 void BufferPool::put(const std::string& f,uint64_t p,const Page& bytes) {
-  auto i=pin(f,p);std::memcpy(arena+i*PAGE,bytes.data(),PAGE);frames[i].dirty=true;frames[i].uncommitted=transaction_active;
+  auto i=pin(f,p);std::memcpy(pages[i].get(),bytes.data(),PAGE);frames[i].dirty=true;frames[i].uncommitted=transaction_active;
 }
 BufferPool::ResidentHandle BufferPool::handle(const std::string& f,uint64_t p){auto i=pin(f,p);return {i,frames[i].version};}
 const std::byte* BufferPool::resident(ResidentHandle h) const {
   if(h.frame>=frames.size()||!frames[h.frame].valid||frames[h.frame].version!=h.version)return nullptr;
-  return arena+h.frame*PAGE;
+  return pages[h.frame].get();
 }
 void BufferPool::flush_page(const std::string& f,uint64_t p){flush(pin(f,p));}
 void BufferPool::append_extent(const std::string& f,uint64_t p,const Page& bytes,size_t offset,size_t length){
@@ -201,16 +237,20 @@ void BufferPool::append_extent_bytes(const std::string& f,uint64_t p,size_t offs
   if(static_cast<uint64_t>(size)<(p+1)*PAGE)require(::ftruncate(fd,static_cast<off_t>((p+1)*PAGE))==0,"append page extension failed");
   size_t remaining=length;const std::byte* source=static_cast<const std::byte*>(bytes);uint64_t position=p*PAGE+offset;
   while(remaining){auto done=retry_eintr([&]{return ::pwrite(fd,source,remaining,static_cast<off_t>(position));});require(done>0,"append write failed");source+=done;remaining-=done;position+=done;}
-  data_page_write_bytes+=length;std::memcpy(arena+i*PAGE+offset,bytes,length);
+  data_page_write_bytes+=length;std::memcpy(pages[i].get()+offset,bytes,length);
   frames[i].dirty=frames[i].uncommitted=false;
 }
 void BufferPool::committed(){transaction_active=false;for(auto& f:frames)f.uncommitted=false;}
 void BufferPool::invalidate_prefix(const std::string& prefix){
-  for(auto& f:frames)if(f.valid&&(f.file==prefix||f.file.rfind(prefix+".",0)==0)){require(!f.pins,"discard pinned region");lookup.erase(f.file+":"+std::to_string(f.page));f.valid=f.dirty=false;++f.version;}
+  auto matches=[&](const std::string& file){return file==prefix||file.rfind(prefix+".",0)==0;};
+  for(const auto& f:frames)if(f.valid&&matches(f.file))require(!f.pins,"discard pinned region");
+  for(size_t i=0;i<frames.size();++i){auto& f=frames[i];if(f.valid&&matches(f.file)){
+    lookup.erase(f.file+":"+std::to_string(f.page));f.valid=f.dirty=f.uncommitted=false;++f.version;pages[i].reset();
+  }}
   for(auto it=descriptors.begin();it!=descriptors.end();)if(it->first==prefix||it->first.rfind(prefix+".",0)==0){::close(it->second);it=descriptors.erase(it);}else ++it;
 }
 void BufferPool::sync_all(){
-  for(auto& e:std::filesystem::directory_iterator(directory)){int fd=page_fd(e.path());try{require(retry_eintr([&]{return ::fsync(fd);})==0,"data file sync failed");::posix_fadvise(fd,0,0,POSIX_FADV_DONTNEED);}catch(...){::close(fd);throw;}::close(fd);}sync_directory(directory);
+  for(auto& e:std::filesystem::directory_iterator(directory)){int fd=page_fd(e.path());try{require(retry_eintr([&]{return ::fsync(fd);})==0,"data file sync failed");}catch(...){::close(fd);throw;}::close(fd);}sync_directory(directory);
 }
 void BufferPool::flush_all() {for(size_t i=0;i<frames.size();++i) flush(i);}
 

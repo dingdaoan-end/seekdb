@@ -16,6 +16,14 @@ namespace mvdb {
 constexpr size_t PAGE = 16384;
 using Page = std::array<std::byte, PAGE>;
 using SlotId = uint32_t;
+namespace detail {
+// LSB-first bytes, bit interval [begin,end). Return end when no matching bit
+// exists. The buffer need only contain ceil(end/8) bytes; empty ranges may
+// use nullptr. Neither alignment nor readable padding is required.
+size_t bitmap_next(const std::byte* bytes,size_t begin,size_t end,bool want_set=true);
+// Internal oracle seam; delegates to the same encoder used for WAL and undo.
+std::string page_delta(const std::string& file,uint64_t page,const Page& old,const Page& next);
+}
 struct MemoryBudget {
   size_t limit, used = 0, peak=0;
   std::shared_ptr<char> lifetime=std::make_shared<char>();
@@ -26,14 +34,17 @@ struct MemoryBudget {
   void release(size_t bytes) { used -= bytes; }
 };
 
-// A fixed userspace allocation: frame and replacement metadata grow only with
-// frame count. Buffered I/O also uses reclaimable, externally charged kernel cache.
+// Fixed frame count and full budget reservation; aligned page backing is allocated
+// on first use. Buffered I/O also uses externally charged kernel cache.
 class BufferPool {
   struct Frame { std::string file; uint64_t page=0, age=0, version=0; bool valid=false, dirty=false, uncommitted=false, metadata=false; uint32_t pins=0; };
   std::filesystem::path directory;
   MemoryBudget& budget;
   std::vector<Frame> frames;
-  std::byte* arena=nullptr;
+  struct PageDeleter { void operator()(std::byte*) const noexcept; };
+  // Pointer slots fit in the existing per-frame metadata allowance. Keeping
+  // Frame unchanged preserves the frame count at every memory budget.
+  std::vector<std::unique_ptr<std::byte,PageDeleter>> pages;
   uint64_t clock=0;
   size_t reservation=0;
   std::unordered_map<std::string,size_t> lookup;
@@ -64,7 +75,12 @@ public:
   void committed();
   void invalidate_prefix(const std::string&);
   void sync_all();
+  uint64_t page_accesses=0; // Logical pin requests, including cache hits; diagnostic only.
   uint64_t physical_reads=0,vector_reads=0,data_page_write_bytes=0;
+  // Diagnostic backing bytes, distinct from the full capacity budget reservation.
+  size_t allocated_page_bytes() const noexcept {
+    size_t bytes=0;for(const auto& p:pages)if(p)bytes+=PAGE;return bytes;
+  }
   BufferPool(std::filesystem::path, MemoryBudget&);
   ~BufferPool();
   BufferPool(const BufferPool&)=delete;
