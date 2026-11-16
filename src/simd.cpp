@@ -31,6 +31,34 @@ __attribute__((target("avx2,fma"))) double simd_squared_fma(const float* a,const
   L2_BODY(_mm256_fmadd_ps(d,d,sums[j]))
 }
 #undef L2_BODY
+// Work on two adjacent rows at a time so the eight independent accumulators
+// and the shared query load fit in AVX2's sixteen registers. Each row retains
+// the full kernel's four accumulation chains and reduction order.
+#define BATCH_REDUCE(S,OUT) \
+  {__m256 merged=_mm256_add_ps(_mm256_add_ps(S[0],S[1]),_mm256_add_ps(S[2],S[3])); \
+  __m128 halves=_mm_add_ps(_mm256_castps256_ps128(merged),_mm256_extractf128_ps(merged,1)); \
+  halves=_mm_hadd_ps(halves,halves);halves=_mm_hadd_ps(halves,halves); \
+  OUT=_mm_cvtss_f32(halves);}
+#define BATCH_BODY(ACCUMULATE) \
+  for(size_t row=0;row<4;row+=2){ \
+    __m256 sums[2][4];for(auto& s:sums)for(auto& x:s)x=_mm256_setzero_ps(); \
+    for(size_t i=0;i<128;i+=32)for(size_t j=0;j<4;++j){ \
+      __m256 q=_mm256_loadu_ps(query+i+j*8); \
+      for(size_t r=0;r<2;++r){ \
+        __m256 d=_mm256_sub_ps(_mm256_loadu_ps(rows+(row+r)*128+i+j*8),q); \
+        sums[r][j]=ACCUMULATE; \
+      } \
+    } \
+    BATCH_REDUCE(sums[0],out[row]) BATCH_REDUCE(sums[1],out[row+1]) \
+  }
+__attribute__((target("avx2"))) void simd_batch4(const float* rows,const float* query,double* out){
+  BATCH_BODY(_mm256_add_ps(sums[r][j],_mm256_mul_ps(d,d)))
+}
+__attribute__((target("avx2,fma"))) void simd_batch4_fma(const float* rows,const float* query,double* out){
+  BATCH_BODY(_mm256_fmadd_ps(d,d,sums[r][j]))
+}
+#undef BATCH_BODY
+#undef BATCH_REDUCE
 // Keep the four original accumulators live across the check, then finish in
 // exactly the original order. The checkpoint reduction never feeds back into
 // them, so survivors remain bit-identical to simd_squared[_fma](...,128).
@@ -110,5 +138,15 @@ double l2_squared_fast(const float* a,const float* b,size_t n,bool safe){
   return sum;
 }
 double l2_fast(const float* a,const float* b,size_t n,bool safe){return std::sqrt(l2_squared_fast(a,b,n,safe));}
+
+void l2_squared_batch4_128(const float* rows,const float* query,double* out,bool safe){
+  if(!safe||!avx2_available()){
+    for(size_t row=0;row<4;++row)out[row]=l2_squared_exact(rows+row*128,query,128);
+    return;
+  }
+  if(fma_available())simd_batch4_fma(rows,query,out);else simd_batch4(rows,query,out);
+  for(size_t row=0;row<4;++row)if(!std::isfinite(out[row])||out[row]<=1e-20)
+    out[row]=l2_squared_exact(rows+row*128,query,128);
+}
 double l2(const float* a,const float* b,size_t n){return l2_fast(a,b,n,!has_extreme(a,n)&&!has_extreme(b,n));}
 }

@@ -58,8 +58,13 @@ class Engine {
     std::vector<SlotId> postings,active_slots;
     std::vector<uint32_t> offsets;
     std::vector<BufferPool::ResidentHandle> vector_pages;
+    std::optional<BufferPool::ResidencyLease> vector_lease;
   };
   std::unique_ptr<TableReadCache> read_cache;
+  std::optional<BufferPool::ResidencyLease> prepared_vectors;
+  std::string prepared_table;
+  bool preparation_cache_allowed=false;
+  void prepare_vector_residency(const std::string&,const Header&,const std::vector<Column>&);
   uint64_t cache_builds=0;
   uint64_t bounded_attempts=0,bounded_pruned=0,bounded_fallbacks=0;
   TableReadCache* cache(const std::string&,const Header&,const std::vector<Column>&);
@@ -80,6 +85,9 @@ class Engine {
   void write_blob(const std::string&,uint64_t,const std::string&,bool append=false);
   void bitmap(const std::string&,SlotId,bool);
   void posting(const std::string&,uint32_t,SlotId,bool);
+  struct PostingList {std::string file;uint64_t offset;uint32_t count;};
+  static bool packed_index(const std::string&);
+  PostingList posting_list(const std::string&,uint32_t);
   uint32_t assign(const std::string&,const Header&,const std::vector<float>&);
   void create_index(const Statement&,const std::vector<Column>&);
   std::string index_base(const std::string&,const Header&) const;
@@ -95,7 +103,13 @@ public:
   Engine(std::filesystem::path root,size_t budget=8*1024*1024,std::function<void(size_t)> progress={})
     :storage(std::move(root),budget,std::move(progress)){}
   Result execute(const std::string& sql);
-  void close(){read_cache.reset();storage.close();}
+  void close(){read_cache.reset();prepared_vectors.reset();storage.close();}
+  size_t resident_frame_count() const{return storage.pool.resident_page_count();}
+  size_t pinned_frame_count() const{return storage.pool.pinned_page_count();}
+  size_t resident_frame_bytes() const{return storage.pool.allocated_page_bytes();}
+  uint64_t released_clean_pages() const{return storage.pool.clean_page_releases;}
+  uint64_t data_cache_drop_count() const{return storage.pool.cache_drop_calls;}
+  void index_publication_progress(std::function<void(size_t)> hook){storage.region_progress=std::move(hook);}
   size_t read_cache_slots() const{return read_cache?read_cache->slots:0;}
   uint64_t bounded_distance_attempts() const{return bounded_attempts;}
   uint64_t bounded_distance_pruned() const{return bounded_pruned;}

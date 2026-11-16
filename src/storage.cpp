@@ -197,7 +197,7 @@ size_t BufferPool::pin(const std::string& file,uint64_t page) {
   // and unmapping discarded backing returns it without touching data-file cache.
   if(!pages[victim]){void* p=::mmap(nullptr,PAGE,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);require(p!=MAP_FAILED,"aligned allocation failed");pages[victim].reset(static_cast<std::byte*>(p));}
   flush(victim);
-  if(frames[victim].valid)lookup.erase(frames[victim].file+":"+std::to_string(frames[victim].page));
+  if(frames[victim].valid){lookup.erase(frames[victim].file+":"+std::to_string(frames[victim].page));++frame_evictions;}
   // Invalidate before reusing backing so failed reads cannot expose overwritten
   // bytes through a handle for the previous occupant.
   frames[victim].valid=frames[victim].dirty=false;
@@ -213,6 +213,79 @@ size_t BufferPool::pin(const std::string& file,uint64_t page) {
 Page BufferPool::get(const std::string& f,uint64_t p) {Page r;std::memcpy(r.data(),view(f,p),PAGE);return r;}
 const std::byte* BufferPool::view(const std::string& f,uint64_t p) {return pages[pin(f,p)].get();}
 BufferPool::PageGuard BufferPool::lease(const std::string& f,uint64_t p){auto i=pin(f,p);++frames[i].pins;return {this,i,pages[i].get()};}
+BufferPool::ResidencyLease::ResidencyLease(ResidencyLease&& other) noexcept { *this=std::move(other); }
+BufferPool::ResidencyLease& BufferPool::ResidencyLease::operator=(ResidencyLease&& other) noexcept {
+  if(this!=&other){reset();owner=other.owner;reservation=other.reservation;
+    guards=std::move(other.guards);other.owner=nullptr;other.reservation=0;}
+  return *this;
+}
+void BufferPool::ResidencyLease::reset() noexcept {
+  // Destroy pins and free their charged allocations before releasing the budget.
+  std::vector<PageGuard>().swap(guards);
+  if(owner)owner->budget.release(reservation);
+  owner=nullptr;reservation=0;
+}
+std::optional<BufferPool::ResidencyLease> BufferPool::load_residency(const std::string& file,uint64_t count,size_t headroom){
+  auto refuse=[&]()->std::optional<ResidencyLease>{++residency_refusals;return std::nullopt;};
+  headroom=std::max<size_t>(32,headroom);
+  if(file.empty()||file.size()>=128||file.find('/')!=std::string::npos||file.find("..")!=std::string::npos||
+     !count||headroom>frames.size()||count>frames.size()-headroom||
+     count>uint64_t(std::numeric_limits<off_t>::max())/PAGE)return refuse();
+  // A one-table preparation lease must not become a sequence of per-file
+  // handoffs in a multi-vector database whose combined working set overflows.
+  // Stay on inclusive caching there, even when one individual vector fits.
+  auto vector_file=[](const std::string& name){auto at=name.rfind(".v");return at!=std::string::npos&&at+2<name.size()&&std::all_of(name.begin()+at+2,name.end(),[](char c){return c>='0'&&c<='9';});};
+  for(const auto& entry:std::filesystem::directory_iterator(directory)){
+    const auto name=entry.path().filename().string();if(name!=file&&vector_file(name)&&entry.is_regular_file()&&entry.file_size()!=0)return refuse();
+  }
+  const size_t overhead=128;
+  if(overhead>budget.limit||count>(budget.limit-overhead)/sizeof(PageGuard))return refuse();
+  const size_t charge=overhead+static_cast<size_t>(count)*sizeof(PageGuard);
+  if(charge>budget.limit-budget.used)return refuse();
+  for(const auto& f:frames)if(f.pins||(f.valid&&f.file==file&&f.uncommitted))return refuse();
+  // Allocate the complete lease before any I/O or cache drop. The separately
+  // opened buffered descriptor is also retained for synchronous error recovery.
+  ResidencyLease result;budget.acquire(charge);result.owner=this;result.reservation=charge;
+  result.guards.reserve(static_cast<size_t>(count));
+  int buffered=::open((directory/file).c_str(),O_RDONLY|O_CLOEXEC);
+  require(buffered>=0,"open residency file failed");
+  try{
+    // Only committed images of this exact file may be flushed here. Other
+    // dirty files retain their ordinary eviction/WAL/undo protection.
+    for(size_t i=0;i<frames.size();++i)if(frames[i].valid&&frames[i].file==file&&frames[i].dirty)flush(i);
+    auto bytes=::lseek(buffered,0,SEEK_END);require(bytes>=0,"residency file size failed");
+    if(static_cast<uint64_t>(bytes)<count*PAGE){::close(buffered);return refuse();}
+    sync_file(buffered);
+    for(uint64_t p=0;p<count;++p){
+      auto i=pin(file,p);auto& f=frames[i];require(!f.dirty&&!f.uncommitted,"residency page changed");
+      ++f.pins;result.guards.emplace_back(this,i,pages[i].get());
+      require(::posix_fadvise(buffered,static_cast<off_t>(p*PAGE),PAGE,POSIX_FADV_DONTNEED)==0,"residency cache handoff failed");
+      ++cache_drop_calls;
+    }
+  }catch(...){
+    // Restore every potentially advised page while the frames are still pinned.
+    // WILLNEED alone is asynchronous and cannot establish this handback. An
+    // I/O failure may itself make restoration fail; that path propagates error
+    // and carries no zero-additional-I/O performance promise.
+    try{Page scratch;for(size_t p=0;p<result.guards.size();++p)
+      require(read_all(buffered,scratch.data(),PAGE,p*PAGE),"residency cache restoration failed");
+    }catch(...){::close(buffered);throw;}
+    ::close(buffered);throw;
+  }
+  ::close(buffered);return result;
+}
+bool BufferPool::release_clean_page(const std::string& file,uint64_t page){
+  auto found=lookup.find(file+":"+std::to_string(page));if(found==lookup.end())return true;
+  const auto i=found->second;auto& f=frames[i];if(f.pins||f.dirty||f.uncommitted)return false;
+  lookup.erase(found);f.valid=false;++f.version;pages[i].reset();++clean_page_releases;return true;
+}
+bool BufferPool::release_clean_file(const std::string& file){
+  for(const auto& f:frames)if(f.valid&&f.file==file&&(f.pins||f.dirty||f.uncommitted))return false;
+  for(size_t i=0;i<frames.size();++i){auto& f=frames[i];if(f.valid&&f.file==file){
+    lookup.erase(f.file+":"+std::to_string(f.page));f.valid=false;++f.version;pages[i].reset();++clean_page_releases;
+  }}
+  return true;
+}
 void BufferPool::put(const std::string& f,uint64_t p,const Page& bytes) {
   auto i=pin(f,p);std::memcpy(pages[i].get(),bytes.data(),PAGE);frames[i].dirty=true;frames[i].uncommitted=transaction_active;
 }
@@ -239,6 +312,14 @@ void BufferPool::append_extent_bytes(const std::string& f,uint64_t p,size_t offs
   while(remaining){auto done=retry_eintr([&]{return ::pwrite(fd,source,remaining,static_cast<off_t>(position));});require(done>0,"append write failed");source+=done;remaining-=done;position+=done;}
   data_page_write_bytes+=length;std::memcpy(pages[i].get()+offset,bytes,length);
   frames[i].dirty=frames[i].uncommitted=false;
+  // Completed invisible append pages are reconstructible from the coherent
+  // file. Keep partial tails hot and retain the kernel cache for future reads.
+  const char* release=std::getenv("MVDB_APPEND_RELEASE");
+  const auto marker=f.rfind(".v");
+  const bool vector_file=marker!=std::string::npos&&marker+2<f.size()&&
+    std::all_of(f.begin()+marker+2,f.end(),[](char c){return c>='0'&&c<='9';});
+  if(offset+length==PAGE&&(vector_file||f.ends_with(".blob"))&&(!release||std::strcmp(release,"off")!=0))
+    release_clean_page(f,p);
 }
 void BufferPool::committed(){transaction_active=false;for(auto& f:frames)f.uncommitted=false;}
 void BufferPool::invalidate_prefix(const std::string& prefix){
@@ -348,7 +429,13 @@ void Storage::recover(const std::function<void(size_t)>& hook) {
       else if(r->type=='C'&&begun){size_t offset=0;if(r->payload.size()!=4||take<uint32_t>(r->payload,offset)!=crc)break;
         uint64_t replay=start;
         while(replay<pos){auto entry=read_record(wal,replay);require(entry.has_value(),"invalid committed WAL");each_delta(*entry,[&](const std::string& payload){
-          if(!payload.empty()&&payload[0]=='\0'){discard_region(payload.substr(1));if(hook)hook(++applied);return;}
+          if(!payload.empty()&&payload[0]=='\0'){
+            if(payload.size()>1&&(payload[1]=='\0'||payload[1]=='\1')){
+              auto prefix=payload.substr(2);require(!prefix.empty()&&prefix.find('/')==std::string::npos&&prefix.find("..") == std::string::npos&&std::filesystem::exists(root/"regions"/prefix),"missing published region allocation");
+            }else discard_region(payload.substr(1));
+            if(hook)hook(++applied);
+            return;
+          }
           std::string file;uint64_t page;Page bytes{};apply_delta(payload,file,page,bytes,true);
           mark_written(file);
           int fd=page_fd(root/"data"/file);auto n=page_read(fd,aligned,PAGE,static_cast<off_t>(page*PAGE));::close(fd);require(n>=0&&n<=ssize_t(PAGE),"data recovery read failed");
@@ -361,6 +448,14 @@ void Storage::recover(const std::function<void(size_t)>& hook) {
     }
     // For SIGKILL recovery, a complete CRC-checked COMMIT is the authority.
     // A partial tail has no commit and is discarded after shadow restoration.
+    // Allocation is flushed before any region data can be written. Walk only
+    // CRC-valid tail records, without an in-memory namespace set. A second kill
+    // can repeat these deletions because allocation tokens are never reused.
+    uint64_t tail=valid;
+    for(;;){std::optional<LogRecord> entry;try{entry=read_record(wal,tail);}catch(const std::runtime_error&){break;}if(!entry)break;
+      if(entry->type=='P'||entry->type=='X')each_delta(*entry,[&](const std::string& payload){if(payload.size()>2&&payload[0]=='\0'&&payload[1]=='\1'){discard_region(payload.substr(2));if(hook)hook(++applied);}});
+      tail=entry->end;
+    }
     require(::ftruncate(wal,static_cast<off_t>(valid))==0,"WAL tail truncation failed");sync_wal();
   }catch(...){std::free(aligned);throw;}std::free(aligned);
 }
@@ -372,6 +467,9 @@ void Storage::recover(const std::function<void(size_t)>& hook) {
 // replaying absolute changed runs in commit order is idempotent on their images.
 void Storage::protect(const std::string& file,uint64_t page){
   if(!active)return;
+  // New namespaces have no visible predecessor. Their durable immutable
+  // baseline is synchronized by seal_region before the WAL header publication.
+  if(fresh_region(file))return;
   mark_written(file);
   require(!file.empty()&&file.size()<128&&file.find('/')==std::string::npos&&file.find("..") == std::string::npos,"unsafe shadow file");
   int index=::open((shadow_index/file).c_str(),O_RDWR|O_CREAT|O_CLOEXEC,0600);require(index>=0,"open shadow index failed");
@@ -401,6 +499,7 @@ void Storage::restore_shadow(){
     require(file.find('/')==std::string::npos&&file.find("..") == std::string::npos,"unsafe shadow filename");
     auto page=take<uint64_t>(entry->payload,cursor),length=take<uint64_t>(entry->payload,cursor);auto exists=take<uint8_t>(entry->payload,cursor);
     require(length%PAGE==0&&exists<=1&&cursor+(exists?PAGE:0)==entry->payload.size(),"invalid shadow page");
+    if(retired_region_file(file)){pos=entry->end;continue;}
     if(exists){alignas(4096) Page bytes;std::memcpy(bytes.data(),entry->payload.data()+cursor,PAGE);raw_page(root/"data"/file,page,bytes.data());}
     int fd=page_fd(root/"data"/file);require(::ftruncate(fd,static_cast<off_t>(length))==0,"restore shadow length failed");::close(fd);
     int index=::open((shadow_index/file).c_str(),O_RDWR|O_CREAT|O_CLOEXEC,0600);require(index>=0,"rebuild shadow index failed");
@@ -417,12 +516,35 @@ std::string Storage::begin_region(const std::string& prefix){
   std::filesystem::create_directories(root/"regions");
   uint64_t id=0;std::string name;
   for(;;){name=prefix+".r"+std::to_string(++id);int fd=::open((root/"regions"/name).c_str(),O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC,0600);if(fd>=0){sync_file(fd);::close(fd);sync_directory(root/"regions");sync_directory(root);break;}require(errno==EEXIST,"allocate region failed");}
-  std::string data(1,'\0');data+=name;uint32_t n=data.size();undo_write(data.data(),n,undo_top);undo_write(reinterpret_cast<const char*>(&n),4,undo_top+n);undo_top+=n+4;regions.push_back(name);return name;
+  std::string data(1,'\0');data+=name;uint32_t n=data.size();undo_write(data.data(),n,undo_top);undo_write(reinterpret_cast<const char*>(&n),4,undo_top+n);undo_top+=n+4;regions.push_back(name);
+  record('P',std::string("\0\1",2)+name);flush_redo();return name;
 }
-void Storage::seal_region(const std::string& prefix){require(active,"seal outside transaction");regions.erase(std::remove(regions.begin(),regions.end(),prefix),regions.end());}
-void Storage::write_new(const std::string& file,uint64_t page,const Page& bytes){require(!closed&&active&&fresh_region(file),"write_new outside fresh region");write_redo(file,page,bytes);}
+void Storage::seal_region(const std::string& prefix){
+  require(active&&fresh_region(prefix),"seal outside fresh region");if(region_progress)region_progress(1);
+  pool.flush_all();if(region_progress)region_progress(2);
+  for(const auto& e:std::filesystem::directory_iterator(root/"data")){auto file=e.path().filename().string();if(file==prefix||file.rfind(prefix+".",0)==0){int fd=page_fd(e.path());try{sync_file(fd);}catch(...){::close(fd);throw;}::close(fd);}}
+  sync_directory(root/"data");if(region_progress)region_progress(3);
+  // Allocation tokens are durable and NEVER removed, including by rollback.
+  // Thus an older discard redo cannot name this baseline. A CRC-covered
+  // publish marker is a no-op on replay: later ordinary DML redo must win.
+  record('P',std::string(2,'\0')+prefix);if(region_progress)region_progress(4);
+  regions.erase(std::remove(regions.begin(),regions.end(),prefix),regions.end());
+}
+void Storage::write_new(const std::string& file,uint64_t page,const Page& bytes){require(!closed&&active&&fresh_region(file),"write_new outside fresh region");pool.put(file,page,bytes);}
+bool Storage::retired_region_file(const std::string& file)const{
+  // Match complete namespace components, never r1 against r10. Tokens are
+  // tiny permanent allocation identities; an empty legacy token is live.
+  for(size_t end=file.size();;){auto marker=file.rfind(".r",end);bool candidate=marker!=std::string::npos&&marker+2<end;
+    if(candidate)for(size_t i=marker+2;i<end;++i)if(file[i]<'0'||file[i]>'9'){candidate=false;break;}
+    if(candidate){int fd=::open((root/"regions"/file.substr(0,end)).c_str(),O_RDONLY|O_CLOEXEC);if(fd>=0){char retired=0;auto n=retry_eintr([&]{return ::pread(fd,&retired,1,0);});::close(fd);require(n>=0,"read region allocation failed");if(n==1&&retired=='R')return true;}}
+    if(end==0)break;
+    auto dot=file.rfind('.',end-1);if(dot==std::string::npos)break;end=dot;
+  }return false;
+}
 void Storage::discard_region(const std::string& prefix){
+  require(!prefix.empty()&&prefix.size()<128&&prefix.find('/')==std::string::npos&&prefix.find('\\')==std::string::npos&&prefix.find("..") == std::string::npos,"unsafe discarded region");
   pool.invalidate_prefix(prefix);
+  int token=::open((root/"regions"/prefix).c_str(),O_WRONLY|O_CLOEXEC);if(token>=0){char retired='R';try{require(retry_eintr([&]{return ::pwrite(token,&retired,1,0);})==1,"retire region failed");sync_file(token);}catch(...){::close(token);throw;}::close(token);}
   for(auto& e:std::filesystem::directory_iterator(root/"data")){auto name=e.path().filename().string();if(name==prefix||name.rfind(prefix+".",0)==0)std::filesystem::remove(e.path());}
 }
 void Storage::undo_write(const char* p,size_t n,uint64_t offset){
@@ -434,7 +556,7 @@ void Storage::undo_read(char* p,size_t n,uint64_t offset){
   if(n)require(read_all(undo,p,n,offset-undo_capacity),"undo record missing");
 }
 void Storage::begin(){require(!closed,"storage is closed");require(!active,"transaction already active");require(::ftruncate(undo,0)==0,"undo reset failed");undo_top=0;redo_buffer.clear();transaction_crc=0;transaction_start=::lseek(wal,0,SEEK_END);record('B',"MV2");active=true;pool.transaction_active=true;}
-void Storage::commit(){require(!closed&&active,"no active transaction");try{flush_redo();std::string payload;append_value(payload,transaction_crc);record('C',payload);sync_wal();
+void Storage::commit(){require(!closed&&active,"no active transaction");require(regions.empty(),"unsealed region at commit");try{flush_redo();std::string payload;append_value(payload,transaction_crc);record('C',payload);sync_wal();
   active=false;pool.committed();regions.clear();undo_top=0;
   if(::lseek(wal,0,SEEK_END)>=64*1024*1024)checkpoint();
   }catch(...){closed=true;throw;}

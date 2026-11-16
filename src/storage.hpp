@@ -67,6 +67,37 @@ public:
   std::function<void(const std::string&,uint64_t)> before_flush;
   bool transaction_active=false;
   struct ResidentHandle { size_t frame=0; uint64_t version=0; };
+  // Owns the complete prepared set, pinning it throughout index/query use.
+  // Like PageGuard, this scoped lease must not outlive its BufferPool.
+  class ResidencyLease {
+    friend class BufferPool;
+    BufferPool* owner=nullptr;
+    size_t reservation=0;
+    std::vector<PageGuard> guards;
+  public:
+    ResidencyLease()=default;
+    ResidencyLease(const ResidencyLease&)=delete;
+    ResidencyLease& operator=(const ResidencyLease&)=delete;
+    ResidencyLease(ResidencyLease&& other) noexcept;
+    ResidencyLease& operator=(ResidencyLease&& other) noexcept;
+    ~ResidencyLease(){reset();}
+    void reset() noexcept;
+  };
+  // Explicit index preparation only: reserves the complete set before loading,
+  // then hands each synchronized page from kernel cache to a pinned frame.
+  // The caller authorizes preparation inside its automatic index transaction;
+  // this is never an ordinary read-path fallback or an explicit-TX operation.
+  std::optional<ResidencyLease> load_residency(const std::string&,uint64_t,size_t headroom);
+  bool release_clean_page(const std::string&,uint64_t);
+  bool release_clean_file(const std::string&);
+  uint64_t clean_page_releases=0,residency_refusals=0,cache_drop_calls=0,frame_evictions=0;
+  size_t frame_capacity() const noexcept {return frames.size();}
+  size_t resident_page_count() const noexcept {
+    size_t n=0;for(const auto& f:frames)if(f.valid)++n;return n;
+  }
+  size_t pinned_page_count() const noexcept {
+    size_t n=0;for(const auto& f:frames)if(f.pins)++n;return n;
+  }
   ResidentHandle handle(const std::string&,uint64_t);
   const std::byte* resident(ResidentHandle) const;
   void append_extent(const std::string&,uint64_t,const Page&,size_t,size_t);
@@ -109,6 +140,7 @@ class Storage {
   void restore_shadow();
   bool fresh_region(const std::string&) const;
   void discard_region(const std::string&);
+  bool retired_region_file(const std::string&) const;
   uint64_t undo_top=0, generation=0, transaction_start=0;
   uint32_t transaction_crc=0;
   bool active=false, closed=false;
@@ -133,6 +165,9 @@ public:
   uint64_t undo_spill_bytes=0, wal_bytes_written=0, shadow_bytes_written=0;
   // Includes recovery and checkpoint epoch initialization; use deltas for commits.
   uint64_t wal_syncs=0;
+  // Publication fault-injection seam: before flush, after flush, after durable
+  // baseline, after CRC-covered publication marker (still before table header).
+  std::function<void(size_t)> region_progress;
   void checkpoint(const std::function<void(size_t)>& stage={});
   bool in_transaction() const { return active; }
   uint64_t savepoint() const { return undo_top; }

@@ -221,16 +221,20 @@ static size_t unicode_length_view(std::string_view s) {
 size_t unicode_length(const std::string& s){return unicode_length_view(s);}
 Value convert(const Literal& v,const Column& col) {return convert(LiteralView{v.text,v.quoted,false},col);}
 Value convert(const LiteralView& v,const Column& col) {
+  Value out;convert_into(v,col,out);return out;
+}
+void convert_into(const LiteralView& v,const Column& col,Value& destination) {
   if(v.escaped){
     // Apostrophes cannot belong to numeric vector components. Reject before
     // decoding to prevent two simultaneous literal-sized scratch allocations.
     if(col.type==Type::Vector)error("invalid VECTOR component");
-    auto decoded=TokenView{v.text,v.quoted,true,false}.str();return convert(LiteralView{decoded,v.quoted,false},col);
+    auto decoded=TokenView{v.text,v.quoted,true,false}.str();convert_into(LiteralView{decoded,v.quoted,false},col,destination);return;
   }
-  if(col.type==Type::Bigint){if(v.quoted)error("BIGINT literal must be numeric");return integer(v.text);}
+  if(col.type==Type::Bigint){if(v.quoted)error("BIGINT literal must be numeric");destination=integer(v.text);return;}
   if(!v.quoted)error("string/vector literal must be quoted");
-  if(col.type==Type::Varchar){if(unicode_length_view(v.text)>col.width)error("VARCHAR exceeds code point length");return std::string(v.text);}
-  std::vector<float> out;out.reserve(std::min<size_t>(col.width,v.text.size()/2+1));
+  if(col.type==Type::Varchar){if(unicode_length_view(v.text)>col.width)error("VARCHAR exceeds code point length");destination=std::string(v.text);return;}
+  if(!std::holds_alternative<std::vector<float>>(destination))destination.emplace<std::vector<float>>();
+  auto& out=std::get<std::vector<float>>(destination);out.clear();out.reserve(std::min<size_t>(col.width,v.text.size()/2+1));
   size_t p=0;auto ws=[&]{while(p<v.text.size()&&std::isspace(static_cast<unsigned char>(v.text[p])))++p;};
   ws();if(p==v.text.size()||v.text[p++]!='[')error("invalid VECTOR literal");ws();
   if(p<v.text.size()&&v.text[p]!=']')while(true){
@@ -269,7 +273,6 @@ Value convert(const LiteralView& v,const Column& col) {
   if(p==v.text.size()||v.text[p++]!=']')error("invalid VECTOR separator");
   ws();
   if(p!=v.text.size()||out.size()!=col.width)error("VECTOR dimension mismatch");
-  return out;
 }
 int compare(const Value& a,const Value& b) {
   if(a.index()!=b.index())error("incompatible comparison types");

@@ -294,6 +294,7 @@ int main(int argc,char** argv){
     std::cerr<<"distance_kernel="<<(mvdb::avx2_available()?"avx2":"scalar")<<'\n';
     Response response;response.ready().emit();
     Metrics metrics;std::string line;bool closed=false;int exit_status=output_ok?0:3;InputLines input;
+    const char* cache_stats=std::getenv("MVDB_CACHE_STATS");const bool cache_statistics=cache_stats&&std::string_view(cache_stats)=="1";
     while(output_ok&&input.next(line)){
       auto before=engine.vector_page_reads();auto spill_before=engine.spill_bytes();
       bool legacy=!json_line(line),shutdown=false;std::string_view id="null";std::string code="invalid_request";RequestInput request;
@@ -334,6 +335,13 @@ int main(int argc,char** argv){
       metrics.number("nlist",engine.last_nlist());
       metrics.number("recommended_nprobe",engine.last_recommended_nprobe());
       metrics.number("effective_nprobe",engine.effective_nprobe());
+      if(cache_statistics){
+        metrics.number("resident_frames",engine.resident_frame_count());
+        metrics.number("resident_frame_bytes",engine.resident_frame_bytes());
+        metrics.number("pinned_frames",engine.pinned_frame_count());
+        metrics.number("clean_page_releases",engine.released_clean_pages());
+        metrics.number("data_cache_drops",engine.data_cache_drop_count());
+      }
       metrics.string("ann_route",engine.last_route());
       metrics.emit();
       if(!output_ok){exit_status=3;break;}

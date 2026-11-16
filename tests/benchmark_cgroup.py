@@ -47,13 +47,15 @@ def run(args):
                     for project in args.projects:
                         name=token+'-'+uuid.uuid4().hex[:8];volume=name+'-data'
                         docker('volume','create',volume)
-                        child=None
+                        child=None;observer=None;observer_thread=None;observed=[];checkpoints={}
                         try:
                             command=[args.docker,'run','--name',name,'-i','--read-only','--network=none','--cpus=2',
                                      '--memory='+memory,'--memory-swap='+memory,'--pids-limit=128','--cap-drop=ALL',
                                      '--security-opt=no-new-privileges','--mount',f'type=volume,src={volume},dst=/data',
                                      '--entrypoint','/bin/sh',args.image,'-c',
                                      '/usr/local/bin/minivectordb --data-dir /data; s=$?; echo ENGINE_EXIT:$s >&2; read finish; exit "$s"']
+                            if args.memory_breakdown:
+                                at=command.index('--entrypoint');command[at:at]=['--env','MVDB_CACHE_STATS=1']
                             child=subprocess.Popen(command,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,bufsize=1)
                             exited=threading.Event();final={};last={};errors=[];status=[]
                             def stderr():
@@ -76,6 +78,23 @@ def run(args):
                                 return {'memory_peak_bytes':peak,'io_stat':devices,'read_bytes':sum(d.get('rbytes',0) for d in devices.values()),
                                         'write_bytes':sum(d.get('wbytes',0) for d in devices.values())}
                             initial=sample();sequence=0
+                            if args.memory_breakdown:
+                                # Dedicated diagnostic only: sampling is outside the DB
+                                # cgroup and is never enabled in scoring comparisons.
+                                script='while [ -r '+cg+'/memory.current ]; do c=$(cat '+cg+'/memory.current); p=$(cat '+cg+'/memory.peak); awk -v c="$c" -v p="$p" \'$1=="anon"{a=$2}$1=="file"{f=$2}$1=="kernel"{k=$2}END{print c,p,a,f,k}\' '+cg+'/memory.stat; sleep 0.02; done'
+                                observer=subprocess.Popen([args.docker,'exec',collector,'/bin/sh','-c',script],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True)
+                                def watch(stream=observer.stdout,values=observed):
+                                    for line in stream:
+                                        parts=line.split()
+                                        if len(parts)==5:
+                                            try:values.append(dict(zip(('current','peak','anon','file','kernel'),map(int,parts))))
+                                            except ValueError:pass
+                                observer_thread=threading.Thread(target=watch,daemon=True);observer_thread.start()
+                            def checkpoint(label):
+                                if args.memory_breakdown:
+                                    values=docker('exec',collector,'cat',cg+'/memory.current',cg+'/memory.stat').stdout.splitlines()
+                                    stat={parts[0]:int(parts[1])for line in values[1:]if len(parts:=line.split())==2}
+                                    checkpoints[label]={'current':int(values[0]),'stat':stat,'engine':dict(last)}
                             def request(sql=None,mode='exact',op='execute'):
                                 nonlocal sequence
                                 sequence+=1;payload={'id':sequence,'op':op}
@@ -89,11 +108,14 @@ def run(args):
                             request(SCHEMA);write_seconds=0;write_start=time.perf_counter()
                             for sql in batches:write_seconds+=request(sql)[1]
                             write_last=time.perf_counter()
+                            checkpoint('loaded')
                             index_seconds=0;query_seconds=None;recalls=None
                             if project!='write':
                                 index_seconds=request('CREATE VECTOR INDEX vi ON t(embedding);')[1]
+                                checkpoint('indexed')
                                 mode=project
                                 for i in list(range(10))+list(range(500,510)):request(queries_sql[i],mode)
+                                checkpoint('warmed')
                                 hits=[[],[]];query_seconds=0
                                 for i,(sql,expected) in enumerate(zip(queries_sql,truth)):
                                     result,elapsed=request(sql,mode);query_seconds+=elapsed
@@ -103,6 +125,7 @@ def run(args):
                                     if args.require_filter_exact and mode=='ann' and i>=500:assert ids==expected,(ids,expected)
                                     hits[i>=500].append(len(set(ids)&set(expected))/10)
                                 recalls=[float(np.mean(x)) for x in hits];assert min(recalls)>=(args.min_ann_recall if mode=='ann' else .95)
+                            checkpoint('measured')
                             _,close_seconds=request(op='shutdown')
                             assert exited.wait(30) and status==[0],(status,errors)
                             finished=sample()
@@ -117,6 +140,9 @@ def run(args):
                                  'M_peak_bytes':finished['memory_peak_bytes'],'initial_cgroup':initial,'final_cgroup':finished,
                                  'engine_final_metrics':final,'last_query_metrics':dict(last),'diagnostics':errors}
                             row['B_bytes']=row['B_read_bytes']+row['B_write_bytes'];assert row['B_bytes']>0,'io.stat unavailable; do not fabricate physical I/O'
+                            if args.memory_breakdown:
+                                row['memory_breakdown']={'sampling':'outside target cgroup, approximately20ms; sampled max-current composition, not an atomic decomposition of memory.peak',
+                                  'samples':len(observed),'sampled_max':max(observed,key=lambda x:x['current'])if observed else None,'checkpoints':checkpoints}
                             if project=='write':
                                 # Correctness consumes the same data volume in a different
                                 # cgroup only after the measured process exits and B/M freeze.
@@ -142,6 +168,11 @@ def run(args):
                             print(f'{args.phase} {distribution} {memory} r{repeat+1} {project}: T={row["T_seconds"]:.6f} B={row["B_bytes"]} M={row["M_peak_bytes"]}',flush=True)
                         finally:
                             docker('rm','-f',name,check=False)
+                            if observer:
+                                try:observer.wait(timeout=5)
+                                except subprocess.TimeoutExpired:observer.kill();observer.wait(timeout=5)
+                                if observer_thread:observer_thread.join(timeout=5)
+                                observer.stdout.close()
                             if child:
                                 if child.poll() is None:child.kill();child.wait(timeout=10)
                                 for stream in (child.stdin,child.stdout,child.stderr):
@@ -157,4 +188,5 @@ if __name__=='__main__':
     p.add_argument('--memories',nargs='+',default=['16m','2g']);p.add_argument('--distributions',nargs='+',default=['clustered','uniform'])
     p.add_argument('--require-filter-exact',action='store_true')
     p.add_argument('--min-ann-recall',type=float,default=.95,help='Required mean Recall@10 for each ANN filter group')
+    p.add_argument('--memory-breakdown',action='store_true',help='Separate diagnostic only: sample memory.stat and frame checkpoints; keep off for timing comparisons')
     p.add_argument('--projects',nargs='+',default=['write','exact','ann']);run(p.parse_args())

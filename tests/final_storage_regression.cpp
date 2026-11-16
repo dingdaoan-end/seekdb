@@ -22,7 +22,7 @@ uint64_t write_calls=0,write_bytes=0;
 bool audit_cache_drop=false;
 unsigned cache_drops=0;
 void audit_begin(){write_calls=write_bytes=0;audit_writes=true;}
-void audit_end(){audit_writes=false;assert(write_calls==0&&write_bytes==0);}
+void audit_end(uint64_t expected_calls=0,uint64_t expected_bytes=0){audit_writes=false;assert(write_calls==expected_calls&&write_bytes==expected_bytes);}
 Page filled(unsigned value){Page p{};p.fill(std::byte(value));return p;}
 void save(const std::filesystem::path& file,const Page& page,size_t count=1){
  std::ofstream out(file,std::ios::binary|std::ios::trunc);
@@ -151,7 +151,9 @@ void fresh_region_rollback(const std::filesystem::path& root,bool full_rollback)
   old_region=storage.begin_region("same_index");
   storage.write_new(old_region+".nodes",0,filled(51));storage.write_new(old_region+".nodes",1,filled(52));
   auto old=storage.pool.handle(old_region+".nodes",1);
-  audit_begin();if(full_rollback)storage.rollback();else storage.rollback_to(mark);audit_end();
+  // Retiring the immutable namespace writes its one-byte tombstone, while no
+  // discarded data page may be flushed (including any dirty index payload).
+  audit_begin();if(full_rollback)storage.rollback();else storage.rollback_to(mark);audit_end(1,1);
   assert(!storage.pool.resident(old));assert(!std::filesystem::exists(root/"data"/(old_region+".nodes")));
   if(full_rollback)storage.begin();
   new_region=storage.begin_region("same_index");assert(new_region!=old_region);
@@ -162,7 +164,7 @@ void fresh_region_rollback(const std::filesystem::path& root,bool full_rollback)
   Storage reopened(root,65536);assert(!std::filesystem::exists(root/"data"/(old_region+".nodes")));
   assert(reopened.read(new_region+".leaves",2)==filled(61));
  }
- std::cout<<(full_rollback?"full":"savepoint")<<" fresh-region rollback + rebuild + reopen: discard pwrite calls=0 bytes=0\n";
+ std::cout<<(full_rollback?"full":"savepoint")<<" fresh-region rollback + rebuild + reopen: data writes=0, namespace retirement=1 byte\n";
 }
 
 void crash_recovery(const std::filesystem::path& root){

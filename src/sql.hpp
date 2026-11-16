@@ -40,6 +40,8 @@ void parse_insert_rows(const std::string&,const std::function<void(const Stateme
 size_t unicode_length(const std::string&);
 Value convert(const Literal&,const Column&);
 Value convert(const LiteralView&,const Column&);
+// Statement-local reuse; no view or pointer escapes the destination Value.
+void convert_into(const LiteralView&,const Column&,Value&);
 int compare(const Value&,const Value&);
 std::string json(const Value&);
 std::string quote(const std::string&);
@@ -53,6 +55,9 @@ double l2_fast(const float*,const float*,size_t,bool safe);
 double l2_exact(const float*,const float*,size_t);
 double l2_squared_fast(const float*,const float*,size_t,bool safe);
 double l2_squared_exact(const float*,const float*,size_t);
+// Four physically adjacent 128D rows; safe requires all rows and query to
+// pass has_extreme. Results match four full l2_squared_fast calls bit for bit.
+void l2_squared_batch4_128(const float* rows,const float* query,double* out,bool safe);
 struct BoundedDistance {double squared;bool pruned;};
 // Takes an exact squared-distance heap threshold; rounds the conservative
 // margin upward to float. Overflow/nonfinite input disables pruning.
